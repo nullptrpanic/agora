@@ -2275,6 +2275,7 @@ fn set_descriptor_close_on_exec(descriptor: libc::c_int, close: bool) -> io::Res
 }
 
 pub(super) fn tracked_current_directory() -> Option<PathBuf> {
+    let _guard = FilesystemHookGuard::enter()?;
     FilesystemHookRuntime::global().map(|runtime| lock(&runtime.current_directory).logical.clone())
 }
 

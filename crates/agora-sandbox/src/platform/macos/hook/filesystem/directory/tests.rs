@@ -118,6 +118,103 @@ fn directory_wrappers_surface_remote_and_alias_name_overflow() {
     }
 }
 
+unsafe extern "C" fn readdir_requiring_blocked_signals(
+    _directory: *mut libc::DIR,
+) -> *mut libc::dirent {
+    let blocked = crate::platform::hook::tests::SignalMaskProbe::signal_is_blocked(libc::SIGUSR2);
+    unsafe { *libc::__error() = if blocked { libc::EAGAIN } else { libc::EIO } };
+    std::ptr::null_mut()
+}
+
+unsafe extern "C" fn rewinddir_requiring_blocked_signals(_directory: *mut libc::DIR) {
+    let blocked = crate::platform::hook::tests::SignalMaskProbe::signal_is_blocked(libc::SIGUSR2);
+    unsafe { *libc::__error() = if blocked { libc::EAGAIN } else { libc::EIO } };
+}
+
+fn local_cursor(directory: *mut libc::DIR) -> DirectoryCursor {
+    DirectoryCursor {
+        sources: vec![DirectorySource {
+            directory: directory as usize,
+            lower: false,
+            owned: false,
+        }],
+        source_index: 0,
+        hidden: HashSet::new(),
+        aliases: HashMap::new(),
+        seen: HashSet::new(),
+        remote_names: HashSet::new(),
+        remote: None,
+    }
+}
+
+#[test]
+fn managed_readdir_defers_signals_while_cursor_state_is_locked() {
+    let directory = Box::into_raw(Box::new(0_u8)).cast::<libc::DIR>();
+    let workspace = tempfile::tempdir().unwrap();
+    let runtime = FilesystemHookRuntime::new(workspace.path().join("workdir/fs")).unwrap();
+    let signal = crate::platform::hook::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+    lock(directory_cursors()).insert(directory as usize, local_cursor(directory));
+
+    with_test_runtime(&runtime, || unsafe {
+        assert!(sandbox_readdir_with(directory, readdir_requiring_blocked_signals).is_null());
+        assert_eq!(*libc::__error(), libc::EAGAIN);
+    });
+
+    assert!(!signal.is_blocked());
+    lock(directory_cursors()).remove(&(directory as usize));
+    unsafe { drop(Box::from_raw(directory.cast::<u8>())) };
+}
+
+#[test]
+fn managed_rewinddir_defers_signals_while_cursor_state_is_locked() {
+    let directory = Box::into_raw(Box::new(0_u8)).cast::<libc::DIR>();
+    let workspace = tempfile::tempdir().unwrap();
+    let runtime = FilesystemHookRuntime::new(workspace.path().join("workdir/fs")).unwrap();
+    let signal = crate::platform::hook::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+    lock(directory_cursors()).insert(directory as usize, local_cursor(directory));
+
+    with_test_runtime(&runtime, || unsafe {
+        sandbox_rewinddir_with(directory, rewinddir_requiring_blocked_signals);
+        assert_eq!(*libc::__error(), libc::EAGAIN);
+    });
+
+    assert!(!signal.is_blocked());
+    lock(directory_cursors()).remove(&(directory as usize));
+    unsafe { drop(Box::from_raw(directory.cast::<u8>())) };
+}
+
+#[test]
+fn unmanaged_readdir_releases_hook_state_before_calling_libc() {
+    let directory = Box::into_raw(Box::new(0_u8)).cast::<libc::DIR>();
+    let workspace = tempfile::tempdir().unwrap();
+    let runtime = FilesystemHookRuntime::new(workspace.path().join("workdir/fs")).unwrap();
+    let signal = crate::platform::hook::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+
+    with_test_runtime(&runtime, || unsafe {
+        assert!(sandbox_readdir_with(directory, readdir_requiring_blocked_signals).is_null());
+        assert_eq!(*libc::__error(), libc::EIO);
+    });
+
+    assert!(!signal.is_blocked());
+    unsafe { drop(Box::from_raw(directory.cast::<u8>())) };
+}
+
+#[test]
+fn unmanaged_rewinddir_releases_hook_state_before_calling_libc() {
+    let directory = Box::into_raw(Box::new(0_u8)).cast::<libc::DIR>();
+    let workspace = tempfile::tempdir().unwrap();
+    let runtime = FilesystemHookRuntime::new(workspace.path().join("workdir/fs")).unwrap();
+    let signal = crate::platform::hook::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+
+    with_test_runtime(&runtime, || unsafe {
+        sandbox_rewinddir_with(directory, rewinddir_requiring_blocked_signals);
+        assert_eq!(*libc::__error(), libc::EIO);
+    });
+
+    assert!(!signal.is_blocked());
+    unsafe { drop(Box::from_raw(directory.cast::<u8>())) };
+}
+
 #[test]
 fn allocated_getcwd_and_realpath_return_owned_logical_paths() {
     let directory = tempfile::tempdir().unwrap();

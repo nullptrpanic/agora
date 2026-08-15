@@ -61,8 +61,9 @@ use super::{
     agora_sandbox_unlink as sandbox_unlink, agora_sandbox_unlinkat as sandbox_unlinkat,
     agora_sandbox_utimensat as sandbox_utimensat, agora_sandbox_utimes as sandbox_utimes,
     catch_filesystem_panic, configure_descriptor, error_errno, flush_at_exit, flush_before_exec,
-    intent_from_fopen_mode, sandbox_descriptor_mutation, sandbox_flock_with,
-    sandbox_unsupported_path_mutation, truncate_reservation, with_test_runtime,
+    intent_from_fopen_mode, lock_filesystem_before_fork, sandbox_descriptor_mutation,
+    sandbox_flock_with, sandbox_unsupported_path_mutation, tracked_current_directory,
+    truncate_reservation, unlock_filesystem_after_fork, with_test_runtime,
 };
 use crate::audit::AuditClient;
 use crate::filesystem::{EntryState, FileAttributes, FileLayer};
@@ -3816,6 +3817,51 @@ fn chdir_updates_the_logical_directory_after_the_native_change_succeeds() {
     });
 
     drop(restore);
+}
+
+#[test]
+fn tracked_current_directory_participates_in_the_filesystem_fork_barrier() {
+    struct PreparedFork;
+
+    impl PreparedFork {
+        fn new() -> Self {
+            unsafe { lock_filesystem_before_fork() };
+            Self
+        }
+    }
+
+    impl Drop for PreparedFork {
+        fn drop(&mut self) {
+            unsafe { unlock_filesystem_after_fork() };
+        }
+    }
+
+    let fixture = Fixture::new();
+    let barrier = PreparedFork::new();
+    std::thread::scope(|scope| {
+        let (started, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let runtime = &fixture.runtime;
+        scope.spawn(move || {
+            with_test_runtime(runtime, || {
+                started.send(()).unwrap();
+                finished.send(tracked_current_directory()).unwrap();
+            });
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(barrier);
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_some()
+        );
+    });
 }
 
 #[test]

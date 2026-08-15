@@ -733,13 +733,26 @@ pub unsafe extern "C" fn agora_sandbox_fdopendir(descriptor: libc::c_int) -> *mu
 }
 
 unsafe fn sandbox_readdir(directory: *mut libc::DIR) -> *mut libc::dirent {
+    let Some(original) = original_readdir() else {
+        unsafe { set_errno(libc::ENOSYS) };
+        return std::ptr::null_mut();
+    };
+    unsafe { sandbox_readdir_with(directory, original) }
+}
+
+unsafe fn sandbox_readdir_with(
+    directory: *mut libc::DIR,
+    original: ReaddirFn,
+) -> *mut libc::dirent {
     catch_filesystem_panic(std::ptr::null_mut(), || {
-        let Some(original) = original_readdir() else {
-            unsafe { set_errno(libc::ENOSYS) };
-            return std::ptr::null_mut();
+        let Some(guard) = FilesystemHookGuard::enter() else {
+            unsafe { set_errno(0) };
+            return unsafe { original(directory) };
         };
         let mut cursors = lock(directory_cursors());
         let Some(cursor) = cursors.get_mut(&(directory as usize)) else {
+            drop(cursors);
+            drop(guard);
             unsafe { set_errno(0) };
             return unsafe { original(directory) };
         };
@@ -820,13 +833,23 @@ pub unsafe extern "C" fn agora_sandbox_readdir_r(
 }
 
 unsafe fn sandbox_rewinddir(directory: *mut libc::DIR) {
+    let Some(original) = original_rewinddir() else {
+        unsafe { set_errno(libc::ENOSYS) };
+        return;
+    };
+    unsafe { sandbox_rewinddir_with(directory, original) }
+}
+
+unsafe fn sandbox_rewinddir_with(directory: *mut libc::DIR, original: RewinddirFn) {
     catch_filesystem_panic((), || {
-        let Some(original) = original_rewinddir() else {
-            unsafe { set_errno(libc::ENOSYS) };
+        let Some(guard) = FilesystemHookGuard::enter() else {
+            unsafe { original(directory) };
             return;
         };
         let mut cursors = lock(directory_cursors());
         let Some(cursor) = cursors.get_mut(&(directory as usize)) else {
+            drop(cursors);
+            drop(guard);
             unsafe { original(directory) };
             return;
         };
