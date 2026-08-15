@@ -17,6 +17,7 @@ use super::mapping::{
     agora_sandbox_mmap as sandbox_mmap, agora_sandbox_msync as sandbox_msync,
     agora_sandbox_munmap as sandbox_munmap,
 };
+use super::socket::{UnixSocketAddress, agora_sandbox_bind as sandbox_bind};
 use super::{
     ByteRangeSet, DirectoryCursor, FilesystemHookGuard, FilesystemHookRuntime, LocalByteRange,
     agora_sandbox_access as sandbox_access, agora_sandbox_chdir as sandbox_chdir,
@@ -68,6 +69,7 @@ use crate::filesystem::{EntryState, FileAttributes, FileLayer};
 use crate::nfs::controller::RemoteController;
 use crate::nfs::protocol::RemoteRoute;
 use crate::nfs::testing::MemoryStorage;
+use crate::platform::hook::network::agora_sandbox_connect as sandbox_connect;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
@@ -163,6 +165,74 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.directory).unwrap();
     }
+}
+
+#[test]
+fn pathname_unix_sockets_bind_and_connect_through_the_overlay() {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let directory = Path::new("/tmp").join(format!("ah-{}", &suffix[..8]));
+    let lower = Path::new("/tmp").join(format!("al-{}", &suffix[..8]));
+    std::fs::create_dir_all(&lower).unwrap();
+    let runtime = FilesystemHookRuntime::new(directory.join("fs")).unwrap();
+    let logical = lower.join("service.sock");
+    let address = UnixSocketAddress::new(&logical).unwrap();
+
+    with_test_runtime(&runtime, || unsafe {
+        let listener = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        assert!(listener >= 0);
+        assert_eq!(
+            sandbox_bind(listener, address.as_ptr(), address.len()),
+            0,
+            "bind failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(libc::listen(listener, 1), 0);
+        assert!(!logical.exists());
+        let mapped = runtime.filesystem.prepare_read(&logical).unwrap();
+        assert!(mapped.exists());
+
+        let client = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        assert!(client >= 0);
+        assert_eq!(sandbox_connect(client, address.as_ptr(), address.len()), 0);
+        let accepted = libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut());
+        assert!(accepted >= 0);
+        libc::close(accepted);
+        libc::close(client);
+        libc::close(listener);
+        assert_eq!(sandbox_unlink(Fixture::c_path(&logical).as_ptr()), 0);
+        assert!(!mapped.exists());
+    });
+
+    std::fs::remove_dir_all(directory).unwrap();
+    std::fs::remove_dir_all(lower).unwrap();
+}
+
+#[test]
+fn pathname_unix_connect_keeps_an_untouched_lower_socket_native() {
+    use std::os::unix::net::UnixListener;
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let directory = Path::new("/tmp").join(format!("ch-{}", &suffix[..8]));
+    let lower = Path::new("/tmp").join(format!("cl-{}", &suffix[..8]));
+    std::fs::create_dir_all(&lower).unwrap();
+    let runtime = FilesystemHookRuntime::new(directory.join("fs")).unwrap();
+    let logical = lower.join("service.sock");
+    let listener = UnixListener::bind(&logical).unwrap();
+    let address = UnixSocketAddress::new(&logical).unwrap();
+
+    with_test_runtime(&runtime, || unsafe {
+        let client = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        assert!(client >= 0);
+        assert_eq!(sandbox_connect(client, address.as_ptr(), address.len()), 0);
+        let _accepted = listener.accept().unwrap();
+        libc::close(client);
+    });
+
+    assert!(logical.exists());
+    drop(listener);
+    std::fs::remove_file(logical).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+    std::fs::remove_dir_all(lower).unwrap();
 }
 
 struct NfsTestServer {

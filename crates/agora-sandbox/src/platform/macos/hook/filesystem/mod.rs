@@ -2188,7 +2188,7 @@ fn with_test_runtime<T>(runtime: &FilesystemHookRuntime, operation: impl FnOnce(
     operation()
 }
 
-fn error_errno(error: &anyhow::Error) -> libc::c_int {
+pub(super) fn error_errno(error: &anyhow::Error) -> libc::c_int {
     if let Some(error) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<LocalClientError>())
@@ -2279,6 +2279,7 @@ mod metadata;
 mod namespace;
 mod nfs;
 mod open;
+pub(super) mod socket;
 mod unsupported;
 
 #[cfg(not(test))]

@@ -3,7 +3,8 @@ use crate::filesystem::crypto::FileCipher;
 use crate::filesystem::{AccessRequest, Credentials, FileAttributes};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -1142,4 +1143,114 @@ fn plain_vfs_delegates_overlay_operations_without_writeback() {
     filesystem.remove(&renamed, false).unwrap();
     assert!(filesystem.prepare_read(&renamed).is_err());
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn authorized_socket_bind_creates_only_an_overlay_socket() {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let directory = Path::new("/tmp").join(format!("as-{}", &suffix[..8]));
+    let root = directory.join("fs");
+    let lower = directory.join("lower");
+    std::fs::create_dir_all(&lower).unwrap();
+    let logical = lower.join("service.sock");
+    let filesystem = VirtualFilesystem::plain(&root).unwrap();
+
+    let listener = filesystem
+        .bind_socket_authorized(&logical, &Credentials::effective(), |mapped| {
+            UnixListener::bind(mapped).map_err(Into::into)
+        })
+        .unwrap();
+    let mapped = filesystem.prepare_read(&logical).unwrap();
+
+    assert!(!logical.exists());
+    assert!(mapped.symlink_metadata().unwrap().file_type().is_socket());
+    let _client = UnixStream::connect(&mapped).unwrap();
+    let _accepted = listener.accept().unwrap();
+
+    filesystem
+        .remove_authorized(&logical, false, &Credentials::effective())
+        .unwrap();
+    assert!(!mapped.exists());
+    drop(listener);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn failed_authorized_socket_bind_does_not_publish_an_overlay_entry() {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let directory = Path::new("/tmp").join(format!("as-{}", &suffix[..8]));
+    let root = directory.join("fs");
+    let lower = directory.join("lower");
+    std::fs::create_dir_all(&lower).unwrap();
+    let logical = lower.join("service.sock");
+    let filesystem = VirtualFilesystem::plain(&root).unwrap();
+
+    let error = filesystem
+        .bind_socket_authorized::<()>(&logical, &Credentials::effective(), |_mapped| {
+            Err(std::io::Error::from_raw_os_error(libc::EADDRINUSE).into())
+        })
+        .unwrap_err();
+
+    assert_eq!(errno(&error), Some(libc::EADDRINUSE));
+    assert!(!logical.exists());
+    assert!(!filesystem.exists(&logical).unwrap());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn authorized_socket_bind_never_replaces_an_existing_lower_socket() {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let workdir = Path::new("/tmp").join(format!("ab-{}", &suffix[..8]));
+    let lower = Path::new("/tmp").join(format!("lb-{}", &suffix[..8]));
+    std::fs::create_dir_all(&lower).unwrap();
+    let logical = lower.join("service.sock");
+    let lower_listener = UnixListener::bind(&logical).unwrap();
+    let filesystem = VirtualFilesystem::plain(workdir.join("fs")).unwrap();
+    let mut invoked = false;
+
+    let error = filesystem
+        .bind_socket_authorized::<()>(&logical, &Credentials::effective(), |_mapped| {
+            invoked = true;
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert_eq!(errno(&error), Some(libc::EADDRINUSE));
+    assert!(!invoked);
+    assert!(logical.exists());
+    drop(lower_listener);
+    std::fs::remove_file(logical).unwrap();
+    std::fs::remove_dir_all(workdir).unwrap();
+    std::fs::remove_dir_all(lower).unwrap();
+}
+
+#[test]
+fn encrypted_socket_bind_keeps_the_socket_native_under_an_encrypted_name() {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let workdir = Path::new("/tmp").join(format!("ae-{}", &suffix[..8]));
+    let lower = Path::new("/tmp").join(format!("el-{}", &suffix[..8]));
+    std::fs::create_dir_all(&lower).unwrap();
+    let logical = lower.join("service.sock");
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let filesystem = VirtualFilesystem::encrypted(workdir.join("fs"), cipher).unwrap();
+
+    let listener = filesystem
+        .bind_socket_authorized(&logical, &Credentials::effective(), |mapped| {
+            UnixListener::bind(mapped).map_err(Into::into)
+        })
+        .unwrap();
+    let mapped = filesystem.prepare_read(&logical).unwrap();
+
+    assert!(!logical.exists());
+    assert_ne!(mapped.file_name(), logical.file_name());
+    assert!(mapped.symlink_metadata().unwrap().file_type().is_socket());
+    let _client = UnixStream::connect(&mapped).unwrap();
+    let _accepted = listener.accept().unwrap();
+
+    filesystem
+        .remove_authorized(&logical, false, &Credentials::effective())
+        .unwrap();
+    drop(listener);
+    std::fs::remove_dir_all(workdir).unwrap();
+    std::fs::remove_dir_all(lower).unwrap();
 }

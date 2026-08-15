@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 #[cfg(test)]
@@ -79,6 +79,15 @@ impl OverlayTransaction<'_> {
     pub(super) fn visible_exists(&self, path: &Path) -> Result<bool> {
         let path = self.store.normalize(path)?;
         self.store.visible_exists_locked(&path)
+    }
+
+    pub(super) fn bind_socket<T>(
+        &self,
+        path: &Path,
+        bind: impl FnOnce(&Path) -> Result<T>,
+    ) -> Result<T> {
+        let path = self.store.normalize(path)?;
+        self.store.bind_socket_locked(&path, bind)
     }
 
     pub(super) fn resolve_final(&self, path: &Path, allow_missing: bool) -> Result<PathBuf> {
@@ -1439,6 +1448,47 @@ impl OverlayStore {
             self.metadata
                 .set_with_attributes(path, EntryState::Cow, Some(attributes))?;
             Ok(destination.clone())
+        })();
+        if result.is_err() {
+            let _ = Self::remove_existing(&destination);
+            match previous_state {
+                Some(state) => {
+                    let _ = self
+                        .metadata
+                        .set_with_attributes(path, state, previous_attributes);
+                }
+                None => {
+                    let _ = self.metadata.remove(path);
+                }
+            }
+        }
+        result
+    }
+
+    fn bind_socket_locked<T>(
+        &self,
+        path: &Path,
+        bind: impl FnOnce(&Path) -> Result<T>,
+    ) -> Result<T> {
+        if self.visible_exists_locked(path)? {
+            return Err(std::io::Error::from_raw_os_error(libc::EADDRINUSE).into());
+        }
+        let previous_state = self.reconciled_state_locked(path)?;
+        let previous_attributes = self.metadata.attributes(path)?;
+        self.ensure_parent_locked(path)?;
+        let destination = self.file_destination(path, true)?;
+        let result = (|| {
+            let value = bind(&destination)?;
+            let metadata = destination.symlink_metadata()?;
+            if !metadata.file_type().is_socket() {
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL).into());
+            }
+            self.metadata.set_with_attributes(
+                path,
+                EntryState::Cow,
+                Some(FileAttributes::from_metadata(&metadata)),
+            )?;
+            Ok(value)
         })();
         if result.is_err() {
             let _ = Self::remove_existing(&destination);

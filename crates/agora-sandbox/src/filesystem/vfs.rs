@@ -909,6 +909,18 @@ impl VirtualFilesystem {
         })
     }
 
+    pub(crate) fn bind_socket_authorized<T>(
+        &self,
+        path: &Path,
+        credentials: &Credentials,
+        bind: impl FnOnce(&Path) -> Result<T>,
+    ) -> Result<T> {
+        self.overlay.transaction(|transaction| {
+            Self::require_parent_mutation_in(transaction, path, credentials)?;
+            transaction.bind_socket(path, bind)
+        })
+    }
+
     pub(crate) fn remove_authorized(
         &self,
         path: &Path,

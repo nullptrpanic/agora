@@ -225,6 +225,18 @@ pub unsafe extern "C" fn agora_sandbox_connect(
         unsafe { set_errno(libc::ENOSYS) };
         return -1;
     };
+    let unix = catch_unwind(AssertUnwindSafe(|| unsafe {
+        super::filesystem::socket::prepare_connect_address(address, length)
+    }))
+    .unwrap_or_else(|_| Err(std::io::Error::from_raw_os_error(libc::EIO).into()));
+    match unix {
+        Ok(Some(mapped)) => return unsafe { original(socket, mapped.as_ptr(), mapped.len()) },
+        Ok(None) => {}
+        Err(error) => {
+            unsafe { set_errno(super::filesystem::error_errno(&error)) };
+            return -1;
+        }
+    }
     let destination = match unsafe { HookRuntime::intercepted_destination(socket, address, length) }
     {
         Ok(Some(destination)) => destination,
@@ -283,6 +295,50 @@ pub unsafe extern "C" fn agora_sandbox_connectx(
         return -1;
     }
     let endpoints = unsafe { &*endpoints };
+    if unsafe {
+        super::filesystem::socket::is_pathname_address(
+            endpoints.source_address,
+            endpoints.source_address_length,
+        )
+    } {
+        unsafe { set_errno(libc::ENOTSUP) };
+        return -1;
+    }
+    let unix = catch_unwind(AssertUnwindSafe(|| unsafe {
+        super::filesystem::socket::prepare_connect_address(
+            endpoints.destination_address,
+            endpoints.destination_address_length,
+        )
+    }))
+    .unwrap_or_else(|_| Err(std::io::Error::from_raw_os_error(libc::EIO).into()));
+    match unix {
+        Ok(Some(mapped)) => {
+            let mapped_endpoints = SocketEndpoints {
+                source_interface: endpoints.source_interface,
+                source_address: endpoints.source_address,
+                source_address_length: endpoints.source_address_length,
+                destination_address: mapped.as_ptr(),
+                destination_address_length: mapped.len(),
+            };
+            return unsafe {
+                original(
+                    socket,
+                    std::ptr::addr_of!(mapped_endpoints),
+                    association_id,
+                    flags,
+                    vectors,
+                    vector_count,
+                    bytes_written,
+                    connection_id,
+                )
+            };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            unsafe { set_errno(super::filesystem::error_errno(&error)) };
+            return -1;
+        }
+    }
     let destination = match unsafe {
         HookRuntime::intercepted_destination(
             socket,
