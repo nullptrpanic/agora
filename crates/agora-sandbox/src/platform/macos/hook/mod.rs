@@ -9,8 +9,10 @@ mod signal;
 
 pub(crate) use signal::SignalMaskGuard;
 
+use std::path::{Path, PathBuf};
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
 use std::sync::Once;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static HOOK_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -19,6 +21,35 @@ static EXIT_FLUSH_REGISTERED: Once = Once::new();
 
 fn initialized() -> bool {
     HOOK_INITIALIZED.load(Ordering::Acquire)
+}
+
+fn logical_process_executable_path(filesystem_root: &Path, executable: &Path) -> PathBuf {
+    let executable =
+        crate::filesystem::normalize_path(executable).unwrap_or_else(|_| executable.to_path_buf());
+    let filesystem_root = crate::filesystem::normalize_path(filesystem_root)
+        .unwrap_or_else(|_| filesystem_root.to_path_buf());
+    executable
+        .strip_prefix(&filesystem_root)
+        .map(|relative| Path::new("/").join(relative))
+        .unwrap_or(executable)
+}
+
+fn try_current_process_executable() -> std::io::Result<String> {
+    static EXECUTABLE: OnceLock<String> = OnceLock::new();
+    if let Some(executable) = EXECUTABLE.get() {
+        return Ok(executable.clone());
+    }
+    let executable = std::env::current_exe()?;
+    let executable = config::global().map_or(executable.clone(), |config| {
+        logical_process_executable_path(Path::new(config.filesystem_root()), &executable)
+    });
+    let executable = executable.to_string_lossy().into_owned();
+    let _ = EXECUTABLE.set(executable.clone());
+    Ok(EXECUTABLE.get().cloned().unwrap_or(executable))
+}
+
+fn current_process_executable() -> String {
+    try_current_process_executable().unwrap_or_default()
 }
 
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]

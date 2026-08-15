@@ -122,11 +122,7 @@ impl HookRuntime {
             .get_or_init(|| {
                 config::global().cloned().map(|config| Self {
                     config,
-                    process: ProcessContext::new(
-                        std::env::current_exe()
-                            .map(|path| path.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                    ),
+                    process: ProcessContext::new(super::current_process_executable()),
                 })
             })
             .as_ref()

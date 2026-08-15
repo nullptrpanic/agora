@@ -2,7 +2,7 @@ use super::crypto::FileCipher;
 use super::metadata::{EntryState, FileAttributes, Materializer, MetadataStore, SourceIdentity};
 use super::namespace;
 use super::{normalize_path, resolve_existing_ancestor};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use md5::{Digest, Md5};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
@@ -798,27 +798,73 @@ impl OverlayStore {
     where
         F: FnOnce(&Path) -> Result<()>,
     {
+        self.prepare_plain_cached(
+            source,
+            Materializer::Executable,
+            Some(Self::executable_variant()),
+            true,
+            "executable",
+            prepare,
+        )
+    }
+
+    pub(crate) fn prepare_loader_image(&self, source: &Path) -> Result<PathBuf> {
+        let source = self.normalize(source)?;
+        self.prepare_plain_cached(
+            &source,
+            Materializer::Loader,
+            None,
+            false,
+            "loader",
+            |temporary| {
+                fs::copy(&source, temporary)?;
+                Ok(())
+            },
+        )
+    }
+
+    fn prepare_plain_cached<F>(
+        &self,
+        source: &Path,
+        materializer: Materializer,
+        variant: Option<String>,
+        require_executable: bool,
+        temporary_label: &str,
+        prepare: F,
+    ) -> Result<PathBuf>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
         let source = self.normalize(source)?;
         self.with_lock(|| {
             let destination = self.plain_destination(&source)?;
             let source_identity = SourceIdentity::from_metadata(&source.metadata()?);
-            let variant = Self::executable_variant();
             let cached = self.reconciled_state_locked(&source)?;
-            let destination_metadata = destination
-                .symlink_metadata()
-                .ok()
-                .filter(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0);
+            if materializer == Materializer::Loader {
+                match &cached {
+                    Some(EntryState::Cow) => bail!(
+                        "cannot prepare sandbox-modified loader image: {}",
+                        source.display()
+                    ),
+                    Some(EntryState::Whiteout) => return Self::not_found(&source),
+                    Some(EntryState::Cached { .. }) | None => {}
+                }
+            }
+            let destination_metadata = destination.symlink_metadata().ok().filter(|metadata| {
+                metadata.is_file() && (!require_executable || metadata.mode() & 0o111 != 0)
+            });
             if let (
                 Some(destination_metadata),
                 Some(EntryState::Cached {
                     checksum: Some(checksum),
-                    materializer: Materializer::Executable,
+                    materializer: cached_materializer,
                     source: Some(cached_source),
-                    variant: Some(cached_variant),
+                    variant: cached_variant,
                     destination: cached_destination,
                 }),
             ) = (destination_metadata, cached)
                 && cached_source == source_identity
+                && cached_materializer == materializer
                 && cached_variant == variant
             {
                 let destination_identity = SourceIdentity::from_metadata(&destination_metadata);
@@ -830,9 +876,9 @@ impl OverlayStore {
                         &source,
                         EntryState::Cached {
                             checksum: Some(checksum),
-                            materializer: Materializer::Executable,
+                            materializer,
                             source: Some(source_identity),
-                            variant: Some(variant),
+                            variant: variant.clone(),
                             destination: Some(destination_identity),
                         },
                     )?;
@@ -841,10 +887,12 @@ impl OverlayStore {
             }
             let parent = destination
                 .parent()
-                .context("executable destination has no parent")?;
+                .context("cached destination has no parent")?;
             self.ensure_parent_locked(&source)?;
-            let temporary =
-                parent.join(format!(".agora-executable-{}.tmp", Uuid::new_v4().simple()));
+            let temporary = parent.join(format!(
+                ".agora-{temporary_label}-{}.tmp",
+                Uuid::new_v4().simple()
+            ));
             let result = (|| {
                 prepare(&temporary)?;
                 let checksum = Self::checksum(&temporary)?;
@@ -856,9 +904,9 @@ impl OverlayStore {
                     &source,
                     EntryState::Cached {
                         checksum: Some(checksum),
-                        materializer: Materializer::Executable,
+                        materializer,
                         source: Some(source_identity),
-                        variant: Some(variant),
+                        variant,
                         destination: Some(destination_identity),
                     },
                 )?;

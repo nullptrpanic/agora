@@ -685,7 +685,7 @@ unsafe fn process_event_request(
             values.push(TRUNCATED_ARGUMENTS.to_string());
         }
     }
-    let process_executable = std::env::current_exe().map_err(|error| {
+    let process_executable = super::try_current_process_executable().map_err(|error| {
         PrepareError::new(
             io_errno(&error),
             format!("failed to resolve current executable: {error}"),
@@ -707,7 +707,7 @@ unsafe fn process_event_request(
         process: ProcessContext {
             pid: std::process::id(),
             ppid: unsafe { libc::getppid() as u32 },
-            executable: process_executable.to_string_lossy().into_owned(),
+            executable: process_executable,
         },
         command: CommandContext {
             executable: executable.to_string_lossy().into_owned(),

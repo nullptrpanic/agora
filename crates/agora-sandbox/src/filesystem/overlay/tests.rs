@@ -1607,6 +1607,91 @@ fn checksum_matches_standard_md5_and_executable_publication_is_reused() {
 }
 
 #[test]
+fn loader_images_are_plain_cached_and_rebuilt_after_destination_changes() {
+    let fixture = Fixture::new();
+    let source = fixture
+        .lower
+        .join("Fixture.app/Contents/Frameworks/libfixture.dylib");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"loader image").unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let destination = fixture.store.prepare_loader_image(&source).unwrap();
+    let first_identity = SourceIdentity::from_metadata(&destination.symlink_metadata().unwrap());
+    let reused = fixture.store.prepare_loader_image(&source).unwrap();
+
+    assert_eq!(destination, reused);
+    assert_eq!(
+        SourceIdentity::from_metadata(&reused.symlink_metadata().unwrap()),
+        first_identity
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), b"loader image");
+    assert_eq!(fixture.store.prepare_read(&source).unwrap(), source);
+    assert!(matches!(
+        fixture.store.state(&source).unwrap(),
+        Some(EntryState::Cached {
+            materializer: Materializer::Loader,
+            ..
+        })
+    ));
+
+    std::fs::write(&destination, b"changed destination").unwrap();
+    fixture.store.prepare_loader_image(&source).unwrap();
+
+    assert_eq!(std::fs::read(&destination).unwrap(), b"loader image");
+
+    std::fs::write(&source, b"updated loader image").unwrap();
+    fixture.store.prepare_loader_image(&source).unwrap();
+
+    assert_eq!(std::fs::read(destination).unwrap(), b"updated loader image");
+}
+
+#[test]
+fn loader_image_preparation_never_replaces_sandbox_cow_content() {
+    let fixture = Fixture::new();
+    let source = fixture
+        .lower
+        .join("Fixture.app/Contents/Frameworks/libfixture.dylib");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"lower loader").unwrap();
+    let upper = fixture.store.prepare_write(&source, false).unwrap();
+    std::fs::write(&upper, b"sandbox loader").unwrap();
+
+    let error = fixture.store.prepare_loader_image(&source).unwrap_err();
+
+    assert_eq!(std::fs::read(&upper).unwrap(), b"sandbox loader");
+    assert!(matches!(
+        fixture.store.state(&source).unwrap(),
+        Some(EntryState::Cow)
+    ));
+    assert!(error.to_string().contains("sandbox-modified loader image"));
+}
+
+#[test]
+fn loader_image_preparation_respects_sandbox_whiteouts() {
+    let fixture = Fixture::new();
+    let source = fixture
+        .lower
+        .join("Fixture.app/Contents/Frameworks/libfixture.dylib");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"lower loader").unwrap();
+    fixture.store.remove(&source, false).unwrap();
+
+    let error = fixture.store.prepare_loader_image(&source).unwrap_err();
+
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::NotFound)
+    );
+    assert!(matches!(
+        fixture.store.state(&source).unwrap(),
+        Some(EntryState::Whiteout)
+    ));
+}
+
+#[test]
 fn executable_publication_skips_checksum_when_the_destination_identity_is_unchanged() {
     let fixture = Fixture::new();
     let source = fixture.lower.join("large-tool");

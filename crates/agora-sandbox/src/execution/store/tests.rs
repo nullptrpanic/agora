@@ -304,6 +304,44 @@ fn executable_store_preserves_entitlements_when_resigning() {
 }
 
 #[test]
+fn executable_store_preserves_code_identifier_when_resigning() {
+    let root = TestDirectory::new();
+    let source = root.path().join("identified-sh");
+    fs::copy("/bin/sh", &source).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+    let status = Command::new("/usr/bin/codesign")
+        .args([
+            "--force",
+            "--sign",
+            "-",
+            "--options",
+            "runtime",
+            "--identifier",
+            "com.example.agora-fixture",
+            "--timestamp=none",
+        ])
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
+
+    let prepared = store.prepare(&source).unwrap();
+
+    let output = Command::new("/usr/bin/codesign")
+        .args(["--display", "--verbose=4"])
+        .arg(prepared)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line == "Identifier=com.example.agora-fixture")
+    );
+}
+
+#[test]
 fn code_signing_flags_parser_reads_the_runtime_bit() {
     assert_eq!(
         ExecutableStore::parse_code_signing_flags(
@@ -387,6 +425,27 @@ fn executable_store_rejects_non_files_and_non_executable_files() {
             .unwrap_err()
             .to_string()
             .contains("not executable")
+    );
+}
+
+#[test]
+fn executable_store_rejects_system_mediated_application_launch() {
+    let root = TestDirectory::new();
+    let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
+
+    let error = store.prepare(Path::new("/usr/bin/open")).unwrap_err();
+
+    assert_eq!(
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error),
+        Some(libc::ENOTSUP)
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("execute the application bundle binary directly")
     );
 }
 

@@ -19,6 +19,9 @@ thread_local! {
 
 use super::DEFAULT_EXECUTABLE_PATH;
 
+mod bundle;
+mod macho;
+
 const MACH_64_MAGIC: u32 = 0xfeed_facf;
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 const CPU_SUBTYPE_ARM64E: u32 = 2;
@@ -109,6 +112,11 @@ impl ExecutableStore {
             });
         }
         let source = self.resolve_source(source)?;
+        if source == Path::new("/usr/bin/open") {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP)).context(
+                "system-mediated application launch is unsupported; execute the application bundle binary directly",
+            );
+        }
         let metadata = Self::validate_source(&source)?;
         if resolve_shebang(&source)?.is_some() {
             return Ok(source);
@@ -117,6 +125,7 @@ impl ExecutableStore {
             if !Self::requires_copy(&source, &metadata)? {
                 return Ok(source);
             }
+            bundle::prepare_dependencies(self, &source, Self::native_architecture())?;
             self.prepare_copy(&source, &metadata)
         } else if matches!(
             self.overlay.state(&source)?,
@@ -297,7 +306,7 @@ impl ExecutableStore {
                 OsStr::new("--sign"),
                 OsStr::new("-"),
                 OsStr::new("--timestamp=none"),
-                OsStr::new("--preserve-metadata=entitlements"),
+                OsStr::new("--preserve-metadata=identifier,entitlements"),
                 temporary.as_os_str(),
             ],
             "failed to ad-hoc sign executable copy",

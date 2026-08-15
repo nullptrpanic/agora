@@ -538,6 +538,39 @@ fn fts_visibility_accepts_an_entry_without_an_access_path() {
 }
 
 #[test]
+fn trusted_fts_paths_normalize_backing_components_before_decoding() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = FilesystemHookRuntime::new(root.path().join("workdir/fs")).unwrap();
+    let backing = runtime
+        .filesystem
+        .root()
+        .join("Applications/Fixture.app/Contents/Resources/../bin/options");
+    let backing = CString::new(backing.as_os_str().as_bytes()).unwrap();
+
+    let logical = unsafe { trusted_fts_logical_path(&runtime, backing.as_ptr()) }.unwrap();
+
+    assert_eq!(
+        logical,
+        Path::new("/Applications/Fixture.app/Contents/bin/options")
+    );
+}
+
+#[test]
+fn trusted_fts_paths_resolve_relative_to_the_logical_current_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = FilesystemHookRuntime::new(root.path().join("workdir/fs")).unwrap();
+    let requested = CString::new("relative-entry").unwrap();
+
+    let logical = unsafe { trusted_fts_logical_path(&runtime, requested.as_ptr()) }.unwrap();
+
+    assert_eq!(
+        logical,
+        crate::filesystem::normalize_path(&std::env::current_dir().unwrap().join("relative-entry"))
+            .unwrap()
+    );
+}
+
+#[test]
 fn virtual_fts_repair_recovers_native_entry_types_and_metadata() {
     let root = tempfile::tempdir().unwrap();
     let lower = root.path().join("lower");

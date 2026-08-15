@@ -1856,18 +1856,16 @@ fn relocated_executable_can_read_and_load_sibling_resources() {
         return;
     }
     let filesystem_root =
-        PathBuf::from(std::env::var_os("AGORA_SANDBOX_TEST_FILESYSTEM_ROOT").unwrap())
-            .canonicalize()
-            .unwrap();
-    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        PathBuf::from(std::env::var_os("AGORA_SANDBOX_TEST_FILESYSTEM_ROOT").unwrap());
+    let executable = std::env::current_exe().unwrap();
     assert!(executable.starts_with(&filesystem_root));
     let contents = executable.parent().unwrap().parent().unwrap();
     let package = contents.parent().unwrap();
 
-    assert_eq!(
-        std::fs::read_to_string(contents.join("Info.plist")).unwrap(),
-        "agora relocated resource\n"
-    );
+    let resource = contents.join("Resources/../Info.plist");
+    let resource_contents = std::fs::read_to_string(&resource)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", resource.display()));
+    assert_eq!(resource_contents, "agora relocated resource\n");
 
     let library = std::ffi::CString::new(
         contents
@@ -3597,9 +3595,11 @@ async fn prepared_executable_can_read_and_load_sibling_resources() {
     let contents = package.join("Contents");
     let executable_directory = contents.join("MacOS");
     let plugin_directory = contents.join("PlugIns");
+    let resource_directory = contents.join("Resources");
     let workdir = directory.join("cache");
     std::fs::create_dir_all(&executable_directory).unwrap();
     std::fs::create_dir_all(&plugin_directory).unwrap();
+    std::fs::create_dir_all(&resource_directory).unwrap();
 
     let executable = executable_directory.join("relocated-fixture");
     std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
@@ -3668,7 +3668,18 @@ async fn prepared_executable_can_read_and_load_sibling_resources() {
         .arg("--nocapture")
         .env("AGORA_SANDBOX_TEST_RELOCATED_PACKAGE", "1")
         .env("AGORA_SANDBOX_TEST_FILESYSTEM_ROOT", workdir.join("fs"));
-    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+    let file_processes = Arc::new(Mutex::new(Vec::new()));
+    let callback_processes = Arc::clone(&file_processes);
+    let callback = move |event| {
+        if let Event::File(event) = event {
+            callback_processes
+                .lock()
+                .unwrap()
+                .push((event.file.path, event.process.executable));
+        }
+        std::future::ready(Decision::Allow)
+    };
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), callback)
         .run(command)
         .await
         .unwrap();
@@ -3686,6 +3697,135 @@ async fn prepared_executable_can_read_and_load_sibling_resources() {
         !cached_package
             .join("Contents/PlugIns/libfixture.dylib")
             .exists()
+    );
+    let expected_executable = executable.canonicalize().unwrap();
+    let file_processes = file_processes.lock().unwrap();
+    assert!(file_processes.iter().any(|(path, process)| {
+        path.ends_with("/Relocated.app/Contents/Info.plist")
+            && Path::new(process) == expected_executable
+    }));
+    assert!(
+        file_processes
+            .iter()
+            .all(|(_, process)| !Path::new(process).starts_with(workdir.join("fs")))
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn prepared_app_loads_bundle_local_frameworks() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-prepared-app-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let package = directory.join("source/Fixture.app");
+    let contents = package.join("Contents");
+    let executable_directory = contents.join("MacOS");
+    let framework_directory = contents.join("Frameworks");
+    let workdir = directory.join("cache");
+    std::fs::create_dir_all(&executable_directory).unwrap();
+    std::fs::create_dir_all(&framework_directory).unwrap();
+    std::fs::write(contents.join("Info.plist"), b"fixture").unwrap();
+
+    let library_source = directory.join("fixture.c");
+    let library = framework_directory.join("libfixture.dylib");
+    std::fs::write(
+        &library_source,
+        b"int agora_fixture_value(void) { return 42; }\n",
+    )
+    .unwrap();
+    let architecture = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        "arm64"
+    };
+    let output = Command::new("/usr/bin/xcrun")
+        .args([
+            "clang",
+            "-dynamiclib",
+            "-arch",
+            architecture,
+            "-Wl,-install_name,@rpath/libfixture.dylib",
+            "-o",
+        ])
+        .arg(&library)
+        .arg(&library_source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "dylib clang failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let executable_source = directory.join("main.c");
+    let executable = executable_directory.join("fixture");
+    std::fs::write(
+        &executable_source,
+        b"extern int agora_fixture_value(void);\n\
+          int main(void) { return agora_fixture_value() == 42 ? 0 : 1; }\n",
+    )
+    .unwrap();
+    let output = Command::new("/usr/bin/xcrun")
+        .args(["clang", "-arch", architecture, "-o"])
+        .arg(&executable)
+        .arg(&executable_source)
+        .arg("-L")
+        .arg(&framework_directory)
+        .args(["-lfixture", "-Wl,-rpath,@executable_path/../Frameworks"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "executable clang failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entitlements = directory.join("entitlements.plist");
+    std::fs::write(
+        &entitlements,
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>com.apple.security.cs.disable-library-validation</key><true/></dict></plist>
+"#,
+    )
+    .unwrap();
+    let output = Command::new("/usr/bin/codesign")
+        .args([
+            "--force",
+            "--sign",
+            "-",
+            "--options",
+            "runtime",
+            "--timestamp=none",
+            "--entitlements",
+        ])
+        .arg(&entitlements)
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "codesign failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(SandboxCommand::new(&executable))
+        .await
+        .unwrap();
+
+    assert!(
+        outcome.status().success(),
+        "child status: {:?}",
+        outcome.status()
+    );
+    let canonical_library = library.canonicalize().unwrap();
+    let cached_library = workdir
+        .join("fs")
+        .join(canonical_library.strip_prefix(Path::new("/")).unwrap());
+    assert_eq!(
+        std::fs::read(cached_library).unwrap(),
+        std::fs::read(canonical_library).unwrap()
     );
     std::fs::remove_dir_all(directory).unwrap();
 }

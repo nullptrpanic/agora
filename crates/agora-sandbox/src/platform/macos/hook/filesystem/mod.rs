@@ -869,7 +869,11 @@ impl FilesystemHookRuntime {
 
     fn logical_or_host(&self, path: &Path) -> Result<PathBuf> {
         if self.filesystem.is_internal(path) {
-            let logical = self.filesystem.logical_path(path)?;
+            let path = normalize_path(path)?;
+            if !self.filesystem.is_internal(&path) {
+                return Err(io::Error::from_raw_os_error(libc::EACCES).into());
+            }
+            let logical = self.filesystem.logical_path(&path)?;
             if self.filesystem.is_private(&logical)? {
                 return Err(io::Error::from_raw_os_error(libc::EACCES).into());
             }
@@ -1133,9 +1137,7 @@ impl FilesystemHookRuntime {
         let Some(audit) = &self.audit else {
             return Ok(());
         };
-        let executable = std::env::current_exe()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let executable = super::current_process_executable();
         audit.publish(AuditEventRequest::File {
             trace_id: self.trace.encode(),
             process: ProcessContext {
@@ -1683,9 +1685,7 @@ impl FilesystemHookRuntime {
         let requested = Path::new(OsStr::from_bytes(unsafe {
             CStr::from_ptr(target).to_bytes()
         }));
-        let target = if requested.is_absolute() && self.filesystem.is_internal(requested) {
-            self.filesystem.logical_path(requested)?
-        } else if requested.is_absolute() {
+        let target = if requested.is_absolute() {
             self.logical_or_host(requested)?
         } else {
             requested.to_path_buf()

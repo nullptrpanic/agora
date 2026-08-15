@@ -3,6 +3,25 @@ use super::network::{ProcessContext, RawSocketAddress, socket_addr_from_raw};
 use crate::filesystem::FileCipher;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::path::Path;
+
+#[test]
+fn prepared_process_executable_identity_uses_the_logical_path() {
+    assert_eq!(
+        super::logical_process_executable_path(
+            Path::new("/tmp/agora/fs"),
+            Path::new("/tmp/agora/fs/Applications/Fixture.app/Contents/MacOS/fixture"),
+        ),
+        Path::new("/Applications/Fixture.app/Contents/MacOS/fixture")
+    );
+    assert_eq!(
+        super::logical_process_executable_path(
+            Path::new("/tmp/agora/fs"),
+            Path::new("/usr/bin/fixture"),
+        ),
+        Path::new("/usr/bin/fixture")
+    );
+}
 
 pub(crate) struct SignalMaskProbe {
     previous: libc::sigset_t,

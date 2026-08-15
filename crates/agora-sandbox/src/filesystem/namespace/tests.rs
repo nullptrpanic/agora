@@ -33,6 +33,7 @@ fn control_name_prefixes_are_escaped_completely() {
         ".rekey.json.pending",
         "0123456789abcdef0123456789abcdef",
         ".agora-executable-user",
+        ".agora-loader-user",
         ".agora-write-lease-user",
     ] {
         let logical = Path::new("/bin").join(name);

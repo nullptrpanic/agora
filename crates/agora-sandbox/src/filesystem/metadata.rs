@@ -28,6 +28,7 @@ const VERSION_THREE_OBJECT_SUFFIX: &[u8] = b"\n  }\n}";
 pub(crate) enum Materializer {
     Copy,
     Executable,
+    Loader,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

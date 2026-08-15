@@ -954,8 +954,8 @@ unsafe fn trusted_fts_logical_path(
     if let Some(logical) = active_fts_logical_path(requested) {
         return Ok(logical);
     }
-    if requested.is_absolute() && runtime.filesystem.is_internal(requested) {
-        runtime.filesystem.logical_path(requested)
+    if requested.is_absolute() {
+        runtime.logical_or_host(requested)
     } else {
         unsafe { runtime.logical_path(path, libc::AT_FDCWD) }
     }

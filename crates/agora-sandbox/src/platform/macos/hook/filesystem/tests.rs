@@ -1979,6 +1979,34 @@ fn symlink_targets_inside_the_backing_store_are_rewritten_to_logical_paths() {
 }
 
 #[test]
+fn symlink_targets_normalize_backing_components_before_rewriting() {
+    let fixture = Fixture::new();
+    let target = fixture.lower.join("directory/target");
+    let link = fixture.lower.join("link");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, b"target").unwrap();
+    let internal = fixture
+        .runtime
+        .filesystem
+        .prepare_write(&target, false)
+        .unwrap();
+    let internal = internal.parent().unwrap().join("sibling/../target");
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        assert_eq!(
+            sandbox_symlink(
+                Fixture::c_path(&internal).as_ptr(),
+                Fixture::c_path(&link).as_ptr(),
+            ),
+            0
+        );
+    });
+
+    let mapped = fixture.runtime.filesystem.prepare_read(&link).unwrap();
+    assert_eq!(std::fs::read_link(mapped).unwrap(), target);
+}
+
+#[test]
 fn faccessat_honors_overlay_whiteouts() {
     let fixture = Fixture::new();
     let file = fixture.lower.join("whiteout");
@@ -2236,6 +2264,49 @@ fn direct_filesystem_backing_paths_reenter_the_logical_view() {
     .unwrap();
 
     assert_eq!(resolved, logical);
+}
+
+#[test]
+fn backing_paths_are_normalized_before_reentering_the_logical_view() {
+    let fixture = Fixture::new();
+    let backing = fixture
+        .runtime
+        .filesystem
+        .root()
+        .join("Applications/Fixture.app/Contents/Resources/../bin/options");
+    let backing = Fixture::c_path(&backing);
+
+    let resolved = unsafe {
+        fixture
+            .runtime
+            .logical_path(backing.as_ptr(), libc::AT_FDCWD)
+    }
+    .unwrap();
+
+    assert_eq!(
+        resolved,
+        Path::new("/Applications/Fixture.app/Contents/bin/options")
+    );
+}
+
+#[test]
+fn backing_paths_cannot_escape_above_the_filesystem_root() {
+    let fixture = Fixture::new();
+    let backing = fixture.runtime.filesystem.root().join("../../lower/target");
+
+    let error = fixture.runtime.logical_or_host(&backing).unwrap_err();
+
+    assert_eq!(error_errno(&error), libc::EACCES);
+}
+
+#[test]
+fn host_paths_preserve_parent_components_for_native_symlink_resolution() {
+    let fixture = Fixture::new();
+    let requested = fixture.lower.join("linked/../target");
+
+    let resolved = fixture.runtime.logical_or_host(&requested).unwrap();
+
+    assert_eq!(resolved, requested);
 }
 
 #[test]
