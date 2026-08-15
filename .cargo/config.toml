@@ -1,0 +1,5 @@
+[build]
+jobs = 16
+
+[env]
+RUST_TEST_THREADS = { value = "16", force = false }

@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Agora Runtime Trace</title>
+    <link rel="stylesheet" href="/vendor/xterm.css">
+    <link rel="stylesheet" href="/app.css">
+    <script defer src="/vendor/xterm.js"></script>
+    <script defer src="/vendor/addon-fit.js"></script>
+    <script defer src="/timeline-follow.js"></script>
+    <script defer src="/trace-batch.js"></script>
+    <script defer src="/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <div class="brand-mark" aria-hidden="true"><span></span><span></span></div>
+          <div>
+            <div class="brand-line"><strong>AGORA</strong><span>RUNTIME TRACE</span></div>
+            <p>Interactive sandbox session</p>
+          </div>
+        </div>
+
+        <div class="session-facts" aria-label="Session status">
+          <div class="fact connection-fact">
+            <span class="connection-dot" id="connection-dot"></span>
+            <div><small>CONNECTION</small><strong id="connection-label">Connecting</strong></div>
+          </div>
+          <div class="fact trace-fact">
+            <small>ACTIVE TRACE</small>
+            <strong id="active-trace">Waiting for events</strong>
+          </div>
+          <div class="fact elapsed-fact">
+            <small>ELAPSED</small>
+            <strong id="elapsed">00:00</strong>
+          </div>
+        </div>
+
+        <div class="header-actions">
+          <button class="button secondary" id="clear-trace" type="button">Clear trace</button>
+          <button class="button danger" id="stop-session" type="button">Stop session</button>
+          <button class="button primary hidden" id="start-session" type="button">Start new session</button>
+        </div>
+      </header>
+
+      <div class="connection-banner hidden" id="connection-banner" role="status"></div>
+
+      <main class="workspace">
+        <section class="terminal-panel panel" aria-labelledby="terminal-title">
+          <div class="panel-heading terminal-heading">
+            <div>
+              <div class="eyebrow"><span class="pulse-dot"></span> SANDBOX TERMINAL</div>
+              <h1 id="terminal-title">Interactive shell</h1>
+            </div>
+            <div class="terminal-meta">
+              <span id="terminal-size">80 × 24</span>
+              <button class="icon-button" id="copy-terminal" type="button" aria-label="Copy terminal selection" title="Copy selection">COPY</button>
+            </div>
+          </div>
+          <div class="terminal-stage">
+            <div id="terminal" aria-label="Sandbox terminal"></div>
+            <div class="terminal-loading" id="terminal-loading">
+              <div class="loader"></div>
+              <strong>Opening sandbox session</strong>
+              <span>The shell starts only after this page authenticates.</span>
+            </div>
+          </div>
+          <footer class="terminal-footer">
+            <span><kbd>Ctrl</kbd> + <kbd>C</kbd> interrupts the foreground command</span>
+            <span>Commands run inside Agora Sandbox</span>
+          </footer>
+        </section>
+
+        <section class="trace-panel panel" aria-labelledby="trace-title">
+          <div class="panel-heading trace-heading">
+            <div>
+              <div class="eyebrow">LIVE AUDIT STREAM</div>
+              <h2 id="trace-title">Runtime activity <span id="event-count">0</span></h2>
+            </div>
+            <div class="diagnostic-pill hidden" id="diagnostic-pill" title="Malformed or unreadable audit records">
+              <span id="diagnostic-count">0</span> diagnostics
+            </div>
+          </div>
+
+          <div class="trace-tools">
+            <label class="search-box">
+              <span class="sr-only">Search runtime events</span>
+              <span aria-hidden="true">⌕</span>
+              <input id="trace-search" type="search" placeholder="Search path, process, host…" autocomplete="off">
+            </label>
+            <div class="filter-row" aria-label="Event filters">
+              <button class="filter-chip active" type="button" data-filter="exec">EXEC</button>
+              <button class="filter-chip active" type="button" data-filter="file">FILE</button>
+              <button class="filter-chip active" type="button" data-filter="network">NETWORK</button>
+              <label class="toggle">
+                <input id="show-closes" type="checkbox">
+                <span></span>
+                Show closes
+              </label>
+            </div>
+          </div>
+
+          <div class="trace-notice hidden" id="trace-notice" role="status"></div>
+          <div class="timeline" id="timeline" tabindex="0" aria-live="polite">
+            <div class="empty-state" id="empty-state">
+              <div class="empty-rings" aria-hidden="true"><span></span><span></span><i></i></div>
+              <strong>Waiting for runtime activity</strong>
+              <p>Run a command in the terminal. Process execution, opened files, and network destinations will appear here.</p>
+            </div>
+          </div>
+
+          <aside class="detail-panel hidden" id="detail-panel" aria-label="Event details">
+            <div class="detail-header">
+              <div>
+                <span class="event-badge" id="detail-badge">EXEC</span>
+                <strong id="detail-title"></strong>
+              </div>
+              <button class="icon-button close-detail" id="close-detail" type="button" aria-label="Close event details">×</button>
+            </div>
+            <dl class="detail-fields" id="detail-fields"></dl>
+            <details class="raw-details">
+              <summary>Raw audit record</summary>
+              <pre id="detail-raw"></pre>
+            </details>
+          </aside>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

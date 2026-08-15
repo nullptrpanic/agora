@@ -1,0 +1,34 @@
+use crate::filesystem::ByteRangeSet;
+use std::sync::Mutex;
+
+use super::backend::ContentBackend;
+
+pub(crate) struct ManagedContent {
+    pub(crate) state: ContentState,
+    pub(super) backend: Box<dyn ContentBackend>,
+}
+
+pub(crate) struct ContentState {
+    pub(crate) writable: bool,
+    pub(crate) dirty: Mutex<ByteRangeSet>,
+    pub(crate) materialized: Mutex<ByteRangeSet>,
+    pub(crate) mutation: Mutex<()>,
+}
+
+impl ManagedContent {
+    pub(super) fn new(backend: impl ContentBackend + 'static, writable: bool) -> Self {
+        Self {
+            state: ContentState {
+                writable,
+                dirty: Mutex::new(ByteRangeSet::default()),
+                materialized: Mutex::new(ByteRangeSet::default()),
+                mutation: Mutex::new(()),
+            },
+            backend: Box::new(backend),
+        }
+    }
+
+    pub(crate) fn writable(&self) -> bool {
+        self.state.writable
+    }
+}

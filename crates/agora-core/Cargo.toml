@@ -1,0 +1,13 @@
+[package]
+name = "agora-core"
+version = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+log = { version = "0.4.33", features = ["std", "kv_serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+erased-serde = "0.4.10"
