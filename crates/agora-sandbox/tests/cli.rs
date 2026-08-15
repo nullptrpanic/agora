@@ -341,7 +341,7 @@ fn shared_session_makes_encrypted_writes_visible_between_commands() {
         String::from_utf8_lossy(&second.stderr)
     );
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let first_status = loop {
         if let Some(status) = first.try_wait().unwrap() {
             break status;

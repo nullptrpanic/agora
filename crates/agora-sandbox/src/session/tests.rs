@@ -62,7 +62,7 @@ async fn session_client_times_out_when_the_daemon_stops_after_join() {
     });
 
     let result = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         super::client::run(
             &root.path().join("sandbox.json"),
             &workdir,

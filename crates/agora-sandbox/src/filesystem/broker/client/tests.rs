@@ -77,6 +77,7 @@ fn client_retries_busy_mutations_with_a_new_request_id() {
         while requests.len() < 2 && std::time::Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
                     let (request, descriptor) =
                         ipc::receive::<RequestEnvelope>(&mut stream).unwrap();
                     assert!(descriptor.is_none());
