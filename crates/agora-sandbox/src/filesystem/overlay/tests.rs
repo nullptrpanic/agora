@@ -1647,6 +1647,34 @@ fn loader_images_are_plain_cached_and_rebuilt_after_destination_changes() {
 }
 
 #[test]
+fn loader_image_cache_rebuilds_an_unversioned_preparation() {
+    let fixture = Fixture::new();
+    let source = fixture
+        .lower
+        .join("Fixture.app/Contents/Frameworks/liblegacy.dylib");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"loader image").unwrap();
+
+    let destination = fixture.store.prepare_loader_image(&source).unwrap();
+    let previous = SourceIdentity::from_metadata(&destination.symlink_metadata().unwrap());
+    let state = fixture.store.state_for_test(&source).unwrap().unwrap();
+    let mut stored = serde_json::to_value(state).unwrap();
+    stored["variant"] = serde_json::Value::Null;
+    fixture
+        .store
+        .set_state_for_test(&source, serde_json::from_value(stored).unwrap())
+        .unwrap();
+
+    fixture.store.prepare_loader_image(&source).unwrap();
+
+    assert_ne!(
+        SourceIdentity::from_metadata(&destination.symlink_metadata().unwrap()),
+        previous
+    );
+    assert_eq!(std::fs::read(destination).unwrap(), b"loader image");
+}
+
+#[test]
 fn loader_image_preparation_never_replaces_sandbox_cow_content() {
     let fixture = Fixture::new();
     let source = fixture
@@ -1689,6 +1717,170 @@ fn loader_image_preparation_respects_sandbox_whiteouts() {
         fixture.store.state(&source).unwrap(),
         Some(EntryState::Whiteout)
     ));
+}
+
+#[test]
+fn loader_trees_are_clean_cached_wrappers_and_preserve_symlinks() {
+    let fixture = Fixture::new();
+    let source = fixture
+        .lower
+        .join("Fixture.app/Contents/Frameworks/Signed.framework/Versions/A");
+    let resources = source.join("Resources");
+    std::fs::create_dir_all(&resources).unwrap();
+    std::fs::write(source.join("Signed"), b"loader").unwrap();
+    std::fs::write(resources.join("Info.plist"), b"plist").unwrap();
+    symlink("Resources", source.join("CurrentResources")).unwrap();
+
+    let destination = fixture.store.prepare_loader_tree(&source).unwrap();
+    let first_identity = SourceIdentity::from_metadata(&destination.symlink_metadata().unwrap());
+
+    assert_eq!(
+        std::fs::read(destination.join("Signed")).unwrap(),
+        b"loader"
+    );
+    assert_eq!(
+        std::fs::read_link(destination.join("CurrentResources")).unwrap(),
+        Path::new("Resources")
+    );
+    assert!(!destination.join(".metadata").exists());
+    assert!(!destination.join("Resources/.metadata").exists());
+    assert_eq!(
+        fixture.store.prepare_read(&source.join("Signed")).unwrap(),
+        source.join("Signed")
+    );
+    assert!(destination.join("Signed").exists());
+    assert!(
+        fixture
+            .store
+            .directory_view(&source)
+            .unwrap()
+            .is_passthrough()
+    );
+    assert!(matches!(
+        fixture.store.state(&source).unwrap(),
+        Some(EntryState::Cached {
+            materializer: Materializer::LoaderTree,
+            ..
+        })
+    ));
+
+    let reused = fixture.store.prepare_loader_tree(&source).unwrap();
+    assert_eq!(
+        SourceIdentity::from_metadata(&reused.symlink_metadata().unwrap()),
+        first_identity
+    );
+
+    std::fs::write(destination.join("Resources/Info.plist"), b"tampered").unwrap();
+    fixture.store.prepare_loader_tree(&source).unwrap();
+    assert_eq!(
+        std::fs::read(destination.join("Resources/Info.plist")).unwrap(),
+        b"plist"
+    );
+
+    std::fs::write(resources.join("Info.plist"), b"updated plist").unwrap();
+    fixture.store.prepare_loader_tree(&source).unwrap();
+    assert_eq!(
+        std::fs::read(destination.join("Resources/Info.plist")).unwrap(),
+        b"updated plist"
+    );
+}
+
+#[test]
+fn loader_tree_migrates_file_caches_but_never_replaces_cow_descendants() {
+    let fixture = Fixture::new();
+    let source = fixture
+        .lower
+        .join("Fixture.app/Contents/Frameworks/Signed.framework/Versions/A");
+    std::fs::create_dir_all(&source).unwrap();
+    let image = source.join("Signed");
+    std::fs::write(&image, b"loader").unwrap();
+
+    fixture.store.prepare_loader_image(&image).unwrap();
+    assert!(
+        fixture
+            .store
+            .root()
+            .join(source.strip_prefix(Path::new("/")).unwrap())
+            .join(".metadata")
+            .exists()
+    );
+    let destination = fixture.store.prepare_loader_tree(&source).unwrap();
+    assert!(!destination.join(".metadata").exists());
+
+    let upper = fixture.store.prepare_write(&image, false).unwrap();
+    std::fs::write(&upper, b"sandbox loader").unwrap();
+    assert!(fixture.store.state(&source).unwrap().is_none());
+    assert!(matches!(
+        fixture.store.state(&image).unwrap(),
+        Some(EntryState::Cow)
+    ));
+
+    let error = fixture.store.prepare_loader_tree(&source).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("sandbox-modified framework loader tree")
+    );
+    assert_eq!(std::fs::read(upper).unwrap(), b"sandbox loader");
+}
+
+#[test]
+fn encrypted_loader_trees_keep_signed_contents_plain_and_control_files_outside() {
+    let (fixture, _cipher) = Fixture::encrypted();
+    let source = fixture
+        .lower
+        .join("Fixture.app/Contents/Frameworks/Signed.framework/Versions/A");
+    std::fs::create_dir_all(source.join("Resources")).unwrap();
+    std::fs::write(source.join("Signed"), b"loader").unwrap();
+    std::fs::write(source.join("Resources/Info.plist"), b"plist").unwrap();
+
+    let destination = fixture.store.prepare_loader_tree(&source).unwrap();
+
+    assert_eq!(
+        std::fs::read(destination.join("Signed")).unwrap(),
+        b"loader"
+    );
+    assert!(!destination.join(".metadata").exists());
+    assert!(!destination.join("Resources/.metadata").exists());
+    assert_eq!(
+        fixture.store.prepare_read(&source.join("Signed")).unwrap(),
+        source.join("Signed")
+    );
+    assert!(destination.join("Signed").exists());
+}
+
+#[test]
+fn loader_trees_preserve_signed_metadata_named_resources() {
+    let fixture = Fixture::new();
+    let source = fixture
+        .lower
+        .join("Fixture.app/Contents/Frameworks/Signed.framework/Versions/A");
+    let resources = source.join("Resources");
+    std::fs::create_dir_all(&resources).unwrap();
+    std::fs::write(source.join("Signed"), b"loader").unwrap();
+    std::fs::write(resources.join(".metadata"), b"signed resource").unwrap();
+
+    let destination = fixture.store.prepare_loader_tree(&source).unwrap();
+
+    assert_eq!(
+        std::fs::read(destination.join("Resources/.metadata")).unwrap(),
+        b"signed resource"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .prepare_read(&resources.join(".metadata"))
+            .unwrap(),
+        resources.join(".metadata")
+    );
+    assert!(
+        fixture
+            .store
+            .directory_view(&resources)
+            .unwrap()
+            .is_passthrough()
+    );
+    assert!(destination.join("Resources/.metadata").exists());
 }
 
 #[test]
@@ -2010,7 +2202,7 @@ fn executable_cache_rebuilds_when_the_recorded_checksum_is_wrong() {
                 materializer,
                 source: Some(source_identity),
                 variant: Some(format!(
-                    "{}/{}",
+                    "{}/{}/prepare-v1",
                     std::env::consts::OS,
                     std::env::consts::ARCH
                 )),
@@ -2091,6 +2283,47 @@ fn executable_cache_rebuilds_when_the_target_variant_is_wrong() {
         .unwrap();
 
     assert_eq!(std::fs::read(destination).unwrap(), b"target executable");
+}
+
+#[test]
+fn executable_cache_rebuilds_a_legacy_unversioned_target_variant() {
+    let fixture = Fixture::new();
+    let source = fixture.lower.join("legacy-variant-tool");
+    std::fs::write(&source, b"source executable").unwrap();
+    let mut preparations = 0;
+    let destination = fixture
+        .store
+        .prepare_executable(&source, |temporary| {
+            preparations += 1;
+            std::fs::write(temporary, b"legacy executable")?;
+            std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        })
+        .unwrap();
+    let state = fixture.store.state_for_test(&source).unwrap().unwrap();
+    let mut stored = serde_json::to_value(state).unwrap();
+    stored["variant"] = serde_json::Value::String(format!(
+        "{}/{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+    fixture
+        .store
+        .set_state_for_test(&source, serde_json::from_value(stored).unwrap())
+        .unwrap();
+
+    fixture
+        .store
+        .prepare_executable(&source, |temporary| {
+            preparations += 1;
+            std::fs::write(temporary, b"current executable")?;
+            std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(preparations, 2);
+    assert_eq!(std::fs::read(destination).unwrap(), b"current executable");
 }
 
 #[test]

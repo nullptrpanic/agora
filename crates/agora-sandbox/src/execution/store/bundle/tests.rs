@@ -1,7 +1,9 @@
 use super::prepare_dependencies;
 use crate::execution::store::ExecutableStore;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::Path;
+use std::process::Command;
 
 const LC_LOAD_DYLIB: u32 = 0x0c;
 const LC_LOAD_WEAK_DYLIB: u32 = 0x8000_0018;
@@ -152,5 +154,68 @@ fn rejects_tokenized_dependencies_that_escape_the_application_bundle() {
         error
             .to_string()
             .contains("application dependency escapes bundle")
+    );
+}
+
+#[test]
+fn materializes_a_framework_resource_envelope_with_its_loader_image() {
+    let root = tempfile::tempdir().unwrap();
+    let contents = root.path().join("Fixture.app/Contents");
+    let executable = contents.join("MacOS/fixture");
+    let framework = contents.join("Frameworks/Signed.framework");
+    let version = framework.join("Versions/A");
+    let dependency = version.join("Signed");
+    let resources = version.join("Resources");
+    std::fs::create_dir_all(&resources).unwrap();
+    std::fs::write(contents.join("Info.plist"), b"fixture").unwrap();
+    std::fs::copy("/usr/bin/true", &dependency).unwrap();
+    std::fs::write(
+        resources.join("Info.plist"),
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>Signed</string>
+<key>CFBundleIdentifier</key><string>com.example.agora.Signed</string>
+<key>CFBundlePackageType</key><string>FMWK</string>
+<key>CFBundleVersion</key><string>1</string>
+</dict></plist>
+"#,
+    )
+    .unwrap();
+    std::fs::write(resources.join("sealed.txt"), b"sealed resource").unwrap();
+    symlink("A", framework.join("Versions/Current")).unwrap();
+    symlink("Versions/Current/Signed", framework.join("Signed")).unwrap();
+    symlink("Versions/Current/Resources", framework.join("Resources")).unwrap();
+    let status = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-", "--timestamp=none"])
+        .arg(&framework)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    write_image(
+        &executable,
+        &[
+            string_command(
+                LC_LOAD_DYLIB,
+                24,
+                b"@rpath/Signed.framework/Versions/A/Signed",
+            ),
+            string_command(LC_RPATH, 12, b"@executable_path/../Frameworks"),
+        ],
+    );
+    let cache = root.path().join("workdir/fs");
+    let store = ExecutableStore::new(cache.clone()).unwrap();
+
+    prepare_dependencies(&store, &executable, "x86_64").unwrap();
+
+    let prepared = cache.join(dependency.strip_prefix(Path::new("/")).unwrap());
+    let output = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict", "--verbose=4"])
+        .arg(&prepared)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "prepared framework signature is invalid: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

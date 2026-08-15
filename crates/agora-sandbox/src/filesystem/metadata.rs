@@ -29,6 +29,7 @@ pub(crate) enum Materializer {
     Copy,
     Executable,
     Loader,
+    LoaderTree,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -574,6 +575,21 @@ impl MetadataStore {
             .into_iter()
             .map(|(name, state)| Ok((Self::decode(&name)?, state)))
             .collect()
+    }
+
+    pub(super) fn contains_only_loader_cache_records(&self, directory: &Path) -> Result<bool> {
+        let metadata = self.load(directory)?;
+        Ok(metadata.attributes.is_empty()
+            && metadata.encrypted_names.is_empty()
+            && metadata.entries.values().all(|state| {
+                matches!(
+                    state,
+                    EntryState::Cached {
+                        materializer: Materializer::Loader,
+                        ..
+                    }
+                )
+            }))
     }
 
     pub(super) fn encrypted_name(&self, path: &Path) -> Result<Option<OsString>> {

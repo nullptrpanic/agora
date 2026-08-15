@@ -1,6 +1,6 @@
 use super::{
     ArchitectureSelection, CPU_SUBTYPE_ARM64E, CPU_TYPE_ARM64, CS_DYLD_RESTRICTED, CS_RUNTIME,
-    ExecutableStore, MACH_64_MAGIC, resolve_shebang,
+    CodeSignature, ExecutableStore, MACH_64_MAGIC, resolve_shebang,
 };
 use crate::execution::resolve_executable;
 use crate::filesystem::{EntryState, Materializer};
@@ -40,33 +40,41 @@ impl Drop for TestDirectory {
 }
 
 #[test]
-fn code_signing_flags_are_cached_for_an_unchanged_executable() {
+fn code_signatures_are_cached_for_an_unchanged_executable() {
     let root = TestDirectory::new();
     let executable = root.path().join("executable");
     fs::write(&executable, b"first").unwrap();
     let inspections = AtomicUsize::new(0);
 
     let metadata = executable.metadata().unwrap();
-    let first = ExecutableStore::cached_code_signing_flags(&metadata, || {
+    let first = ExecutableStore::cached_code_signature(&metadata, || {
         inspections.fetch_add(1, Ordering::Relaxed);
-        Ok(7)
+        Ok(CodeSignature {
+            flags: 7,
+            ..CodeSignature::default()
+        })
     })
     .unwrap();
-    let cached = ExecutableStore::cached_code_signing_flags(&metadata, || {
+    let cached = ExecutableStore::cached_code_signature(&metadata, || {
         inspections.fetch_add(1, Ordering::Relaxed);
-        Ok(9)
+        Ok(CodeSignature {
+            flags: 9,
+            ..CodeSignature::default()
+        })
     })
     .unwrap();
 
     fs::write(&executable, b"changed contents").unwrap();
-    let changed =
-        ExecutableStore::cached_code_signing_flags(&executable.metadata().unwrap(), || {
-            inspections.fetch_add(1, Ordering::Relaxed);
-            Ok(11)
+    let changed = ExecutableStore::cached_code_signature(&executable.metadata().unwrap(), || {
+        inspections.fetch_add(1, Ordering::Relaxed);
+        Ok(CodeSignature {
+            flags: 11,
+            ..CodeSignature::default()
         })
-        .unwrap();
+    })
+    .unwrap();
 
-    assert_eq!((first, cached, changed), (7, 7, 11));
+    assert_eq!((first.flags, cached.flags, changed.flags), (7, 7, 11));
     assert_eq!(inspections.load(Ordering::Relaxed), 2);
 }
 
@@ -98,7 +106,14 @@ fn executable_store_prepares_and_caches_a_native_copy() {
     assert!(destination.is_some());
     assert_eq!(
         variant.as_deref(),
-        Some(format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH).as_str())
+        Some(
+            format!(
+                "{}/{}/prepare-v1",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+            .as_str()
+        )
     );
     assert!(!first.with_extension("md5").exists());
     assert!(first.is_file());
@@ -131,7 +146,11 @@ fn executable_store_prepares_and_caches_a_native_copy() {
     assert!(metadata["entries"]["sh"]["entry"]["destination"].is_object());
     assert_eq!(
         metadata["entries"]["sh"]["entry"]["variant"],
-        format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)
+        format!(
+            "{}/{}/prepare-v1",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
     );
 }
 
@@ -301,6 +320,151 @@ fn executable_store_preserves_entitlements_when_resigning() {
         ExecutableStore::code_signing_flags(&prepared).unwrap() & CS_DYLD_RESTRICTED,
         0
     );
+}
+
+#[test]
+fn executable_store_rejects_identity_bound_entitlements_before_caching() {
+    let root = TestDirectory::new();
+    let source = root.path().join("identity-bound-sh");
+    let entitlements = root.path().join("entitlements.plist");
+    fs::copy("/bin/sh", &source).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        &entitlements,
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+          <plist version=\"1.0\"><dict>\
+          <key>com.apple.application-identifier</key>\
+          <string>TEAMID.com.example.agora-fixture</string>\
+          <key>com.apple.security.cs.allow-jit</key><true/>\
+          </dict></plist>\n",
+    )
+    .unwrap();
+    let status = Command::new("/usr/bin/codesign")
+        .args([
+            "--force",
+            "--sign",
+            "-",
+            "--options",
+            "runtime",
+            "--identifier",
+            "com.example.agora-fixture",
+            "--timestamp=none",
+        ])
+        .arg("--entitlements")
+        .arg(&entitlements)
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
+    let destination = store.destination(&source).unwrap();
+
+    let error = store.prepare(&source).unwrap_err();
+
+    assert_eq!(
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error),
+        Some(libc::ENOTSUP)
+    );
+    let message = error.to_string();
+    assert!(message.contains(&source.display().to_string()));
+    assert!(message.contains("com.apple.application-identifier"));
+    assert!(!destination.exists());
+    assert_eq!(store.overlay.state(&source).unwrap(), None);
+}
+
+#[test]
+fn executable_store_does_not_reuse_an_identity_bound_cached_copy() {
+    let root = TestDirectory::new();
+    let source = root.path().join("identity-bound-sh");
+    let entitlements = root.path().join("entitlements.plist");
+    fs::copy("/bin/sh", &source).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        &entitlements,
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+          <plist version=\"1.0\"><dict>\
+          <key>com.apple.developer.team-identifier</key><string>TEAMID</string>\
+          </dict></plist>\n",
+    )
+    .unwrap();
+    let status = Command::new("/usr/bin/codesign")
+        .args([
+            "--force",
+            "--sign",
+            "-",
+            "--options",
+            "runtime",
+            "--timestamp=none",
+        ])
+        .arg("--entitlements")
+        .arg(&entitlements)
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
+    let cached = store
+        .overlay
+        .prepare_executable(&source, |temporary| {
+            fs::copy(&source, temporary)?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(cached.exists());
+
+    let error = store.prepare(&source).unwrap_err();
+
+    assert_eq!(
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error),
+        Some(libc::ENOTSUP)
+    );
+    let message = error.to_string();
+    assert!(message.contains(&source.display().to_string()));
+    assert!(message.contains("com.apple.developer.team-identifier"));
+}
+
+#[test]
+fn identity_bound_entitlement_policy_is_generic() {
+    for entitlement in [
+        "application-identifier",
+        "com.apple.application-identifier",
+        "com.apple.developer.icloud-services",
+        "com.apple.developer.team-identifier",
+        "com.apple.private.security.no-container",
+        "com.apple.rootless.storage.AppData",
+        "com.apple.security.application-groups",
+        "com.apple.security.system-container",
+        "com.apple.security.system-groups",
+        "keychain-access-groups",
+        "aps-environment",
+        "beta-reports-active",
+        "fairplay-client",
+        "useractivity-team-identifier",
+    ] {
+        assert!(
+            ExecutableStore::requires_original_signing_identity(entitlement),
+            "expected {entitlement} to require the original signing identity"
+        );
+    }
+
+    for entitlement in [
+        "com.apple.security.app-sandbox",
+        "com.apple.security.automation.apple-events",
+        "com.apple.security.cs.allow-jit",
+        "com.apple.security.network.client",
+        "com.example.custom-entitlement",
+    ] {
+        assert!(
+            !ExecutableStore::requires_original_signing_identity(entitlement),
+            "expected {entitlement} to remain eligible for ad-hoc preparation"
+        );
+    }
 }
 
 #[test]

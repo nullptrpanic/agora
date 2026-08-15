@@ -18,6 +18,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
 const LOCK_DESCRIPTOR_POOL_CAPACITY: usize = 16;
+// Increment when executable or loader preparation can produce different bytes
+// for the same source and target platform.
+const PREPARED_FILE_CACHE_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BackingIdentity {
@@ -813,7 +816,7 @@ impl OverlayStore {
         self.prepare_plain_cached(
             &source,
             Materializer::Loader,
-            None,
+            Some(Self::loader_variant()),
             false,
             "loader",
             |temporary| {
@@ -821,6 +824,102 @@ impl OverlayStore {
                 Ok(())
             },
         )
+    }
+
+    pub(crate) fn prepare_loader_tree(&self, source: &Path) -> Result<PathBuf> {
+        let source = self.normalize(source)?;
+        self.with_lock(|| {
+            let source_metadata = source.symlink_metadata()?;
+            if !source_metadata.is_dir() {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR).into());
+            }
+            let destination = self.plain_destination(&source)?;
+            let source_identity = SourceIdentity::from_metadata(&source_metadata);
+            let source_checksum = Self::tree_checksum(&source)?;
+            let (cached, cow_ancestor) = self.reconciled_entry_locked(&source)?;
+            if cow_ancestor {
+                bail!(
+                    "cannot prepare loader tree below a sandbox-modified directory: {}",
+                    source.display()
+                );
+            }
+            match &cached {
+                Some(EntryState::Cow) => bail!(
+                    "cannot prepare sandbox-modified loader tree: {}",
+                    source.display()
+                ),
+                Some(EntryState::Whiteout) => return Self::not_found(&source),
+                Some(EntryState::Cached { .. }) | None => {}
+            }
+            if let (
+                Ok(destination_metadata),
+                Some(EntryState::Cached {
+                    checksum: Some(cached_checksum),
+                    materializer: Materializer::LoaderTree,
+                    source: Some(cached_source),
+                    variant: cached_variant,
+                    destination: cached_destination,
+                }),
+            ) = (destination.symlink_metadata(), cached.as_ref())
+                && destination_metadata.is_dir()
+                && *cached_source == source_identity
+                && cached_variant.as_ref() == Some(&Self::loader_variant())
+                && cached_checksum == &source_checksum
+                && *cached_destination == Some(SourceIdentity::from_metadata(&destination_metadata))
+                && Self::tree_checksum(&destination)
+                    .is_ok_and(|checksum| checksum == source_checksum)
+            {
+                return Ok(destination);
+            }
+            if destination.exists()
+                && !matches!(
+                    cached,
+                    Some(EntryState::Cached {
+                        materializer: Materializer::LoaderTree,
+                        ..
+                    })
+                )
+                && !self.loader_tree_destination_is_replaceable_locked(&source)?
+            {
+                bail!(
+                    "cannot replace sandbox-modified framework loader tree: {}",
+                    source.display()
+                );
+            }
+            let parent = destination
+                .parent()
+                .context("cached loader tree destination has no parent")?;
+            self.ensure_parent_locked(&source)?;
+            let temporary = parent.join(format!(
+                ".agora-loader-tree-{}.tmp",
+                Uuid::new_v4().simple()
+            ));
+            let result = (|| {
+                Self::copy_plain_tree(&source, &temporary)?;
+                if Self::tree_checksum(&temporary)? != source_checksum {
+                    bail!("loader tree changed while it was being prepared");
+                }
+                Self::remove_existing(&destination)?;
+                fs::rename(&temporary, &destination)?;
+                self.metadata.set(
+                    &source,
+                    EntryState::Cached {
+                        checksum: Some(source_checksum),
+                        materializer: Materializer::LoaderTree,
+                        source: Some(source_identity),
+                        variant: Some(Self::loader_variant()),
+                        destination: Some(SourceIdentity::from_metadata(
+                            &destination.symlink_metadata()?,
+                        )),
+                    },
+                )?;
+                Ok(destination.clone())
+            })();
+            if result.is_err() {
+                let _ = Self::remove_existing(&temporary);
+            }
+            result
+        })
     }
 
     fn prepare_plain_cached<F>(
@@ -934,8 +1033,127 @@ impl OverlayStore {
         Ok(Self::hex_digest(digest.finalize().as_slice()))
     }
 
+    fn tree_checksum(root: &Path) -> Result<String> {
+        let root_metadata = root.symlink_metadata()?;
+        if !root_metadata.is_dir() {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR).into());
+        }
+        let mut digest = Md5::new();
+        digest.update(b"loader-tree-v1");
+        digest.update((root_metadata.mode() | 0o700).to_le_bytes());
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let mut entries = fs::read_dir(&directory)?.collect::<std::io::Result<Vec<_>>>()?;
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries.into_iter().rev() {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .context("loader tree entry escaped its root")?;
+                let metadata = path.symlink_metadata()?;
+                let file_type = metadata.file_type();
+                let kind = if file_type.is_dir() {
+                    b'd'
+                } else if file_type.is_file() {
+                    b'f'
+                } else if file_type.is_symlink() {
+                    b'l'
+                } else {
+                    return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into());
+                };
+                digest.update([kind]);
+                Self::update_digest_bytes(&mut digest, relative.as_os_str().as_bytes());
+                let mode = if file_type.is_dir() {
+                    metadata.mode() | 0o700
+                } else {
+                    metadata.mode()
+                };
+                digest.update(mode.to_le_bytes());
+                if file_type.is_dir() {
+                    pending.push(path);
+                } else if file_type.is_symlink() {
+                    let target = fs::read_link(path)?;
+                    Self::update_digest_bytes(&mut digest, target.as_os_str().as_bytes());
+                } else {
+                    digest.update(metadata.len().to_le_bytes());
+                    let mut file = File::open(path)?;
+                    let mut buffer = [0_u8; 64 * 1024];
+                    loop {
+                        let read = file.read(&mut buffer)?;
+                        if read == 0 {
+                            break;
+                        }
+                        digest.update(&buffer[..read]);
+                    }
+                }
+            }
+        }
+        Ok(Self::hex_digest(digest.finalize().as_slice()))
+    }
+
+    fn loader_tree_destination_is_replaceable_locked(&self, source: &Path) -> Result<bool> {
+        let mut pending = vec![source.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            if !self
+                .metadata
+                .contains_only_loader_cache_records(&directory)?
+            {
+                return Ok(false);
+            }
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn update_digest_bytes(digest: &mut Md5, bytes: &[u8]) {
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+
+    fn copy_plain_tree(source: &Path, destination: &Path) -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let source_metadata = source.symlink_metadata()?;
+        fs::create_dir(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let from = entry.path();
+            let to = destination.join(entry.file_name());
+            let metadata = from.symlink_metadata()?;
+            let file_type = metadata.file_type();
+            if file_type.is_dir() {
+                Self::copy_plain_tree(&from, &to)?;
+            } else if file_type.is_symlink() {
+                symlink(fs::read_link(&from)?, &to)?;
+            } else if file_type.is_file() {
+                fs::copy(&from, &to)?;
+                fs::set_permissions(&to, fs::Permissions::from_mode(metadata.mode() & 0o7777))?;
+            } else {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into());
+            }
+        }
+        fs::set_permissions(
+            destination,
+            fs::Permissions::from_mode((source_metadata.mode() & 0o7777) | 0o700),
+        )?;
+        Ok(())
+    }
+
     fn executable_variant() -> String {
-        format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)
+        format!(
+            "{}/{}/prepare-v{PREPARED_FILE_CACHE_VERSION}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    }
+
+    fn loader_variant() -> String {
+        format!("prepare-v{PREPARED_FILE_CACHE_VERSION}")
     }
 
     #[cfg(test)]
@@ -1059,6 +1277,7 @@ impl OverlayStore {
     }
 
     fn stage_write_locked(&self, path: &Path, create: bool) -> Result<PathBuf> {
+        self.detach_loader_tree_locked(path)?;
         let (state, cow_ancestor) = self.reconciled_entry_locked(path)?;
         if cow_ancestor {
             let destination = match self.metadata.encrypted_name(path)? {
@@ -1176,6 +1395,7 @@ impl OverlayStore {
     }
 
     fn set_attributes_locked(&self, path: &Path, attributes: FileAttributes) -> Result<()> {
+        self.detach_loader_tree_locked(path)?;
         self.reconciled_state_locked(path)?;
         self.metadata.set_attributes(path, attributes)
     }
@@ -1237,6 +1457,12 @@ impl OverlayStore {
     }
 
     fn prepare_directory_locked(&self, path: &Path) -> Result<PathBuf> {
+        if self.loader_tree_ancestor_locked(path, true)?.is_some() {
+            return path
+                .is_dir()
+                .then(|| path.to_path_buf())
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT).into());
+        }
         let destination = self.destination(path)?;
         let (state, cow_ancestor) = self.reconciled_entry_locked(path)?;
         if matches!(state, Some(EntryState::Whiteout)) {
@@ -1258,6 +1484,7 @@ impl OverlayStore {
     }
 
     fn ensure_directory_locked(&self, path: &Path) -> Result<PathBuf> {
+        self.detach_loader_tree_locked(path)?;
         let destination = self.destination(path)?;
         let (state, cow_ancestor) = self.reconciled_entry_locked(path)?;
         if matches!(state, Some(EntryState::Whiteout)) {
@@ -1288,6 +1515,12 @@ impl OverlayStore {
     }
 
     fn directory_view_locked(&self, path: &Path) -> Result<DirectoryView> {
+        if self.loader_tree_ancestor_locked(path, true)?.is_some() {
+            return path
+                .is_dir()
+                .then(|| DirectoryView::passthrough(path.to_path_buf()))
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT).into());
+        }
         let (state, cow_ancestor) = self.reconciled_entry_locked(path)?;
         if matches!(state, Some(EntryState::Whiteout)) {
             return Self::not_found(path);
@@ -1439,6 +1672,7 @@ impl OverlayStore {
     }
 
     fn remove_locked(&self, path: &Path, directory: bool) -> Result<()> {
+        self.detach_loader_tree_locked(path)?;
         if !self.visible_exists_locked(path)? {
             return Self::not_found(path);
         }
@@ -1508,6 +1742,8 @@ impl OverlayStore {
     }
 
     fn rename_locked(&self, from: &Path, to: &Path) -> Result<()> {
+        self.detach_loader_tree_locked(from)?;
+        self.detach_loader_tree_locked(to)?;
         if from == to {
             return self
                 .visible_exists_locked(from)?
@@ -1700,6 +1936,15 @@ impl OverlayStore {
                 whiteouts.insert(path);
                 continue;
             }
+            if matches!(
+                state,
+                Some(EntryState::Cached {
+                    materializer: Materializer::LoaderTree,
+                    ..
+                })
+            ) {
+                continue;
+            }
             let destination = self.plain_destination(&path)?;
             match destination.symlink_metadata() {
                 Ok(metadata) if metadata.is_dir() && self.metadata.has_marker(&path)? => {
@@ -1719,8 +1964,50 @@ impl OverlayStore {
     }
 
     fn reconciled_entry_locked(&self, path: &Path) -> Result<(Option<EntryState>, bool)> {
+        if self.loader_tree_ancestor_locked(path, false)?.is_some() {
+            return Ok((None, false));
+        }
         let cow_ancestor = self.reconcile_ancestors_locked(path)?;
         Ok((self.reconcile_entry_locked(path)?, cow_ancestor))
+    }
+
+    fn loader_tree_ancestor_locked(
+        &self,
+        path: &Path,
+        include_self: bool,
+    ) -> Result<Option<PathBuf>> {
+        let mut ancestors = path
+            .ancestors()
+            .skip(usize::from(!include_self))
+            .take_while(|ancestor| *ancestor != Path::new("/"))
+            .collect::<Vec<_>>();
+        ancestors.reverse();
+        for ancestor in ancestors {
+            if matches!(
+                self.metadata.state(ancestor)?,
+                Some(EntryState::Cached {
+                    materializer: Materializer::LoaderTree,
+                    ..
+                })
+            ) && matches!(
+                self.reconcile_entry_locked(ancestor)?,
+                Some(EntryState::Cached {
+                    materializer: Materializer::LoaderTree,
+                    ..
+                })
+            ) {
+                return Ok(Some(ancestor.to_path_buf()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn detach_loader_tree_locked(&self, path: &Path) -> Result<()> {
+        let Some(root) = self.loader_tree_ancestor_locked(path, true)? else {
+            return Ok(());
+        };
+        Self::remove_existing(&self.plain_destination(&root)?)?;
+        self.metadata.remove(&root)
     }
 
     fn reconcile_ancestors_locked(&self, path: &Path) -> Result<bool> {

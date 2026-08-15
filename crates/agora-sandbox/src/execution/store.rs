@@ -44,6 +44,12 @@ struct ExecutableIdentity {
     flags: u32,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CodeSignature {
+    flags: u32,
+    entitlement_keys: Vec<String>,
+}
+
 impl ExecutableIdentity {
     fn new(metadata: &Metadata) -> Self {
         Self {
@@ -102,16 +108,16 @@ impl ExecutableStore {
         Ok(Self { overlay })
     }
 
-    pub(super) fn prepare(&self, source: &Path) -> Result<PathBuf> {
-        if !self.overlay.is_internal(source) && self.overlay.is_private(source)? {
+    pub(super) fn prepare(&self, requested: &Path) -> Result<PathBuf> {
+        if !self.overlay.is_internal(requested) && self.overlay.is_private(requested)? {
             return Err(io::Error::from_raw_os_error(libc::EACCES)).with_context(|| {
                 format!(
                     "sandbox executable is inside the private work directory: {}",
-                    source.display()
+                    requested.display()
                 )
             });
         }
-        let source = self.resolve_source(source)?;
+        let source = self.resolve_source(requested)?;
         if source == Path::new("/usr/bin/open") {
             return Err(io::Error::from_raw_os_error(libc::ENOTSUP)).context(
                 "system-mediated application launch is unsupported; execute the application bundle binary directly",
@@ -125,20 +131,24 @@ impl ExecutableStore {
             if !Self::requires_copy(&source, &metadata)? {
                 return Ok(source);
             }
+            Self::validate_ad_hoc_resigning(&source, requested, &metadata)?;
             bundle::prepare_dependencies(self, &source, Self::native_architecture())?;
             self.prepare_copy(&source, &metadata)
-        } else if matches!(
-            self.overlay.state(&source)?,
-            Some(EntryState::Cached {
-                materializer: Materializer::Executable,
-                ..
-            })
-        ) {
-            Ok(source)
         } else {
-            let source = self.prepare_internal_copy(&source, &metadata)?;
-            self.overlay.mark_executable(&source)?;
-            Ok(source)
+            Self::validate_ad_hoc_resigning(&source, requested, &metadata)?;
+            if matches!(
+                self.overlay.state(&source)?,
+                Some(EntryState::Cached {
+                    materializer: Materializer::Executable,
+                    ..
+                })
+            ) {
+                Ok(source)
+            } else {
+                let source = self.prepare_internal_copy(&source, &metadata)?;
+                self.overlay.mark_executable(&source)?;
+                Ok(source)
+            }
         }
     }
 
@@ -160,45 +170,59 @@ impl ExecutableStore {
     fn requires_copy(source: &Path, metadata: &Metadata) -> Result<bool> {
         let sip_restricted =
             metadata.st_flags() & SF_RESTRICTED != 0 && sip_restricts_protected_files();
-        Ok(sip_restricted
-            || Self::cached_code_signing_flags(metadata, || Self::code_signing_flags(source))?
-                & CS_DYLD_RESTRICTED
-                != 0)
+        let signature =
+            Self::cached_code_signature(metadata, || Self::inspect_code_signature(source))?;
+        Ok(sip_restricted || signature.flags & CS_DYLD_RESTRICTED != 0)
     }
 
-    fn cached_code_signing_flags(
+    fn cached_code_signature(
         metadata: &Metadata,
-        inspect: impl FnOnce() -> Result<u32>,
-    ) -> Result<u32> {
-        static CACHE: OnceLock<Mutex<HashMap<ExecutableIdentity, u32>>> = OnceLock::new();
+        inspect: impl FnOnce() -> Result<CodeSignature>,
+    ) -> Result<CodeSignature> {
+        static CACHE: OnceLock<Mutex<HashMap<ExecutableIdentity, CodeSignature>>> = OnceLock::new();
 
         let identity = ExecutableIdentity::new(metadata);
         let mut cache = CACHE
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(flags) = cache.get(&identity) {
-            return Ok(*flags);
+        if let Some(signature) = cache.get(&identity) {
+            return Ok(signature.clone());
         }
-        let flags = inspect()?;
+        let signature = inspect()?;
         if cache.len() >= SIGNATURE_CACHE_CAPACITY {
             cache.clear();
         }
-        cache.insert(identity, flags);
-        Ok(flags)
+        cache.insert(identity, signature.clone());
+        Ok(signature)
     }
 
+    #[cfg(test)]
     fn code_signing_flags(source: &Path) -> Result<u32> {
+        Ok(Self::inspect_code_signature(source)?.flags)
+    }
+
+    fn inspect_code_signature(source: &Path) -> Result<CodeSignature> {
         let output = Command::new("/usr/bin/codesign")
-            .args(["--display", "--verbose=4"])
+            .args(["--display", "--verbose=4", "--entitlements", "-", "--xml"])
             .arg(source)
             .output()
             .context("failed to run codesign while inspecting an executable signature")?;
         if !output.status.success() {
-            return Ok(0);
+            return Ok(CodeSignature::default());
         }
-        Self::parse_code_signing_flags(&output.stderr)
-            .context("failed to parse executable code signature")
+        let flags = Self::parse_code_signing_flags(&output.stderr)
+            .context("failed to parse executable code signature")?;
+        let entitlement_keys = Self::parse_entitlement_keys(&output.stdout).with_context(|| {
+            format!(
+                "failed to parse entitlements for executable {}",
+                source.display()
+            )
+        })?;
+        Ok(CodeSignature {
+            flags,
+            entitlement_keys,
+        })
     }
 
     fn parse_code_signing_flags(details: &[u8]) -> Result<u32> {
@@ -211,6 +235,70 @@ impl ExecutableStore {
             .find(|byte: char| !byte.is_ascii_hexdigit())
             .unwrap_or(flags.len());
         u32::from_str_radix(&flags[..end], 16).context("invalid CodeDirectory flags")
+    }
+
+    fn parse_entitlement_keys(plist: &[u8]) -> Result<Vec<String>> {
+        if plist.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut input = tempfile::tempfile().context("failed to stage executable entitlements")?;
+        input
+            .write_all(plist)
+            .context("failed to stage executable entitlements")?;
+        input
+            .seek(SeekFrom::Start(0))
+            .context("failed to rewind executable entitlements")?;
+        let output = Command::new("/usr/bin/plutil")
+            .args(["-convert", "json", "-o", "-", "--", "-"])
+            .stdin(input)
+            .output()
+            .context("failed to run plutil while inspecting executable entitlements")?;
+        let json = Self::check_output(output, "failed to decode executable entitlements")?;
+        let entitlements: BTreeMap<String, serde_json::Value> = serde_json::from_str(&json)
+            .context("executable entitlements are not a property-list dictionary")?;
+        Ok(entitlements.into_keys().collect())
+    }
+
+    fn validate_ad_hoc_resigning(
+        source: &Path,
+        requested: &Path,
+        metadata: &Metadata,
+    ) -> Result<()> {
+        let signature =
+            Self::cached_code_signature(metadata, || Self::inspect_code_signature(source))?;
+        let unsupported = signature
+            .entitlement_keys
+            .into_iter()
+            .filter(|entitlement| Self::requires_original_signing_identity(entitlement))
+            .collect::<Vec<_>>();
+        if unsupported.is_empty() {
+            return Ok(());
+        }
+        Err(io::Error::from_raw_os_error(libc::ENOTSUP)).with_context(|| {
+            format!(
+                "sandbox cannot prepare executable {} because ad-hoc signing cannot preserve its original signing identity for entitlements: {}",
+                requested.display(),
+                unsupported.join(", ")
+            )
+        })
+    }
+
+    fn requires_original_signing_identity(entitlement: &str) -> bool {
+        matches!(
+            entitlement,
+            "application-identifier"
+                | "aps-environment"
+                | "beta-reports-active"
+                | "com.apple.application-identifier"
+                | "com.apple.security.application-groups"
+                | "com.apple.security.system-container"
+                | "com.apple.security.system-groups"
+                | "fairplay-client"
+                | "keychain-access-groups"
+                | "useractivity-team-identifier"
+        ) || entitlement.starts_with("com.apple.developer.")
+            || entitlement.starts_with("com.apple.private.")
+            || entitlement.starts_with("com.apple.rootless.")
     }
 
     fn prepare_copy(&self, source: &Path, metadata: &Metadata) -> Result<PathBuf> {
