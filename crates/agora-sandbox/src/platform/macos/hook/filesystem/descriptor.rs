@@ -10,6 +10,13 @@ type TruncateFn = unsafe extern "C" fn(*const libc::c_char, libc::off_t) -> libc
 type FtruncateFn = unsafe extern "C" fn(libc::c_int, libc::off_t) -> libc::c_int;
 pub(super) type FlockFn = unsafe extern "C" fn(libc::c_int, libc::c_int) -> libc::c_int;
 
+struct FcntlDuplicateTransaction {
+    _operation: mapping::OperationLease<'static>,
+    _guard: FilesystemHookGuard,
+    runtime: &'static FilesystemHookRuntime,
+    source: libc::c_int,
+}
+
 unsafe fn sandbox_truncate(path: *const libc::c_char, length: libc::off_t) -> libc::c_int {
     catch_filesystem_panic(-1, || {
         let Some(original) = original_truncate() else {
@@ -106,6 +113,11 @@ unsafe fn sandbox_descriptor_mutation_with_truncate(
     let Some(runtime) = FilesystemHookRuntime::global() else {
         return operation(descriptor);
     };
+    let descriptor_operation = runtime.operations.acquire(
+        mapping::OperationRequest::new()
+            .descriptor_registry_shared()
+            .descriptor_shared(descriptor),
+    );
     if runtime.native_passthrough_descriptor(descriptor) {
         return operation(descriptor);
     }
@@ -153,6 +165,7 @@ unsafe fn sandbox_descriptor_mutation_with_truncate(
             {
                 return unsafe { fail(&error, -1) };
             }
+            drop(descriptor_operation);
             if let Err(error) = runtime.writeback(descriptor) {
                 return unsafe { fail(&error, -1) };
             }
@@ -204,7 +217,7 @@ pub unsafe extern "C" fn agora_sandbox_ftruncate(
     unsafe { sandbox_ftruncate(descriptor, length) }
 }
 
-unsafe fn sandbox_close(
+pub(super) unsafe fn sandbox_close(
     descriptor: libc::c_int,
     operation: impl FnOnce(libc::c_int) -> libc::c_int,
 ) -> libc::c_int {
@@ -215,12 +228,18 @@ unsafe fn sandbox_close(
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return operation(descriptor);
         };
+        let _operation = runtime.operations.acquire(
+            mapping::OperationRequest::new()
+                .descriptor_registry_shared()
+                .descriptor_exclusive(descriptor),
+        );
+        let transition = runtime.begin_descriptor_transition_under_lease(descriptor);
         if let Some(file) = runtime.tracked(descriptor)
             && let Err(error) = runtime.publish(FileOperation::Close, file)
         {
             return unsafe { fail_audit(&error, -1) };
         }
-        let tracked = runtime.take_descriptor(descriptor);
+        let tracked = runtime.take_descriptor_during_transition_under_lease(descriptor);
         if let Some((open, true)) = &tracked {
             let result = if runtime.has_mapping(open) {
                 runtime.commit_open_file(descriptor, open, true)
@@ -228,7 +247,7 @@ unsafe fn sandbox_close(
                 runtime.finish_open_file(descriptor, open)
             };
             if let Err(error) = result {
-                runtime.restore_descriptor(descriptor, Arc::clone(open));
+                runtime.restore_descriptor_under_lease(descriptor, Arc::clone(open));
                 return unsafe { fail(&error, -1) };
             }
         }
@@ -241,8 +260,9 @@ unsafe fn sandbox_close(
         if result != 0
             && let Some((open, _)) = tracked
         {
-            runtime.restore_descriptor(descriptor, open);
+            runtime.restore_descriptor_under_lease(descriptor, open);
         } else if result == 0 {
+            transition.clear();
             runtime.unregister_directory(descriptor);
         }
         result
@@ -296,6 +316,12 @@ unsafe fn sandbox_fclose(stream: *mut libc::FILE) -> libc::c_int {
         } else {
             unsafe { libc::fileno(stream) }
         };
+        let _operation = runtime.operations.acquire(
+            mapping::OperationRequest::new()
+                .descriptor_registry_shared()
+                .descriptor_exclusive(descriptor),
+        );
+        let transition = runtime.begin_descriptor_transition_under_lease(descriptor);
         if let Some(file) = runtime.tracked(descriptor)
             && let Err(error) = runtime.publish(FileOperation::Close, file)
         {
@@ -307,7 +333,7 @@ unsafe fn sandbox_fclose(stream: *mut libc::FILE) -> libc::c_int {
             0
         };
         let flush_errno = (flush_result != 0).then(|| unsafe { *libc::__error() });
-        let tracked = runtime.take_descriptor(descriptor);
+        let tracked = runtime.take_descriptor_during_transition_under_lease(descriptor);
         if let Some((open, true)) = &tracked {
             let result = if runtime.has_mapping(open) {
                 runtime.commit_open_file(descriptor, open, true)
@@ -315,11 +341,12 @@ unsafe fn sandbox_fclose(stream: *mut libc::FILE) -> libc::c_int {
                 runtime.finish_open_file(descriptor, open)
             };
             if let Err(error) = result {
-                runtime.restore_descriptor(descriptor, Arc::clone(open));
+                runtime.restore_descriptor_under_lease(descriptor, Arc::clone(open));
                 return unsafe { fail(&error, -1) };
             }
         }
         let result = unsafe { original(stream) };
+        transition.clear();
         if let Some((open, last_alias)) = &tracked {
             release_local_close_locks(open, *last_alias);
         }
@@ -392,15 +419,20 @@ pub unsafe extern "C" fn agora_sandbox_dup(descriptor: libc::c_int) -> libc::c_i
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let result = unsafe { original(descriptor) };
-        if result < 0 {
-            return result;
-        }
         let Some(_guard) = FilesystemHookGuard::enter() else {
-            return result;
+            return unsafe { original(descriptor) };
         };
-        if let Some(runtime) = FilesystemHookRuntime::global() {
-            runtime.duplicate_descriptor(descriptor, result);
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return unsafe { original(descriptor) };
+        };
+        let _operation = runtime.operations.acquire(
+            mapping::OperationRequest::new()
+                .descriptor_registry_shared()
+                .descriptor_shared(descriptor),
+        );
+        let result = unsafe { original(descriptor) };
+        if result >= 0 {
+            runtime.duplicate_descriptor_under_lease(descriptor, result);
         }
         result
     })
@@ -425,13 +457,16 @@ pub unsafe extern "C" fn agora_sandbox_dup2(
         if source == destination {
             return unsafe { original(source, destination) };
         }
-        if let Err(error) = runtime.writeback(destination) {
-            return unsafe { fail(&error, -1) };
-        }
+        let _operation = match runtime.acquire_descriptor_replacement(Some(source), destination) {
+            Ok(operation) => operation,
+            Err(error) => return unsafe { fail(&error, -1) },
+        };
+        let transition = runtime.begin_descriptor_transition_under_lease(destination);
         let result = unsafe { original(source, destination) };
         if result >= 0 {
-            let replaced = runtime.take_descriptor(destination);
-            runtime.duplicate_descriptor(source, destination);
+            let replaced = runtime.take_descriptor_during_transition_under_lease(destination);
+            runtime.duplicate_descriptor_under_lease(source, destination);
+            transition.commit();
             if let Some((open, last_alias)) = &replaced {
                 release_local_close_locks(open, *last_alias);
             }
@@ -447,16 +482,44 @@ pub unsafe extern "C" fn agora_sandbox_dup2(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn agora_sandbox_track_fcntl_duplicate(
-    source: libc::c_int,
+pub extern "C" fn agora_sandbox_begin_fcntl_duplicate(source: libc::c_int) -> *mut libc::c_void {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(guard) = FilesystemHookGuard::enter() else {
+            return std::ptr::null_mut();
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return std::ptr::null_mut();
+        };
+        let operation = runtime.operations.acquire(
+            mapping::OperationRequest::new()
+                .descriptor_registry_shared()
+                .descriptor_shared(source),
+        );
+        Box::into_raw(Box::new(FcntlDuplicateTransaction {
+            _operation: operation,
+            _guard: guard,
+            runtime,
+            source,
+        }))
+        .cast()
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_finish_fcntl_duplicate(
+    transaction: *mut libc::c_void,
     destination: libc::c_int,
 ) {
-    let Some(_guard) = FilesystemHookGuard::enter() else {
+    if transaction.is_null() {
         return;
-    };
+    }
+    let transaction = unsafe { Box::from_raw(transaction.cast::<FcntlDuplicateTransaction>()) };
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        if let Some(runtime) = FilesystemHookRuntime::global() {
-            runtime.duplicate_descriptor(source, destination);
+        if destination >= 0 {
+            transaction
+                .runtime
+                .duplicate_descriptor_under_lease(transaction.source, destination);
         }
     }));
 }

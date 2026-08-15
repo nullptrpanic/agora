@@ -482,21 +482,25 @@ unsafe fn sandbox_freopen(
                 } else {
                     unsafe { libc::fileno(stream) }
                 };
-                if descriptor >= 0
-                    && let Err(error) = runtime.writeback(descriptor)
-                {
-                    return unsafe { fail(&error, std::ptr::null_mut()) };
+                if descriptor < 0 {
+                    return unsafe { original(native.as_ptr(), mode, stream) };
                 }
+                let _operation = match runtime.acquire_descriptor_replacement(None, descriptor) {
+                    Ok(operation) => operation,
+                    Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+                };
+                let transition = runtime.begin_descriptor_transition_under_lease(descriptor);
                 let result = unsafe { original(native.as_ptr(), mode, stream) };
-                if descriptor >= 0 {
-                    if let Some((open, last_alias)) = runtime.take_descriptor(descriptor) {
-                        release_local_close_locks(&open, last_alias);
-                        if last_alias && !runtime.has_mapping(&open) {
-                            let _ = runtime.finish_open_file(-1, &open);
-                        }
+                if let Some((open, last_alias)) =
+                    runtime.take_descriptor_during_transition_under_lease(descriptor)
+                {
+                    release_local_close_locks(&open, last_alias);
+                    if last_alias && !runtime.has_mapping(&open) {
+                        let _ = runtime.finish_open_file(-1, &open);
                     }
-                    runtime.unregister_directory(descriptor);
                 }
+                transition.clear();
+                runtime.unregister_directory(descriptor);
                 return result;
             }
             Ok(None) => {}

@@ -17,7 +17,7 @@ pub extern "C" fn agora_sandbox_data_descriptor_requires_hook(
     libc::c_int::from(
         runtime
             .memory_index
-            .descriptor_state(descriptor)
+            .data_descriptor_state(descriptor)
             .unwrap_or(true),
     )
 }

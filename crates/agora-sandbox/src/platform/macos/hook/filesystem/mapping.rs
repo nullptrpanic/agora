@@ -1,5 +1,9 @@
 use super::*;
 
+mod coordination;
+
+pub(super) use coordination::{OperationCoordinator, OperationLease, OperationRequest};
+
 type MmapFn = unsafe extern "C" fn(
     *mut libc::c_void,
     usize,
@@ -12,6 +16,10 @@ type MemoryFn = unsafe extern "C" fn(*mut libc::c_void, usize) -> libc::c_int;
 type MemoryFlagsFn = unsafe extern "C" fn(*mut libc::c_void, usize, libc::c_int) -> libc::c_int;
 const DESCRIPTOR_INDEX_BITS: usize = 65_536;
 const DESCRIPTOR_WORD_BITS: usize = u64::BITS as usize;
+const DESCRIPTOR_STATE_BITS: usize = 2;
+const DESCRIPTORS_PER_WORD: usize = DESCRIPTOR_WORD_BITS / DESCRIPTOR_STATE_BITS;
+const DATA_TRACKED_BIT: u64 = 1;
+const MAPPING_MANAGED_BIT: u64 = 1 << 1;
 
 #[derive(Clone)]
 struct MappingSlice {
@@ -98,7 +106,7 @@ impl MemoryStateIndex {
     pub(super) fn new() -> Self {
         Self {
             mappings: AtomicSnapshot::new(Vec::new()),
-            descriptors: (0..DESCRIPTOR_INDEX_BITS / DESCRIPTOR_WORD_BITS)
+            descriptors: (0..DESCRIPTOR_INDEX_BITS / DESCRIPTORS_PER_WORD)
                 .map(|_| AtomicU64::new(0))
                 .collect(),
         }
@@ -116,19 +124,26 @@ impl MemoryStateIndex {
         );
     }
 
-    pub(super) fn set_descriptor(&self, descriptor: libc::c_int, tracked: bool) {
+    pub(super) fn set_descriptor(
+        &self,
+        descriptor: libc::c_int,
+        data_tracked: bool,
+        mapping_managed: bool,
+    ) {
         let Ok(descriptor) = usize::try_from(descriptor) else {
             return;
         };
-        let Some(word) = self.descriptors.get(descriptor / DESCRIPTOR_WORD_BITS) else {
+        let Some(word) = self.descriptors.get(descriptor / DESCRIPTORS_PER_WORD) else {
             return;
         };
-        let mask = 1_u64 << (descriptor % DESCRIPTOR_WORD_BITS);
-        if tracked {
-            word.fetch_or(mask, Ordering::Release);
-        } else {
-            word.fetch_and(!mask, Ordering::Release);
-        }
+        let shift = (descriptor % DESCRIPTORS_PER_WORD) * DESCRIPTOR_STATE_BITS;
+        let mask = (DATA_TRACKED_BIT | MAPPING_MANAGED_BIT) << shift;
+        let state = ((u64::from(data_tracked) * DATA_TRACKED_BIT)
+            | (u64::from(mapping_managed) * MAPPING_MANAGED_BIT))
+            << shift;
+        let _ = word.fetch_update(Ordering::Release, Ordering::Relaxed, |current| {
+            Some((current & !mask) | state)
+        });
     }
 
     fn overlaps(&self, start: usize, end: usize) -> bool {
@@ -139,23 +154,47 @@ impl MemoryStateIndex {
         })
     }
 
-    pub(super) fn descriptor_state(&self, descriptor: libc::c_int) -> Option<bool> {
+    pub(super) fn data_descriptor_state(&self, descriptor: libc::c_int) -> Option<bool> {
+        self.descriptor_routing_state(descriptor)
+            .map(|(data_tracked, _)| data_tracked)
+    }
+
+    pub(super) fn descriptor_routing_state(&self, descriptor: libc::c_int) -> Option<(bool, bool)> {
         let Ok(descriptor) = usize::try_from(descriptor) else {
-            return Some(false);
+            return Some((false, false));
         };
-        let word = self.descriptors.get(descriptor / DESCRIPTOR_WORD_BITS)?;
-        let mask = 1_u64 << (descriptor % DESCRIPTOR_WORD_BITS);
-        Some(word.load(Ordering::Acquire) & mask != 0)
+        let word = self.descriptors.get(descriptor / DESCRIPTORS_PER_WORD)?;
+        let shift = (descriptor % DESCRIPTORS_PER_WORD) * DESCRIPTOR_STATE_BITS;
+        let state = word.load(Ordering::Acquire) >> shift;
+        Some((
+            state & DATA_TRACKED_BIT != 0,
+            state & MAPPING_MANAGED_BIT != 0,
+        ))
+    }
+
+    fn mapping_descriptor_state(&self, descriptor: libc::c_int) -> Option<bool> {
+        self.descriptor_routing_state(descriptor)
+            .map(|(_, mapping_managed)| mapping_managed)
     }
 }
 
 impl FilesystemHookRuntime {
-    fn try_mapping_operation(&self) -> Option<MutexGuard<'_, ()>> {
-        match self.mapping_operations.try_lock() {
-            Ok(operation) => Some(operation),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => None,
+    fn mmap_operation_request(
+        address: *mut libc::c_void,
+        length: usize,
+        flags: libc::c_int,
+        descriptor: libc::c_int,
+    ) -> OperationRequest {
+        let mut request = OperationRequest::new().mapping_registry_shared();
+        if flags & libc::MAP_ANON == 0 {
+            request = request
+                .descriptor_registry_shared()
+                .descriptor_shared(descriptor);
         }
+        if flags & libc::MAP_FIXED != 0 {
+            request = request.address_exclusive(address as usize, address as usize + length);
+        }
+        request
     }
 }
 
@@ -288,14 +327,60 @@ impl FilesystemHookRuntime {
             .collect()
     }
 
-    pub(super) fn flush_open_mappings(&self, open: &Arc<OpenFile>, durable: bool) -> Result<()> {
-        let _operation = lock(&self.mapping_operations);
-        let slices = self.full_mapping_slices(|mapping| Arc::ptr_eq(&mapping.open, open));
+    fn mapping_snapshot_request(&self, slices: &[MappingSlice]) -> OperationRequest {
+        slices.iter().fold(
+            OperationRequest::new().mapping_registry_shared(),
+            |request, slice| request.address_shared(slice.address, slice.address + slice.length),
+        )
+    }
+
+    fn revalidate_mapping_slices(&self, expected: &[MappingSlice]) -> Vec<MappingSlice> {
+        let mappings = lock(&self.mappings);
+        let mut slices = Vec::new();
+        for expected in expected {
+            let expected_end = expected.address + expected.length;
+            for mapping in mappings
+                .iter()
+                .filter(|mapping| Arc::ptr_eq(&mapping.open, &expected.open))
+            {
+                let start = expected.address.max(mapping.start);
+                let end = expected_end.min(mapping.end);
+                if start < end
+                    && !slices.iter().any(|slice: &MappingSlice| {
+                        slice.address == start
+                            && slice.length == end - start
+                            && Arc::ptr_eq(&slice.open, &mapping.open)
+                    })
+                {
+                    slices.push(MappingSlice {
+                        address: start,
+                        length: end - start,
+                        open: Arc::clone(&mapping.open),
+                    });
+                }
+            }
+        }
+        slices
+    }
+
+    fn flush_mapping_snapshot(&self, expected: &[MappingSlice], durable: bool) -> Result<()> {
+        let _operation = self
+            .operations
+            .acquire(self.mapping_snapshot_request(expected));
+        let slices = self.revalidate_mapping_slices(expected);
         self.flush_mapping_slices(&slices, durable)
     }
 
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    fn flush_native_mapping_snapshot(&self, expected: &[MappingSlice]) -> Result<()> {
+        let _operation = self
+            .operations
+            .acquire(self.mapping_snapshot_request(expected));
+        let slices = self.revalidate_mapping_slices(expected);
+        Self::flush_native_mapping_slices(&slices)
+    }
+
     pub(super) fn flush_logical_mappings(&self, logical: &Path, durable: bool) -> Result<()> {
-        let _operation = lock(&self.mapping_operations);
         let mappings = lock(&self.mappings).clone();
         let slices = mappings
             .iter()
@@ -306,11 +391,22 @@ impl FilesystemHookRuntime {
                 open: Arc::clone(&mapping.open),
             })
             .collect::<Vec<_>>();
-        self.flush_mapping_slices(&slices, durable)
+        self.flush_mapping_snapshot(&slices, durable)
     }
 
+    #[cfg(test)]
     fn remove_mappings(&self, start: usize, end: usize) -> Vec<Arc<OpenFile>> {
         let mut mappings = lock(&self.mappings);
+        let affected = Self::remove_mappings_locked(&mut mappings, start, end);
+        self.memory_index.publish_mappings(&mappings);
+        affected
+    }
+
+    fn remove_mappings_locked(
+        mappings: &mut Vec<MemoryMapping>,
+        start: usize,
+        end: usize,
+    ) -> Vec<Arc<OpenFile>> {
         let mut retained = Vec::with_capacity(mappings.len() + 1);
         let mut affected = Vec::new();
         for mapping in mappings.drain(..) {
@@ -338,7 +434,6 @@ impl FilesystemHookRuntime {
             }
         }
         *mappings = retained;
-        self.memory_index.publish_mappings(&mappings);
         affected
     }
 
@@ -356,24 +451,122 @@ impl FilesystemHookRuntime {
 
     pub(super) fn finish_unreferenced(&self, opens: Vec<Arc<OpenFile>>) -> Result<()> {
         for open in opens {
-            if !self.has_descriptor(&open) && !self.has_mapping(&open) {
-                self.finish_open_file(-1, &open)?;
+            let claimed = {
+                let _barrier = self.operations.acquire(
+                    OperationRequest::new()
+                        .descriptor_registry_exclusive()
+                        .mapping_registry_exclusive(),
+                );
+                !self.has_descriptor(&open)
+                    && !self.has_mapping(&open)
+                    && !open.finished.swap(true, Ordering::AcqRel)
+            };
+            if claimed {
+                self.finish_claimed_open_file(-1, &open)?;
             }
         }
         Ok(())
     }
 
     pub(super) fn flush_memory_mappings(&self) -> Result<()> {
-        let _operation = lock(&self.mapping_operations);
-        let slices = self.full_mapping_slices(|_| true);
-        self.flush_mapping_slices(&slices, true)
+        let slices = {
+            let _barrier = self
+                .operations
+                .acquire(OperationRequest::new().mapping_registry_exclusive());
+            self.full_mapping_slices(|_| true)
+        };
+        self.flush_mapping_snapshot(&slices, true)
     }
 
     #[cfg(any(agora_sandbox_hook_build, test, coverage))]
     pub(super) fn flush_native_memory_mappings(&self) -> Result<()> {
-        let _operation = lock(&self.mapping_operations);
-        let slices = self.full_mapping_slices(|_| true);
-        Self::flush_native_mapping_slices(&slices)
+        let slices = {
+            let _barrier = self
+                .operations
+                .acquire(OperationRequest::new().mapping_registry_exclusive());
+            self.full_mapping_slices(|_| true)
+        };
+        self.flush_native_mapping_snapshot(&slices)
+    }
+
+    pub(super) fn writeback_descriptor(
+        &self,
+        descriptor: libc::c_int,
+    ) -> Result<Option<Arc<OpenFile>>> {
+        loop {
+            let expected = self.tracked_open(descriptor);
+            let slices = expected
+                .as_ref()
+                .map(|open| self.full_mapping_slices(|mapping| Arc::ptr_eq(&mapping.open, open)))
+                .unwrap_or_default();
+            let request = slices.iter().fold(
+                OperationRequest::new()
+                    .descriptor_registry_shared()
+                    .mapping_registry_shared()
+                    .descriptor_shared(descriptor),
+                |request, slice| {
+                    request.address_shared(slice.address, slice.address + slice.length)
+                },
+            );
+            let _operation = self.operations.acquire(request);
+            let current = self.tracked_open(descriptor);
+            let unchanged = match (&expected, &current) {
+                (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
+                (None, None) => true,
+                _ => false,
+            };
+            if !unchanged {
+                continue;
+            }
+            let Some(open) = current else {
+                return Ok(None);
+            };
+            let slices = self.revalidate_mapping_slices(&slices);
+            self.flush_mapping_slices(&slices, true)?;
+            self.commit_open_file(descriptor, &open, true)?;
+            return Ok(Some(open));
+        }
+    }
+
+    pub(super) fn acquire_descriptor_replacement(
+        &self,
+        source: Option<libc::c_int>,
+        destination: libc::c_int,
+    ) -> Result<OperationLease<'_>> {
+        loop {
+            let expected = self.tracked_open(destination);
+            let slices = expected
+                .as_ref()
+                .map(|open| self.full_mapping_slices(|mapping| Arc::ptr_eq(&mapping.open, open)))
+                .unwrap_or_default();
+            let mut request = OperationRequest::new()
+                .descriptor_registry_shared()
+                .mapping_registry_shared()
+                .descriptor_exclusive(destination);
+            if let Some(source) = source {
+                request = request.descriptor_shared(source);
+            }
+            request = slices.iter().fold(request, |request, slice| {
+                request.address_shared(slice.address, slice.address + slice.length)
+            });
+            let operation = self.operations.acquire(request);
+            let current = self.tracked_open(destination);
+            let unchanged = match (&expected, &current) {
+                (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
+                (None, None) => true,
+                _ => false,
+            };
+            if !unchanged {
+                drop(operation);
+                continue;
+            }
+            if let Some(open) = current {
+                let slices = self.revalidate_mapping_slices(&slices);
+                self.flush_mapping_slices(&slices, true)?;
+                self.commit_open_file(destination, &open, true)?;
+            }
+            return Ok(operation);
+        }
     }
 }
 
@@ -459,7 +652,7 @@ fn mmap_route(
         return MemoryRoute::Native;
     }
 
-    match runtime.memory_index.descriptor_state(descriptor) {
+    match runtime.memory_index.mapping_descriptor_state(descriptor) {
         Some(true) | None => MemoryRoute::Managed(runtime),
         Some(false) => MemoryRoute::Native,
     }
@@ -502,9 +695,11 @@ unsafe fn sandbox_mmap(
         let Some(_guard) = FilesystemHookGuard::enter() else {
             return unsafe { fail_closed_memory(libc::MAP_FAILED) };
         };
-        let Some(operation) = runtime.try_mapping_operation() else {
-            return unsafe { fail_closed_memory(libc::MAP_FAILED) };
-        };
+        let operation = runtime
+            .operations
+            .acquire(FilesystemHookRuntime::mmap_operation_request(
+                address, length, flags, descriptor,
+            ));
         match mmap_route(address, length, flags, descriptor) {
             MemoryRoute::Native => {
                 return unsafe { original(address, length, protection, flags, descriptor, offset) };
@@ -521,31 +716,69 @@ unsafe fn sandbox_mmap(
         {
             return unsafe { fail(&error, libc::MAP_FAILED) };
         }
-        let mapped = unsafe { original(address, length, protection, flags, descriptor, offset) };
-        if mapped == libc::MAP_FAILED {
-            return mapped;
-        }
-        let start = mapped as usize;
-        let Some(end) = start.checked_add(length) else {
-            if let Some(munmap) = original_munmap() {
-                unsafe { munmap(mapped, length) };
+        let fixed = flags & libc::MAP_FIXED != 0;
+        let (mapped, replaced) = if fixed {
+            let start = address as usize;
+            let end = start + length;
+            let mut mappings = lock(&runtime.mappings);
+            let provisional = pending.as_ref().map(|pending| {
+                mappings.push(MemoryMapping {
+                    start,
+                    end,
+                    file_offset: pending.file_offset,
+                    writable: pending.writable,
+                    open: Arc::clone(&pending.open),
+                });
+                mappings.len() - 1
+            });
+            if provisional.is_some() {
+                runtime.memory_index.publish_mappings(&mappings);
             }
-            unsafe { set_errno(libc::EOVERFLOW) };
-            return libc::MAP_FAILED;
-        };
-        let replaced = if flags & libc::MAP_FIXED != 0 {
-            runtime.remove_mappings(start, end)
+            let mapped =
+                unsafe { original(address, length, protection, flags, descriptor, offset) };
+            if mapped == libc::MAP_FAILED {
+                let errno = unsafe { *libc::__error() };
+                if let Some(provisional) = provisional {
+                    mappings.remove(provisional);
+                    runtime.memory_index.publish_mappings(&mappings);
+                }
+                unsafe { set_errno(errno) };
+                return mapped;
+            }
+            let replaced = FilesystemHookRuntime::remove_mappings_locked(&mut mappings, start, end);
+            if let Some(pending) = pending {
+                mappings.push(MemoryMapping {
+                    start,
+                    end,
+                    file_offset: pending.file_offset,
+                    writable: pending.writable,
+                    open: pending.open,
+                });
+            }
+            runtime.memory_index.publish_mappings(&mappings);
+            (mapped, replaced)
         } else {
-            Vec::new()
-        };
-        if let Err(error) = runtime.register_mapping(mapped, length, pending) {
-            if let Some(munmap) = original_munmap() {
-                unsafe { munmap(mapped, length) };
+            let mapped =
+                unsafe { original(address, length, protection, flags, descriptor, offset) };
+            if mapped == libc::MAP_FAILED {
+                return mapped;
             }
-            drop(operation);
-            let _ = runtime.finish_unreferenced(replaced);
-            return unsafe { fail(&error, libc::MAP_FAILED) };
-        }
+            let start = mapped as usize;
+            let Some(_end) = start.checked_add(length) else {
+                if let Some(munmap) = original_munmap() {
+                    unsafe { munmap(mapped, length) };
+                }
+                unsafe { set_errno(libc::EOVERFLOW) };
+                return libc::MAP_FAILED;
+            };
+            if let Err(error) = runtime.register_mapping(mapped, length, pending) {
+                if let Some(munmap) = original_munmap() {
+                    unsafe { munmap(mapped, length) };
+                }
+                return unsafe { fail(&error, libc::MAP_FAILED) };
+            }
+            (mapped, Vec::new())
+        };
         drop(operation);
         let _ = runtime.finish_unreferenced(replaced);
         mapped
@@ -591,9 +824,11 @@ unsafe fn sandbox_msync(
         let Some(_guard) = FilesystemHookGuard::enter() else {
             return unsafe { fail_closed_memory(-1) };
         };
-        let Some(_operation) = runtime.try_mapping_operation() else {
-            return unsafe { fail_closed_memory(-1) };
-        };
+        let _operation = runtime.operations.acquire(
+            OperationRequest::new()
+                .mapping_registry_shared()
+                .address_shared(address as usize, end),
+        );
         match mapping_range_route(address as usize, end) {
             MemoryRoute::Native => return unsafe { original(address, length, flags) },
             MemoryRoute::Managed(_) => {}
@@ -643,9 +878,11 @@ unsafe fn sandbox_munmap(address: *mut libc::c_void, length: usize) -> libc::c_i
         let Some(_guard) = FilesystemHookGuard::enter() else {
             return unsafe { fail_closed_memory(-1) };
         };
-        let Some(operation) = runtime.try_mapping_operation() else {
-            return unsafe { fail_closed_memory(-1) };
-        };
+        let operation = runtime.operations.acquire(
+            OperationRequest::new()
+                .mapping_registry_shared()
+                .address_exclusive(address as usize, end),
+        );
         match mapping_range_route(address as usize, end) {
             MemoryRoute::Native => return unsafe { original(address, length) },
             MemoryRoute::Managed(_) => {}
@@ -654,11 +891,15 @@ unsafe fn sandbox_munmap(address: *mut libc::c_void, length: usize) -> libc::c_i
         if let Err(error) = sync_native_mappings(runtime, address as usize, length, true) {
             return unsafe { fail(&error, -1) };
         }
+        let mut mappings = lock(&runtime.mappings);
         let result = unsafe { original(address, length) };
         if result != 0 {
             return result;
         }
-        let affected = runtime.remove_mappings(address as usize, end);
+        let affected =
+            FilesystemHookRuntime::remove_mappings_locked(&mut mappings, address as usize, end);
+        runtime.memory_index.publish_mappings(&mappings);
+        drop(mappings);
         drop(operation);
         let _ = runtime.finish_unreferenced(affected);
         result

@@ -15,7 +15,7 @@ use crate::filesystem::{
 };
 use crate::trace::TraceContext;
 use anyhow::{Context, Result};
-use mapping::MemoryStateIndex;
+use mapping::{MemoryStateIndex, OperationCoordinator};
 use nfs::{RemoteAnchor, RemoteDirectoryView, RemoteFilesystem, RemoteOpen};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -221,8 +221,43 @@ struct FilesystemHookRuntime {
     open_files: Mutex<HashMap<libc::c_int, Arc<OpenFile>>>,
     mappings: Mutex<Vec<MemoryMapping>>,
     memory_index: MemoryStateIndex,
-    mapping_operations: Mutex<()>,
+    operations: OperationCoordinator,
     directory_descriptors: Mutex<HashMap<libc::c_int, DirectoryDescriptor>>,
+}
+
+struct DescriptorTransition<'a> {
+    runtime: &'a FilesystemHookRuntime,
+    descriptor: libc::c_int,
+    previous: Option<(bool, bool)>,
+    committed: bool,
+}
+
+impl DescriptorTransition<'_> {
+    fn clear(mut self) {
+        self.runtime
+            .memory_index
+            .set_descriptor(self.descriptor, false, false);
+        self.committed = true;
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for DescriptorTransition<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some((data_tracked, mapping_managed)) = self.previous {
+            self.runtime.memory_index.set_descriptor(
+                self.descriptor,
+                data_tracked,
+                mapping_managed,
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -291,6 +326,10 @@ impl OpenFile {
 
     fn publishes_writes(&self) -> bool {
         self.managed().publishes_writes()
+    }
+
+    fn manages_mappings(&self) -> bool {
+        self.managed().is_broker_managed() || self.publishes_writes()
     }
 }
 
@@ -562,7 +601,7 @@ impl FilesystemHookRuntime {
                             open_files: Mutex::new(HashMap::new()),
                             mappings: Mutex::new(Vec::new()),
                             memory_index: MemoryStateIndex::new(),
-                            mapping_operations: Mutex::new(()),
+                            operations: OperationCoordinator::new(),
                             directory_descriptors: Mutex::new(HashMap::new()),
                         };
                         runtime.restore_inherited_local_descriptors(
@@ -593,7 +632,7 @@ impl FilesystemHookRuntime {
             open_files: Mutex::new(HashMap::new()),
             mappings: Mutex::new(Vec::new()),
             memory_index: MemoryStateIndex::new(),
-            mapping_operations: Mutex::new(()),
+            operations: OperationCoordinator::new(),
             directory_descriptors: Mutex::new(HashMap::new()),
         })
     }
@@ -617,7 +656,7 @@ impl FilesystemHookRuntime {
             open_files: Mutex::new(HashMap::new()),
             mappings: Mutex::new(Vec::new()),
             memory_index: MemoryStateIndex::new(),
-            mapping_operations: Mutex::new(()),
+            operations: OperationCoordinator::new(),
             directory_descriptors: Mutex::new(HashMap::new()),
         })
     }
@@ -1102,17 +1141,40 @@ impl FilesystemHookRuntime {
 
     fn publish_open_writers(&self, logical: &Path) -> Result<()> {
         self.flush_logical_mappings(logical, false)?;
-        let files = lock(&self.open_files)
-            .iter()
-            .map(|(&descriptor, open)| (descriptor, Arc::clone(open)))
-            .collect::<Vec<_>>();
         let mut seen = HashSet::new();
-        for (descriptor, open) in files {
-            if open.publishes_writes()
-                && open.logical() == logical
-                && seen.insert(Arc::as_ptr(&open))
-            {
+        let writers = lock(&self.open_files)
+            .values()
+            .filter(|open| {
+                open.publishes_writes()
+                    && open.logical() == logical
+                    && seen.insert(Arc::as_ptr(open))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for open in writers {
+            loop {
+                let descriptor =
+                    lock(&self.open_files)
+                        .iter()
+                        .find_map(|(&descriptor, candidate)| {
+                            Arc::ptr_eq(candidate, &open).then_some(descriptor)
+                        });
+                let Some(descriptor) = descriptor else {
+                    break;
+                };
+                let _operation = self.operations.acquire(
+                    mapping::OperationRequest::new()
+                        .descriptor_registry_shared()
+                        .descriptor_shared(descriptor),
+                );
+                if !self
+                    .tracked_open(descriptor)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &open))
+                {
+                    continue;
+                }
                 self.commit_open_file(descriptor, &open, false)?;
+                break;
             }
         }
         Ok(())
@@ -1151,10 +1213,16 @@ impl FilesystemHookRuntime {
     }
 
     fn register(&self, descriptor: libc::c_int, open: OpenFile) {
-        let _mapping_operation = lock(&self.mapping_operations);
+        let _operation = self.operations.acquire(
+            mapping::OperationRequest::new()
+                .descriptor_registry_shared()
+                .descriptor_exclusive(descriptor),
+        );
         let mut files = lock(&self.open_files);
+        let manages_mappings = open.manages_mappings();
         files.insert(descriptor, Arc::new(open));
-        self.memory_index.set_descriptor(descriptor, true);
+        self.memory_index
+            .set_descriptor(descriptor, true, manages_mappings);
     }
 
     fn tracked(&self, descriptor: libc::c_int) -> Option<FileContext> {
@@ -1198,8 +1266,18 @@ impl FilesystemHookRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
     fn duplicate_descriptor(&self, source: libc::c_int, destination: libc::c_int) {
-        let _mapping_operation = lock(&self.mapping_operations);
+        let _operation = self.operations.acquire(
+            mapping::OperationRequest::new()
+                .descriptor_registry_shared()
+                .descriptor_shared(source)
+                .descriptor_exclusive(destination),
+        );
+        self.duplicate_descriptor_under_lease(source, destination);
+    }
+
+    fn duplicate_descriptor_under_lease(&self, source: libc::c_int, destination: libc::c_int) {
         let mut files = lock(&self.open_files);
         let close_on_exec = files
             .get(&source)
@@ -1214,8 +1292,13 @@ impl FilesystemHookRuntime {
                 None
             }
         };
-        self.memory_index
-            .set_descriptor(destination, duplicated.is_some());
+        self.memory_index.set_descriptor(
+            destination,
+            duplicated.is_some(),
+            duplicated
+                .as_ref()
+                .is_some_and(|open| open.manages_mappings()),
+        );
         drop(files);
 
         if let Some(open) = duplicated {
@@ -1300,7 +1383,6 @@ impl FilesystemHookRuntime {
         {
             return;
         }
-        let _mapping_operation = lock(&self.mapping_operations);
         let content_descriptors = inherited
             .descriptors
             .iter()
@@ -1420,29 +1502,84 @@ impl FilesystemHookRuntime {
                 );
                 open
             };
+            let manages_mappings = open.manages_mappings();
             files.insert(inherited.descriptor, open);
-            self.memory_index.set_descriptor(inherited.descriptor, true);
+            self.memory_index
+                .set_descriptor(inherited.descriptor, true, manages_mappings);
         }
     }
 
+    #[cfg(test)]
     fn take_descriptor(&self, descriptor: libc::c_int) -> Option<(Arc<OpenFile>, bool)> {
-        let _mapping_operation = lock(&self.mapping_operations);
+        let _operation = self.operations.acquire(
+            mapping::OperationRequest::new()
+                .descriptor_registry_shared()
+                .descriptor_exclusive(descriptor),
+        );
+        self.take_descriptor_under_lease(descriptor)
+    }
+
+    #[cfg(test)]
+    fn take_descriptor_under_lease(
+        &self,
+        descriptor: libc::c_int,
+    ) -> Option<(Arc<OpenFile>, bool)> {
+        let tracked = self.remove_descriptor_under_lease(descriptor);
+        self.memory_index.set_descriptor(descriptor, false, false);
+        tracked
+    }
+
+    fn take_descriptor_during_transition_under_lease(
+        &self,
+        descriptor: libc::c_int,
+    ) -> Option<(Arc<OpenFile>, bool)> {
+        self.remove_descriptor_under_lease(descriptor)
+    }
+
+    fn remove_descriptor_under_lease(
+        &self,
+        descriptor: libc::c_int,
+    ) -> Option<(Arc<OpenFile>, bool)> {
         let mut files = lock(&self.open_files);
         let open = files.remove(&descriptor)?;
         let last_alias = !files
             .values()
             .any(|candidate| Arc::ptr_eq(candidate, &open));
-        self.memory_index.set_descriptor(descriptor, false);
         drop(files);
         self.refresh_local_state_inheritance(&open);
         Some((open, last_alias))
     }
 
+    fn begin_descriptor_transition_under_lease(
+        &self,
+        descriptor: libc::c_int,
+    ) -> DescriptorTransition<'_> {
+        let previous = self.memory_index.descriptor_routing_state(descriptor);
+        self.memory_index.set_descriptor(descriptor, true, true);
+        DescriptorTransition {
+            runtime: self,
+            descriptor,
+            previous,
+            committed: false,
+        }
+    }
+
+    #[cfg(test)]
     fn restore_descriptor(&self, descriptor: libc::c_int, open: Arc<OpenFile>) {
-        let _mapping_operation = lock(&self.mapping_operations);
+        let _operation = self.operations.acquire(
+            mapping::OperationRequest::new()
+                .descriptor_registry_shared()
+                .descriptor_exclusive(descriptor),
+        );
+        self.restore_descriptor_under_lease(descriptor, open);
+    }
+
+    fn restore_descriptor_under_lease(&self, descriptor: libc::c_int, open: Arc<OpenFile>) {
         let mut files = lock(&self.open_files);
+        let manages_mappings = open.manages_mappings();
         files.insert(descriptor, Arc::clone(&open));
-        self.memory_index.set_descriptor(descriptor, true);
+        self.memory_index
+            .set_descriptor(descriptor, true, manages_mappings);
         drop(files);
         self.refresh_local_state_inheritance(&open);
     }
@@ -1488,12 +1625,7 @@ impl FilesystemHookRuntime {
     }
 
     fn writeback(&self, descriptor: libc::c_int) -> Result<()> {
-        let open = lock(&self.open_files).get(&descriptor).cloned();
-        if let Some(open) = open {
-            self.flush_open_mappings(&open, true)?;
-            self.commit_open_file(descriptor, &open, true)?;
-        }
-        Ok(())
+        self.writeback_descriptor(descriptor).map(drop)
     }
 
     fn commit_open_file(
@@ -1509,6 +1641,10 @@ impl FilesystemHookRuntime {
         if open.finished.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        self.finish_claimed_open_file(descriptor, open)
+    }
+
+    fn finish_claimed_open_file(&self, descriptor: libc::c_int, open: &OpenFile) -> Result<()> {
         let result = open.managed().finish(self, descriptor, open);
         if result.is_err() {
             open.finished.store(false, Ordering::Release);
@@ -1517,35 +1653,61 @@ impl FilesystemHookRuntime {
     }
 
     fn commit_all_open_files(&self) -> Result<()> {
-        let _mapping_operation = lock(&self.mapping_operations);
-        let mut files = lock(&self.open_files);
-        let mut stale = Vec::new();
-        files.retain(|&descriptor, open| {
-            if unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0 {
-                true
-            } else {
-                stale.push(Arc::clone(open));
-                self.memory_index.set_descriptor(descriptor, false);
-                false
-            }
-        });
-        let mut seen = HashSet::new();
-        let mut open_files = Vec::new();
-        for (&descriptor, open) in files.iter() {
-            if seen.insert(Arc::as_ptr(open)) {
-                open_files.push((descriptor, Arc::clone(open)));
-            }
-        }
-        drop(files);
+        let (stale, open_files) = {
+            let _barrier = self
+                .operations
+                .acquire(mapping::OperationRequest::new().descriptor_registry_exclusive());
+            let mut files = lock(&self.open_files);
+            let mut stale = Vec::new();
+            files.retain(|&descriptor, open| {
+                if unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0 {
+                    true
+                } else {
+                    stale.push(Arc::clone(open));
+                    self.memory_index.set_descriptor(descriptor, false, false);
+                    false
+                }
+            });
+            let mut seen = HashSet::new();
+            let open_files = files
+                .values()
+                .filter(|open| seen.insert(Arc::as_ptr(open)))
+                .cloned()
+                .collect::<Vec<_>>();
+            (stale, open_files)
+        };
         self.finish_unreferenced(stale)?;
-        for (descriptor, open) in open_files {
-            self.commit_open_file(descriptor, &open, true)
-                .with_context(|| {
-                    format!(
-                        "failed to synchronize descriptor {descriptor} for {}",
-                        open.logical().display()
-                    )
-                })?;
+        for open in open_files {
+            loop {
+                let descriptor =
+                    lock(&self.open_files)
+                        .iter()
+                        .find_map(|(&descriptor, candidate)| {
+                            Arc::ptr_eq(candidate, &open).then_some(descriptor)
+                        });
+                let Some(descriptor) = descriptor else {
+                    break;
+                };
+                let _operation = self.operations.acquire(
+                    mapping::OperationRequest::new()
+                        .descriptor_registry_shared()
+                        .descriptor_shared(descriptor),
+                );
+                if !self
+                    .tracked_open(descriptor)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &open))
+                {
+                    continue;
+                }
+                self.commit_open_file(descriptor, &open, true)
+                    .with_context(|| {
+                        format!(
+                            "failed to synchronize descriptor {descriptor} for {}",
+                            open.logical().display()
+                        )
+                    })?;
+                break;
+            }
         }
         Ok(())
     }
@@ -1557,22 +1719,28 @@ impl FilesystemHookRuntime {
         // sending a separate Broker Sync here would encrypt every writable
         // mapping twice during normal process exit.
         self.flush_native_memory_mappings()?;
-        let files = lock(&self.open_files);
-        let mappings = lock(&self.mappings);
-        let mut seen = HashSet::new();
-        let mut open_files = Vec::new();
-        for (&descriptor, open) in files.iter() {
-            if seen.insert(Arc::as_ptr(open)) {
-                open_files.push((descriptor, Arc::clone(open)));
+        let open_files = {
+            let _barrier = self.operations.acquire(
+                mapping::OperationRequest::new()
+                    .descriptor_registry_exclusive()
+                    .mapping_registry_exclusive(),
+            );
+            let files = lock(&self.open_files);
+            let mappings = lock(&self.mappings);
+            let mut seen = HashSet::new();
+            let mut open_files = Vec::new();
+            for (&descriptor, open) in files.iter() {
+                if seen.insert(Arc::as_ptr(open)) {
+                    open_files.push((descriptor, Arc::clone(open)));
+                }
             }
-        }
-        for mapping in mappings.iter() {
-            if seen.insert(Arc::as_ptr(&mapping.open)) {
-                open_files.push((-1, Arc::clone(&mapping.open)));
+            for mapping in mappings.iter() {
+                if seen.insert(Arc::as_ptr(&mapping.open)) {
+                    open_files.push((-1, Arc::clone(&mapping.open)));
+                }
             }
-        }
-        drop(mappings);
-        drop(files);
+            open_files
+        };
         let mut first = None;
         for (descriptor, open) in open_files {
             if let Err(error) = self.finish_open_file(descriptor, &open)

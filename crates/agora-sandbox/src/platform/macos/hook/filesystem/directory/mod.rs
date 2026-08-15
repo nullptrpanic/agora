@@ -849,15 +849,25 @@ unsafe fn sandbox_closedir(directory: *mut libc::DIR) -> libc::c_int {
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(directory) };
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return unsafe { original(directory) };
+        };
         let cursor = lock(directory_cursors()).remove(&(directory as usize));
         let descriptor = unsafe { libc::dirfd(directory) };
-        let tracked =
-            FilesystemHookRuntime::global().and_then(|runtime| runtime.take_descriptor(descriptor));
+        let _operation = runtime.operations.acquire(
+            mapping::OperationRequest::new()
+                .descriptor_registry_shared()
+                .descriptor_exclusive(descriptor),
+        );
+        let transition = runtime.begin_descriptor_transition_under_lease(descriptor);
+        let tracked = runtime.take_descriptor_during_transition_under_lease(descriptor);
         if let Some((open, true)) = &tracked
-            && let Some(runtime) = FilesystemHookRuntime::global()
             && let Err(error) = runtime.finish_open_file(descriptor, open)
         {
-            runtime.restore_descriptor(descriptor, Arc::clone(open));
+            runtime.restore_descriptor_under_lease(descriptor, Arc::clone(open));
             lock(directory_cursors()).extend(cursor.map(|cursor| (directory as usize, cursor)));
             return unsafe { fail(&error, -1) };
         }
@@ -867,15 +877,13 @@ unsafe fn sandbox_closedir(directory: *mut libc::DIR) -> libc::c_int {
                 unsafe { original(source) };
             }
         }
-        if result == 0
-            && let Some(runtime) = FilesystemHookRuntime::global()
-        {
+        if result == 0 {
+            transition.clear();
             runtime.unregister_directory(descriptor);
         } else if result != 0
             && let Some((open, _)) = tracked
-            && let Some(runtime) = FilesystemHookRuntime::global()
         {
-            runtime.restore_descriptor(descriptor, open);
+            runtime.restore_descriptor_under_lease(descriptor, open);
         }
         result
     })

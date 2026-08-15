@@ -27,7 +27,8 @@ extern int agora_sandbox_guarded_open_dprotected_with_mode(
     mode_t mode
 );
 extern const void *agora_sandbox_original_fcntl(void);
-extern void agora_sandbox_track_fcntl_duplicate(int source, int destination);
+extern void *agora_sandbox_begin_fcntl_duplicate(int source);
+extern void agora_sandbox_finish_fcntl_duplicate(void *transaction, int destination);
 extern int agora_sandbox_commit_synced_descriptor(int descriptor);
 extern int agora_sandbox_fcntl_setfd_argument(int descriptor, int flags);
 extern void agora_sandbox_fcntl_commit_setfd(int descriptor);
@@ -639,6 +640,10 @@ int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
 #endif
     int operation_descriptor =
         lock_command ? agora_sandbox_lock_descriptor(descriptor) : descriptor;
+    int duplicate_command = command == F_DUPFD || command == F_DUPFD_CLOEXEC;
+    void *duplicate_transaction = duplicate_command
+        ? agora_sandbox_begin_fcntl_duplicate(descriptor)
+        : NULL;
     int result;
     switch (command) {
         case F_GETFD:
@@ -741,8 +746,8 @@ int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
             break;
         }
     }
-    if (result >= 0 && (command == F_DUPFD || command == F_DUPFD_CLOEXEC)) {
-        agora_sandbox_track_fcntl_duplicate(descriptor, result);
+    if (duplicate_command) {
+        agora_sandbox_finish_fcntl_duplicate(duplicate_transaction, result);
     }
     if (result >= 0 && (command == F_FULLFSYNC || command == F_BARRIERFSYNC)) {
         return agora_sandbox_commit_synced_descriptor(descriptor);

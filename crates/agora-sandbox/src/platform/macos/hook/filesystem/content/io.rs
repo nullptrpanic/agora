@@ -1,4 +1,4 @@
-use super::super::{FilesystemHookRuntime, fail};
+use super::super::{FilesystemHookRuntime, fail, mapping};
 pub(crate) use super::backend::ContentIoOffset;
 use super::backend::{ReadOperations, WriteOperations};
 
@@ -13,6 +13,11 @@ pub(crate) unsafe fn managed_seek_io(
     mut native: impl FnMut() -> libc::off_t,
 ) -> Option<libc::off_t> {
     let runtime = FilesystemHookRuntime::global()?;
+    let _operation = runtime.operations.acquire(
+        mapping::OperationRequest::new()
+            .descriptor_registry_shared()
+            .descriptor_shared(descriptor),
+    );
     let open = runtime.tracked_open(descriptor)?;
     let content = open.managed();
     let _mutation = content.mutation_guard();
@@ -46,6 +51,11 @@ where
     Native: FnMut() -> libc::ssize_t,
 {
     let runtime = FilesystemHookRuntime::global()?;
+    let _operation = runtime.operations.acquire(
+        mapping::OperationRequest::new()
+            .descriptor_registry_shared()
+            .descriptor_shared(descriptor),
+    );
     let open = runtime.tracked_open(descriptor)?;
     let content = open.managed();
     let _mutation = content.mutation_guard();
@@ -85,6 +95,11 @@ where
     Native: FnMut() -> libc::ssize_t,
 {
     let runtime = FilesystemHookRuntime::global()?;
+    let _operation = runtime.operations.acquire(
+        mapping::OperationRequest::new()
+            .descriptor_registry_shared()
+            .descriptor_shared(descriptor),
+    );
     let open = runtime.tracked_open(descriptor)?;
     let content = open.managed();
     let _mutation = content.mutation_guard();
