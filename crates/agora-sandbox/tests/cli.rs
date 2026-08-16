@@ -103,7 +103,8 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("run"));
-    assert!(stdout.contains("migrate-key"));
+    assert!(stdout.contains("key"));
+    assert!(!stdout.contains("migrate-key"));
     assert!(!stdout.contains("__session-daemon"));
     assert!(!stdout.contains("--smb-config"));
     assert!(!stdout.contains("--filesystem-key"));
@@ -222,17 +223,27 @@ fn sandbox_cli_runs_from_one_strict_config_file() {
 
 #[test]
 fn sandbox_cli_documents_interactive_key_migration() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .args(["migrate-key", "--help"])
+    let key = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .args(["key", "--help"])
         .output()
         .unwrap();
+    assert!(key.status.success());
+    let key_help = String::from_utf8_lossy(&key.stdout);
+    assert!(key_help.contains("migrate, -m"));
 
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("--workdir <WORKDIR>"));
-    assert!(stdout.contains("Interactively"));
-    assert!(!stdout.contains("--filesystem-key"));
-    assert!(!stdout.contains("--new-filesystem-key"));
+    for command in [["key", "migrate", "--help"], ["key", "-m", "--help"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+            .args(command)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("--workdir <WORKDIR>"));
+        assert!(stdout.contains("Interactively"));
+        assert!(!stdout.contains("--filesystem-key"));
+        assert!(!stdout.contains("--new-filesystem-key"));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -749,7 +760,7 @@ fn sandbox_cli_migrates_the_encrypted_filesystem_key_in_place() {
 
     let mut migrated = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"));
     migrated
-        .arg("migrate-key")
+        .args(["key", "migrate"])
         .arg("--workdir")
         .arg(&workdir)
         .stdin(Stdio::piped())
@@ -796,7 +807,7 @@ fn sandbox_cli_prompts_for_migration_keys_in_a_terminal() {
         .arg("-q")
         .arg("/dev/null")
         .arg(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .arg("migrate-key")
+        .args(["key", "-m"])
         .arg("--workdir")
         .arg(&workdir)
         .stdin(Stdio::piped())

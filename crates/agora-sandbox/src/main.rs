@@ -50,11 +50,10 @@ enum CliCommand {
         executable: String,
     },
 
-    /// Interactively change the passphrase of an existing encrypted filesystem
-    MigrateKey {
-        /// Sandbox work directory; defaults to ~/.agora-sandbox
-        #[arg(long)]
-        workdir: Option<PathBuf>,
+    /// Manage sandbox filesystem keys
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
     },
 
     #[cfg(feature = "web")]
@@ -81,6 +80,17 @@ enum CliCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// Interactively change the passphrase of an existing encrypted filesystem
+    #[command(short_flag = 'm')]
+    Migrate {
+        /// Sandbox work directory; defaults to ~/.agora-sandbox
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
+}
+
 fn open_log(path: &Path) -> Result<File> {
     if let Some(parent) = path
         .parent()
@@ -99,7 +109,9 @@ fn open_log(path: &Path) -> Result<File> {
 
 async fn async_main(arguments: Arguments) -> Result<u8> {
     match arguments.command {
-        CliCommand::MigrateKey { workdir } => {
+        CliCommand::Key {
+            command: KeyCommand::Migrate { workdir },
+        } => {
             key_migration::run(workdir).await?;
             Ok(0)
         }
