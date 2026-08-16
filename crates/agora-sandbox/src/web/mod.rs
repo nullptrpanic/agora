@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::env;
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
@@ -9,7 +10,6 @@ use tokio::sync::oneshot;
 
 mod assets;
 mod audit;
-mod config;
 mod protocol;
 mod server;
 mod terminal;
@@ -17,15 +17,18 @@ mod terminal;
 #[cfg(test)]
 mod tests;
 
-pub(crate) struct TraceViewerOptions {
-    pub(crate) config: PathBuf,
-    pub(crate) sandbox_bin: Option<PathBuf>,
-    pub(crate) open_browser: bool,
+pub(super) struct WebOptions {
+    pub(super) config_path: PathBuf,
+    pub(super) log_path: PathBuf,
+    pub(super) open_browser: bool,
 }
 
-pub(crate) async fn run(options: TraceViewerOptions) -> Result<()> {
+pub(super) async fn run(options: WebOptions) -> Result<()> {
+    let sandbox_binary =
+        env::current_exe().context("failed to resolve the agora-sandbox binary")?;
     run_with(
         options,
+        sandbox_binary,
         |url| async move { open_default_browser(&url).await },
         async {
             if let Err(error) = tokio::signal::ctrl_c().await {
@@ -37,7 +40,8 @@ pub(crate) async fn run(options: TraceViewerOptions) -> Result<()> {
 }
 
 async fn run_with<Open, OpenFuture, Shutdown>(
-    options: TraceViewerOptions,
+    options: WebOptions,
+    sandbox_binary: PathBuf,
     opener: Open,
     shutdown: Shutdown,
 ) -> Result<()>
@@ -46,7 +50,6 @@ where
     OpenFuture: Future<Output = io::Result<()>>,
     Shutdown: Future<Output = ()> + Send + 'static,
 {
-    let resolved = config::resolve(&options)?;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("failed to bind the trace viewer loopback listener")?;
@@ -59,11 +62,10 @@ where
     let hub = server::EventHub::new();
     let manager = Arc::new(server::SessionManager::new(
         terminal::TerminalSpec {
-            sandbox_binary: resolved.sandbox_binary,
-            config_path: resolved.config_path,
-            shell: PathBuf::from("/bin/bash"),
+            sandbox_binary,
+            config_path: options.config_path,
         },
-        resolved.log_path,
+        options.log_path,
         hub.clone(),
     ));
     let state = server::AppState::new(

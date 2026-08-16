@@ -1,6 +1,6 @@
 # Vendored Browser Assets
 
-The Trace Viewer embeds these browser distributions so it has no CDN or Node.js runtime dependency:
+The sandbox Web viewer embeds these browser distributions so it has no CDN or Node.js runtime dependency:
 
 | Package | Version | Included files | Upstream |
 | --- | --- | --- | --- |

@@ -3,14 +3,14 @@ use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
-const INDEX: &str = include_str!("../../web/index.html");
-const APP_CSS: &str = include_str!("../../web/app.css");
-const APP_JS: &str = include_str!("../../web/app.js");
-const TIMELINE_FOLLOW_JS: &str = include_str!("../../web/timeline-follow.js");
-const TRACE_BATCH_JS: &str = include_str!("../../web/trace-batch.js");
-const XTERM_JS: &str = include_str!("../../third-party/xterm/xterm.js");
-const XTERM_CSS: &str = include_str!("../../third-party/xterm/xterm.css");
-const FIT_JS: &str = include_str!("../../third-party/xterm-addon-fit/addon-fit.js");
+const INDEX: &str = include_str!("assets/index.html");
+const APP_CSS: &str = include_str!("assets/app.css");
+const APP_JS: &str = include_str!("assets/app.js");
+const TIMELINE_FOLLOW_JS: &str = include_str!("assets/timeline-follow.js");
+const TRACE_BATCH_JS: &str = include_str!("assets/trace-batch.js");
+const XTERM_JS: &str = include_str!("assets/vendor/xterm/xterm.js");
+const XTERM_CSS: &str = include_str!("assets/vendor/xterm/xterm.css");
+const FIT_JS: &str = include_str!("assets/vendor/xterm-addon-fit/addon-fit.js");
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://127.0.0.1:*; img-src 'self' data:; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
@@ -140,10 +140,10 @@ mod tests {
     #[test]
     fn application_assets_are_local_only_and_vendor_licenses_are_retained() {
         let application = concat!(
-            include_str!("../../web/index.html"),
-            include_str!("../../web/timeline-follow.js"),
-            include_str!("../../web/trace-batch.js"),
-            include_str!("../../web/app.js")
+            include_str!("assets/index.html"),
+            include_str!("assets/timeline-follow.js"),
+            include_str!("assets/trace-batch.js"),
+            include_str!("assets/app.js")
         );
         assert!(!application.contains("http://"));
         assert!(!application.contains("https://"));
@@ -151,25 +151,24 @@ mod tests {
         assert!(!application.contains("localStorage"));
         assert!(!application.contains("indexedDB"));
         assert!(
-            include_str!("../../third-party/xterm/LICENSE")
-                .contains("Permission is hereby granted")
+            include_str!("assets/vendor/xterm/LICENSE").contains("Permission is hereby granted")
         );
         assert!(
-            include_str!("../../third-party/xterm-addon-fit/LICENSE")
+            include_str!("assets/vendor/xterm-addon-fit/LICENSE")
                 .contains("Permission is hereby granted")
         );
     }
 
     #[test]
     fn frontend_helpers_load_before_the_application_and_are_wired() {
-        let index = include_str!("../../web/index.html");
+        let index = include_str!("assets/index.html");
         let follow_helper = r#"<script defer src="/timeline-follow.js"></script>"#;
         let batch_helper = r#"<script defer src="/trace-batch.js"></script>"#;
         let application = r#"<script defer src="/app.js"></script>"#;
         assert!(index.find(follow_helper).unwrap() < index.find(batch_helper).unwrap());
         assert!(index.find(batch_helper).unwrap() < index.find(application).unwrap());
 
-        let app = include_str!("../../web/app.js");
+        let app = include_str!("assets/app.js");
         assert!(app.contains("timelineFollowing: true"));
         assert!(app.contains("timelineFollow.isAtBottom(elements.timeline)"));
         assert!(app.contains("timelineFollow.restoreAfterRender("));

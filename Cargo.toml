@@ -5,7 +5,6 @@ members = [
     "crates/agora-node",
     "crates/agora-server",
     "crates/agora-sandbox",
-    "crates/agora-tools",
 ]
 
 [workspace.package]

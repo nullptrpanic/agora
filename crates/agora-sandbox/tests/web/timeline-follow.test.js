@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { isAtBottom, restoreAfterRender } = require("../web/timeline-follow.js");
+const { isAtBottom, restoreAfterRender } = require("../../src/web/assets/timeline-follow.js");
 
 test("bottom detection uses the documented 24 pixel threshold", () => {
   assert.equal(isAtBottom({ scrollTop: 476, clientHeight: 500, scrollHeight: 1000 }), true);

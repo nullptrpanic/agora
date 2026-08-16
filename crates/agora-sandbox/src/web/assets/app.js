@@ -131,7 +131,7 @@
 
   function connect() {
     if (!token) {
-      setConnection("disconnected", "Token missing", "Open the complete URL printed by agora-tools to authenticate this viewer.");
+      setConnection("disconnected", "Token missing", "Open the complete URL printed by agora-sandbox web to authenticate this viewer.");
       elements.terminalLoading.querySelector("strong").textContent = "Viewer token missing";
       elements.terminalLoading.querySelector("span").textContent = "Return to the terminal and open the printed URL.";
       return;

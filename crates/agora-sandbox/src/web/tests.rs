@@ -1,4 +1,4 @@
-use super::{TraceViewerOptions, run_with};
+use super::{WebOptions, run_with};
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -12,7 +12,7 @@ fn executable(path: &Path) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
-fn options(root: &Path, open_browser: bool) -> TraceViewerOptions {
+fn test_options(root: &Path, open_browser: bool) -> (WebOptions, std::path::PathBuf) {
     let config = root.join("sandbox.json");
     let sandbox = root.join("agora-sandbox");
     fs::write(
@@ -24,11 +24,14 @@ fn options(root: &Path, open_browser: bool) -> TraceViewerOptions {
     )
     .unwrap();
     executable(&sandbox);
-    TraceViewerOptions {
-        config,
-        sandbox_bin: Some(sandbox),
-        open_browser,
-    }
+    (
+        WebOptions {
+            config_path: config,
+            log_path: root.join("runtime/sandbox.log"),
+            open_browser,
+        },
+        sandbox,
+    )
 }
 
 #[tokio::test]
@@ -36,9 +39,11 @@ async fn orchestration_opens_a_fragment_token_on_a_random_loopback_listener() {
     let root = tempfile::tempdir().unwrap();
     let captured = Arc::new(Mutex::new(None));
     let opener_capture = captured.clone();
+    let (options, sandbox) = test_options(root.path(), true);
 
     run_with(
-        options(root.path(), true),
+        options,
+        sandbox,
         move |url| {
             *opener_capture.lock().unwrap() = Some(url);
             async { Ok(()) }
@@ -59,8 +64,10 @@ async fn no_open_skips_browser_and_browser_failure_does_not_stop_the_server() {
     let root = tempfile::tempdir().unwrap();
     let called = Arc::new(Mutex::new(0_u8));
     let no_open_called = called.clone();
+    let (options, sandbox) = test_options(root.path(), false);
     run_with(
-        options(root.path(), false),
+        options,
+        sandbox,
         move |_url| {
             *no_open_called.lock().unwrap() += 1;
             async { Ok(()) }
@@ -71,8 +78,10 @@ async fn no_open_skips_browser_and_browser_failure_does_not_stop_the_server() {
     .unwrap();
     assert_eq!(*called.lock().unwrap(), 0);
 
+    let (options, sandbox) = test_options(root.path(), true);
     run_with(
-        options(root.path(), true),
+        options,
+        sandbox,
         |_url| async { Err(io::Error::other("browser unavailable")) },
         async {},
     )

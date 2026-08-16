@@ -12,6 +12,7 @@ const EVENT_CAPACITY: usize = 128;
 const STOP_GRACE: Duration = Duration::from_secs(2);
 const FORCE_KILL_WAIT: Duration = Duration::from_secs(1);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const SANDBOX_SHELL: &str = "/bin/bash";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TerminalSize {
@@ -50,7 +51,6 @@ pub(super) enum TerminalEvent {
 pub(super) struct TerminalSpec {
     pub(super) sandbox_binary: PathBuf,
     pub(super) config_path: PathBuf,
-    pub(super) shell: PathBuf,
 }
 
 pub(super) struct TerminalSession {
@@ -76,7 +76,7 @@ impl TerminalSession {
             "-c".as_ref(),
             spec.config_path.as_os_str(),
             "-e".as_ref(),
-            spec.shell.as_os_str(),
+            SANDBOX_SHELL.as_ref(),
         ]);
         command.env("TERM", "xterm-256color");
         let mut child = pair
@@ -261,7 +261,7 @@ mod tests {
     use super::{TerminalEvent, TerminalSession, TerminalSize, TerminalSpec};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -300,7 +300,6 @@ exec /bin/bash --noprofile --norc
         TerminalSpec {
             sandbox_binary: root.join("fake-sandbox"),
             config_path: root.join("sandbox.json"),
-            shell: PathBuf::from("/bin/bash"),
         }
     }
 

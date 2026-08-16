@@ -127,6 +127,56 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(!removed.status.success());
 }
 
+#[test]
+fn sandbox_cli_exposes_the_web_viewer() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("web"));
+}
+
+#[test]
+fn sandbox_web_requires_a_config_file() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .arg("web")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--config <CONFIG>"));
+}
+
+#[test]
+fn sandbox_web_documents_only_viewer_options() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .args(["web", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("-c, --config <CONFIG>"));
+    assert!(stdout.contains("--no-open"));
+    assert!(!stdout.contains("--sandbox-bin"));
+    assert!(!stdout.contains("--command"));
+    assert!(!stdout.contains("--shell"));
+    assert!(!stdout.contains("--listen"));
+}
+
+#[test]
+fn sandbox_web_rejects_browser_selected_execution_options() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .args(["web", "--config", "sandbox.json", "--shell", "/bin/zsh"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--shell'"));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn sandbox_cli_runs_from_one_strict_config_file() {

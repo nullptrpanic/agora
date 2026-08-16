@@ -1,6 +1,6 @@
+use super::audit_log::record as audit_record;
 use super::{
-    JsonCallback, audit_record, exit_status_code, open_log, parse_command, shutdown_signals,
-    signal_exit_code,
+    JsonCallback, exit_status_code, open_log, parse_command, shutdown_signals, signal_exit_code,
 };
 use agora_core::lifecycle::shutdown::ShutdownGuard;
 use agora_sandbox::callback::{

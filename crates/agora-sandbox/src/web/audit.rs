@@ -1,3 +1,4 @@
+use crate::audit_log::AuditRecord;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -45,32 +46,6 @@ struct Envelope {
     audit: Option<Value>,
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum CompactAudit {
-    Process {
-        access_time: String,
-        trace_id: String,
-        executable: String,
-        arguments: Vec<String>,
-    },
-    Filesystem {
-        access_time: String,
-        trace_id: String,
-        operation: String,
-        path: String,
-    },
-    Network {
-        access_time: String,
-        trace_id: String,
-        destination_ip: IpAddr,
-        destination_port: u16,
-        domain: Option<String>,
-        target_host: Option<String>,
-        target_port: Option<u16>,
-    },
-}
-
 pub(super) fn normalize_line(id: u64, line: &[u8]) -> Result<Option<TraceEvent>, AuditLineError> {
     let envelope: Envelope = serde_json::from_slice(line)
         .map_err(|error| AuditLineError(format!("invalid JSON log record: {error}")))?;
@@ -81,14 +56,15 @@ pub(super) fn normalize_line(id: u64, line: &[u8]) -> Result<Option<TraceEvent>,
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let audit: CompactAudit = serde_json::from_value(detail.clone())
+    let audit: AuditRecord = serde_json::from_value(detail.clone())
         .map_err(|error| AuditLineError(format!("invalid {audit_type} audit record: {error}")))?;
     let (root_trace_id, kind, occurred_at, title) = match audit {
-        CompactAudit::Process {
+        AuditRecord::Process {
             access_time,
             trace_id,
             executable,
             arguments,
+            ..
         } => {
             let title = if arguments.is_empty() {
                 executable
@@ -101,24 +77,20 @@ pub(super) fn normalize_line(id: u64, line: &[u8]) -> Result<Option<TraceEvent>,
             };
             (trace_root(&trace_id)?, TraceKind::Exec, access_time, title)
         }
-        CompactAudit::Filesystem {
+        AuditRecord::Filesystem {
             access_time,
             trace_id,
             operation,
             path,
+            ..
         } => {
-            let kind = match operation.as_str() {
-                "open" => TraceKind::FileOpen,
-                "close" => TraceKind::FileClose,
-                _ => {
-                    return Err(AuditLineError(format!(
-                        "invalid filesystem audit operation: {operation}"
-                    )));
-                }
+            let kind = match operation {
+                crate::audit_log::FileOperation::Open => TraceKind::FileOpen,
+                crate::audit_log::FileOperation::Close => TraceKind::FileClose,
             };
             (trace_root(&trace_id)?, kind, access_time, path)
         }
-        CompactAudit::Network {
+        AuditRecord::Network {
             access_time,
             trace_id,
             destination_ip,
@@ -126,6 +98,7 @@ pub(super) fn normalize_line(id: u64, line: &[u8]) -> Result<Option<TraceEvent>,
             domain,
             target_host,
             target_port,
+            ..
         } => {
             let title = match (target_host.filter(|host| !host.is_empty()), target_port) {
                 (Some(host), Some(port)) => format!("{host}:{port}"),

@@ -1,4 +1,4 @@
-use crate::trace_viewer::audit::TraceEvent;
+use super::audit::TraceEvent;
 use axum::extract::ws::Message;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -140,10 +140,10 @@ pub(super) fn validate_auth(
 
 #[cfg(test)]
 mod tests {
+    use super::super::audit::{TraceEvent, TraceKind};
     use super::{
         AccessToken, ClientControl, ServerControl, SessionStatus, parse_control, validate_auth,
     };
-    use crate::trace_viewer::audit::{TraceEvent, TraceKind};
     use axum::extract::ws::Message;
     use serde_json::json;
 

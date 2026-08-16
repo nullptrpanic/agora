@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { create } = require("../web/trace-batch.js");
+const { create } = require("../../src/web/assets/trace-batch.js");
 
 function fakeTimers() {
   let nextId = 1;

@@ -3,19 +3,14 @@ use agora_core::lifecycle::{
     shutdown::{ShutdownGuard, ShutdownReason},
     signal::{Signal, SignalHandlers},
 };
-use agora_core::logger::{self, LoggerEntry};
+use agora_core::logger;
 #[cfg(not(target_os = "macos"))]
 use agora_sandbox::runner::Sandbox;
 #[cfg(target_os = "macos")]
 use agora_sandbox::session;
-use agora_sandbox::{
-    callback::{Callback, Decision, Event, EventType, FileOpenMode, ProcessOperation},
-    hook_library,
-    runner::SandboxCommand,
-};
+use agora_sandbox::{hook_library, runner::SandboxCommand};
 use anyhow::{Context, Result};
 use clap::{ColorChoice, Parser, Subcommand};
-use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -23,8 +18,13 @@ use std::process::{ExitCode, ExitStatus};
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex, MutexGuard};
 
+mod audit_log;
 mod config;
 mod key_migration;
+#[cfg(feature = "web")]
+mod web;
+
+use audit_log::JsonCallback;
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +57,18 @@ enum CliCommand {
         workdir: Option<PathBuf>,
     },
 
+    #[cfg(feature = "web")]
+    /// Open an interactive sandbox terminal with a live audit timeline
+    Web {
+        /// Sandbox JSON configuration file
+        #[arg(short = 'c', long)]
+        config: PathBuf,
+
+        /// Print the URL without opening the default browser
+        #[arg(long)]
+        no_open: bool,
+    },
+
     #[cfg(target_os = "macos")]
     #[command(name = "__session-daemon", hide = true)]
     SessionDaemon {
@@ -67,76 +79,6 @@ enum CliCommand {
         #[arg(long, hide = true)]
         startup_lock_fd: libc::c_int,
     },
-}
-
-struct JsonCallback;
-
-impl JsonCallback {
-    fn new() -> Self {
-        Self
-    }
-}
-
-impl Callback for JsonCallback {
-    fn on_event(&self, event: Event) -> impl Future<Output = Decision> + Send {
-        if let Some(record) = audit_record(&event) {
-            logger::info!(
-                entry = LoggerEntry::new().with_entry("audit", record),
-                "sandbox audit event"
-            );
-        }
-        std::future::ready(Decision::Allow)
-    }
-}
-
-fn audit_record(event: &Event) -> Option<AuditRecord> {
-    match event {
-        Event::Network(event) if event.event_type == EventType::NetworkConnectAttempt => {
-            event.network.as_ref().map(|network| AuditRecord::Network {
-                access_time: event.occurred_at.clone(),
-                trace_id: event.trace_id.clone(),
-                pid: event.process.pid,
-                destination_ip: network.destination_ip,
-                destination_port: network.destination_port,
-                target_host: network.target.as_deref().map(|target| target.host.clone()),
-                target_port: network.target.as_deref().map(|target| target.port),
-                domain: network.domain.clone(),
-            })
-        }
-        Event::Process(event) if event.event_type == EventType::ProcessExecAttempt => {
-            Some(AuditRecord::Process {
-                access_time: event.occurred_at.clone(),
-                trace_id: event.trace_id.clone(),
-                pid: event.process.pid,
-                ppid: event.process.ppid,
-                process_executable: event.process.executable.clone(),
-                executable: event.command.executable.clone(),
-                arguments: event.command.arguments.clone(),
-                current_dir: event.command.current_dir.clone(),
-                operation: event.command.operation,
-            })
-        }
-        Event::File(event)
-            if matches!(
-                event.event_type,
-                EventType::FilesystemOpen | EventType::FilesystemClose
-            ) =>
-        {
-            Some(AuditRecord::Filesystem {
-                access_time: event.occurred_at.clone(),
-                trace_id: event.trace_id.clone(),
-                pid: event.process.pid,
-                operation: match event.event_type {
-                    EventType::FilesystemOpen => FileOperation::Open,
-                    EventType::FilesystemClose => FileOperation::Close,
-                    _ => unreachable!(),
-                },
-                path: event.file.path.clone(),
-                mode: event.file.mode,
-            })
-        }
-        _ => None,
-    }
 }
 
 fn open_log(path: &Path) -> Result<File> {
@@ -155,49 +97,6 @@ fn open_log(path: &Path) -> Result<File> {
         .with_context(|| format!("failed to open log file {}", path.display()))
 }
 
-#[derive(Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum AuditRecord {
-    Network {
-        access_time: String,
-        trace_id: String,
-        pid: u32,
-        destination_ip: std::net::IpAddr,
-        destination_port: u16,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        target_host: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        target_port: Option<u16>,
-        domain: Option<String>,
-    },
-    Process {
-        access_time: String,
-        trace_id: String,
-        pid: u32,
-        ppid: u32,
-        process_executable: String,
-        executable: String,
-        arguments: Vec<String>,
-        current_dir: String,
-        operation: ProcessOperation,
-    },
-    Filesystem {
-        access_time: String,
-        trace_id: String,
-        pid: u32,
-        operation: FileOperation,
-        path: String,
-        mode: FileOpenMode,
-    },
-}
-
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum FileOperation {
-    Open,
-    Close,
-}
-
 async fn async_main(arguments: Arguments) -> Result<u8> {
     match arguments.command {
         CliCommand::MigrateKey { workdir } => {
@@ -205,6 +104,8 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
             Ok(0)
         }
         CliCommand::Run { config, executable } => run(config, executable).await,
+        #[cfg(feature = "web")]
+        CliCommand::Web { config, no_open } => run_web(config, no_open).await,
         #[cfg(target_os = "macos")]
         CliCommand::SessionDaemon {
             config,
@@ -214,9 +115,20 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
     }
 }
 
+#[cfg(feature = "web")]
+async fn run_web(config_path: PathBuf, no_open: bool) -> Result<u8> {
+    let (config_path, config) = load_config(config_path)?;
+    web::run(web::WebOptions {
+        config_path,
+        log_path: config.log_file().to_path_buf(),
+        open_browser: !no_open,
+    })
+    .await?;
+    Ok(0)
+}
+
 async fn run(config_path: PathBuf, executable: String) -> Result<u8> {
-    let config_path = absolute_config_path(config_path)?;
-    let config = config::RunConfig::load(&config_path)?;
+    let (config_path, config) = load_config(config_path)?;
     let command = parse_command(&executable)?;
     let hook = hook_library::materialize(config.workdir())?;
 
@@ -273,8 +185,7 @@ async fn run_session_daemon(
     let startup =
         unsafe { session::DaemonStartup::from_raw_descriptors(ready_fd, startup_lock_fd) }?;
     let prepared = (|| {
-        let config_path = absolute_config_path(config_path)?;
-        let config = config::RunConfig::load(&config_path)?;
+        let (_, config) = load_config(config_path)?;
         let hook = hook_library::materialize(config.workdir())?;
         let identity = config.session_identity(&hook)?;
         logger::init(open_log(config.log_file())?, logger::LevelFilter::Info)?;
@@ -298,6 +209,12 @@ fn absolute_config_path(path: PathBuf) -> Result<PathBuf> {
     Ok(std::env::current_dir()
         .context("failed to resolve current directory")?
         .join(path))
+}
+
+fn load_config(path: PathBuf) -> Result<(PathBuf, config::RunConfig)> {
+    let path = absolute_config_path(path)?;
+    let config = config::RunConfig::load(&path)?;
+    Ok((path, config))
 }
 
 fn parse_command(command: &str) -> Result<SandboxCommand> {

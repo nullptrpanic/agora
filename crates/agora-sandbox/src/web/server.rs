@@ -1,8 +1,8 @@
-use crate::trace_viewer::audit::{CursorItem, LogCursor, TraceEvent};
-use crate::trace_viewer::protocol::{
+use super::audit::{CursorItem, LogCursor, TraceEvent};
+use super::protocol::{
     AccessToken, ClientControl, ServerControl, SessionStatus, parse_control, validate_auth,
 };
-use crate::trace_viewer::terminal::{TerminalEvent, TerminalSession, TerminalSize, TerminalSpec};
+use super::terminal::{TerminalEvent, TerminalSession, TerminalSize, TerminalSpec};
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
@@ -459,7 +459,7 @@ pub(super) async fn serve(
 
 fn router(state: AppState) -> Router {
     Router::new()
-        .merge(crate::trace_viewer::assets::routes())
+        .merge(super::assets::routes())
         .route("/ws", get(websocket_upgrade))
         .with_state(state)
 }
@@ -772,15 +772,14 @@ mod access_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::super::audit::{TraceEvent, TraceKind};
+    use super::super::protocol::SessionStatus;
+    use super::super::terminal::{TerminalSize, TerminalSpec};
     use super::{EventHub, SessionManager};
-    use crate::trace_viewer::audit::{TraceEvent, TraceKind};
-    use crate::trace_viewer::protocol::SessionStatus;
-    use crate::trace_viewer::terminal::{TerminalSize, TerminalSpec};
     use serde_json::json;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
     use std::time::Duration;
 
     fn event(id: u64, root: &str, title: &str) -> TraceEvent {
@@ -883,7 +882,6 @@ exec /bin/bash --noprofile --norc
             TerminalSpec {
                 sandbox_binary: sandbox,
                 config_path: config,
-                shell: PathBuf::from("/bin/bash"),
             },
             log.clone(),
             hub.clone(),
@@ -946,13 +944,13 @@ exec /bin/bash --noprofile --norc
 
 #[cfg(test)]
 mod websocket_tests {
+    use super::super::protocol::{AccessToken, SessionStatus};
+    use super::super::terminal::TerminalSpec;
     use super::{AccessGuard, AppState, EventHub, SessionManager, serve};
-    use crate::trace_viewer::protocol::{AccessToken, SessionStatus};
-    use crate::trace_viewer::terminal::TerminalSpec;
     use futures_util::{SinkExt, StreamExt};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::{TcpListener, TcpStream};
@@ -1031,7 +1029,6 @@ mod websocket_tests {
             TerminalSpec {
                 sandbox_binary: sandbox,
                 config_path: config,
-                shell: PathBuf::from("/bin/bash"),
             },
             log,
             hub.clone(),
