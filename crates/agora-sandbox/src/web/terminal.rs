@@ -56,7 +56,6 @@ pub(super) struct TerminalSpec {
 pub(super) struct TerminalSession {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
     process_id: libc::pid_t,
     exited: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
@@ -88,7 +87,6 @@ impl TerminalSession {
             .process_id()
             .and_then(|pid| libc::pid_t::try_from(pid).ok())
             .context("viewer terminal child did not expose a process id")?;
-        let killer = Arc::new(Mutex::new(child.clone_killer()));
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -163,7 +161,6 @@ impl TerminalSession {
             Self {
                 master,
                 writer,
-                killer,
                 process_id,
                 exited,
                 stop_requested,
@@ -193,24 +190,16 @@ impl TerminalSession {
         if self.exited.load(Ordering::Acquire) || self.stop_requested.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let result = unsafe { libc::kill(self.process_id, libc::SIGTERM) };
-        if result != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
-            }
-        }
+        signal_process(self.process_id, libc::SIGTERM)?;
 
         let exited = self.exited.clone();
-        let killer = self.killer.clone();
+        let process_id = self.process_id;
         thread::Builder::new()
             .name("agora-trace-terminal-stop".to_string())
             .spawn(move || {
                 thread::sleep(STOP_GRACE);
-                if !exited.load(Ordering::Acquire)
-                    && let Ok(mut killer) = killer.lock()
-                {
-                    let _ = killer.kill();
+                if !exited.load(Ordering::Acquire) {
+                    let _ = signal_process(process_id, libc::SIGKILL);
                 }
             })
             .map_err(|error| io::Error::other(anyhow!(error)))?;
@@ -222,11 +211,7 @@ impl TerminalSession {
         if self.wait_for_exit(STOP_GRACE + EXIT_POLL_INTERVAL) {
             return Ok(());
         }
-        self.killer
-            .lock()
-            .map_err(|_| io::Error::other("viewer terminal killer lock is poisoned"))?
-            .kill()
-            .map_err(io::Error::other)?;
+        signal_process(self.process_id, libc::SIGKILL)?;
         if self.wait_for_exit(FORCE_KILL_WAIT) {
             Ok(())
         } else {
@@ -247,6 +232,18 @@ impl TerminalSession {
 
     pub(super) fn is_exited(&self) -> bool {
         self.exited.load(Ordering::Acquire)
+    }
+}
+
+fn signal_process(process_id: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
+    if unsafe { libc::kill(process_id, signal) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
@@ -368,6 +365,59 @@ exec /bin/bash --noprofile --norc
         let output = output_until(&mut events, "INTERRUPTED").await;
         assert!(output.contains("INTERRUPTED"));
         session.request_stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_force_kills_a_child_that_ignores_graceful_signals() {
+        let root = tempfile::tempdir().unwrap();
+        let sandbox = root.path().join("fake-sandbox");
+        fs::write(
+            &sandbox,
+            r#"#!/bin/sh
+trap '' TERM HUP
+printf 'STUBBORN_READY\r\n'
+while :; do sleep 1; done
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&sandbox).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&sandbox, permissions).unwrap();
+        fs::write(root.path().join("sandbox.json"), "{}").unwrap();
+        let (session, mut events) =
+            TerminalSession::spawn(spec(root.path()), TerminalSize::default()).unwrap();
+        output_until(&mut events, "STUBBORN_READY").await;
+
+        let started = std::time::Instant::now();
+        session.request_stop().unwrap();
+        let exited = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    TerminalEvent::Exited { signal, .. } => break signal,
+                    TerminalEvent::Error(message) => panic!("terminal error: {message}"),
+                    TerminalEvent::Output(_) => {}
+                }
+            }
+        })
+        .await;
+        if exited.is_err() {
+            unsafe {
+                libc::kill(-session.process_id, libc::SIGKILL);
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !session.is_exited() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        let signal = exited.expect("stop did not force-kill the unresponsive terminal child");
+        let expected_signal =
+            unsafe { std::ffi::CStr::from_ptr(libc::strsignal(libc::SIGKILL)) }.to_string_lossy();
+        assert_eq!(signal.as_deref(), Some(expected_signal.as_ref()));
+        assert!(started.elapsed() >= super::STOP_GRACE);
     }
 
     #[tokio::test]
