@@ -72,8 +72,9 @@ impl ResetCommand {
         self.scheduler.stop_session_keys(&keys);
 
         let mut failed = Vec::new();
-        while let Some((agent, key, mut barrier)) = resets.pop_front() {
+        while let Some((agent, key, barrier)) = resets.pop_front() {
             let result = async {
+                let mut barrier = barrier?;
                 barrier.wait_until_front().await?;
                 self.reset_agent_session(&key, &agent).await
             }

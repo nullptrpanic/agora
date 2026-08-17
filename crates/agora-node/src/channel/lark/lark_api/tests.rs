@@ -34,6 +34,15 @@ fn message_event_payload() -> Vec<u8> {
     br#"{"schema":"2.0","header":{"event_id":"evt_1","event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_1"}},"message":{"message_id":"om_1","chat_id":"oc_1","chat_type":"group","message_type":"text","content":"{\"text\":\"hello\"}"}}}"#.to_vec()
 }
 
+fn short_websocket_timing() -> LarkWebSocketTiming {
+    LarkWebSocketTiming {
+        connect_timeout: Duration::from_millis(50),
+        write_timeout: Duration::from_millis(50),
+        default_ping_interval: Duration::from_millis(20),
+        minimum_idle_timeout: Duration::from_millis(80),
+    }
+}
+
 async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
     let mut request = Vec::new();
     loop {
@@ -61,6 +70,130 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
             return String::from_utf8(request).unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn websocket_connect_and_write_deadlines_are_bounded() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let websocket_url = format!("ws://{}/", listener.local_addr().unwrap());
+    let endpoint = HttpMockServer::start(move |_| {
+        MockResponse::json(format!(
+            r#"{{"code":0,"msg":"ok","data":{{"URL":"{websocket_url}"}}}}"#
+        ))
+    })
+    .await;
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let api = LarkApi::with_base_url(config(), endpoint.base_url())
+        .unwrap()
+        .with_websocket_timing(short_websocket_timing());
+    let (sender, _) = mpsc::channel(1);
+    let mut connected = false;
+
+    let error = api
+        .run_websocket_once(sender, &mut connected)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("connect lark websocket timed out")
+    );
+    assert!(!connected);
+
+    let error = api
+        .write_websocket(
+            std::future::pending::<std::result::Result<(), tokio_tungstenite::tungstenite::Error>>(
+            ),
+            "send test lark websocket message failed",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("write lark websocket timed out"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn websocket_silent_connection_hits_inbound_idle_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let websocket_url = format!("ws://{}/", listener.local_addr().unwrap());
+    let endpoint = HttpMockServer::start(move |_| {
+        MockResponse::json(format!(
+            r#"{{"code":0,"msg":"ok","data":{{"URL":"{websocket_url}","ClientConfig":{{"PingInterval":0}}}}}}"#
+        ))
+    })
+    .await;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _socket = accept_async(stream).await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let api = LarkApi::with_base_url(config(), endpoint.base_url())
+        .unwrap()
+        .with_websocket_timing(short_websocket_timing());
+    let (sender, _) = mpsc::channel(1);
+    let mut connected = false;
+
+    let error = api
+        .run_websocket_once(sender, &mut connected)
+        .await
+        .unwrap_err();
+
+    assert!(connected);
+    assert!(
+        error
+            .to_string()
+            .contains("lark websocket inbound idle timed out")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn websocket_inbound_ping_refreshes_the_idle_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let websocket_url = format!("ws://{}/", listener.local_addr().unwrap());
+    let endpoint = HttpMockServer::start(move |_| {
+        MockResponse::json(format!(
+            r#"{{"code":0,"msg":"ok","data":{{"URL":"{websocket_url}","ClientConfig":{{"PingInterval":0}}}}}}"#
+        ))
+    })
+    .await;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        for payload in [vec![1], vec![2], vec![3]] {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            socket
+                .send(WebSocketMessage::Ping(payload.clone().into()))
+                .await
+                .unwrap();
+            loop {
+                if let WebSocketMessage::Pong(received) = socket.next().await.unwrap().unwrap() {
+                    assert_eq!(received.as_ref(), payload.as_slice());
+                    break;
+                }
+            }
+        }
+        socket.send(WebSocketMessage::Close(None)).await.unwrap();
+    });
+    let api = LarkApi::with_base_url(config(), endpoint.base_url())
+        .unwrap()
+        .with_websocket_timing(short_websocket_timing());
+    let (sender, _) = mpsc::channel(1);
+    let mut connected = false;
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        api.run_websocket_once(sender, &mut connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(connected);
+    server.await.unwrap();
 }
 
 #[tokio::test]

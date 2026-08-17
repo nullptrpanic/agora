@@ -63,6 +63,7 @@ impl TelegramApi {
             &GetUpdatesRequest {
                 offset,
                 timeout: TELEGRAM_LONG_POLL_SECONDS,
+                limit: 1,
                 allowed_updates: ["message", "callback_query"],
             },
         )
@@ -467,6 +468,7 @@ struct GetUpdatesRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     offset: Option<i64>,
     timeout: u64,
+    limit: usize,
     allowed_updates: [&'a str; 2],
 }
 

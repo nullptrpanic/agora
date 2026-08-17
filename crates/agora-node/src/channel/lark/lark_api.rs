@@ -12,6 +12,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
@@ -37,6 +38,28 @@ const LARK_MAX_IN_FLIGHT_EVENTS: usize = 64;
 const LARK_EVENT_CACHE_CAPACITY: usize = 4096;
 const LARK_EVENT_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const LARK_PENDING_EVENT_TTL: Duration = Duration::from_secs(2 * 60);
+const LARK_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const LARK_WS_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const LARK_WS_MINIMUM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct LarkWebSocketTiming {
+    connect_timeout: Duration,
+    write_timeout: Duration,
+    default_ping_interval: Duration,
+    minimum_idle_timeout: Duration,
+}
+
+impl Default for LarkWebSocketTiming {
+    fn default() -> Self {
+        Self {
+            connect_timeout: LARK_WS_CONNECT_TIMEOUT,
+            write_timeout: LARK_WS_WRITE_TIMEOUT,
+            default_ping_interval: Duration::from_secs(DEFAULT_WS_PING_INTERVAL_SECONDS),
+            minimum_idle_timeout: LARK_WS_MINIMUM_IDLE_TIMEOUT,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct LarkApi {
@@ -47,6 +70,7 @@ pub(super) struct LarkApi {
     base_url: String,
     proxy: Option<crate::config::HttpProxy>,
     event_cache: Arc<Mutex<LarkEventCache>>,
+    websocket_timing: LarkWebSocketTiming,
 }
 
 #[derive(Default)]
@@ -241,7 +265,14 @@ impl LarkApi {
             base_url,
             proxy: config.proxy,
             event_cache: Arc::new(Mutex::new(LarkEventCache::default())),
+            websocket_timing: LarkWebSocketTiming::default(),
         })
+    }
+
+    #[cfg(test)]
+    fn with_websocket_timing(mut self, timing: LarkWebSocketTiming) -> Self {
+        self.websocket_timing = timing;
+        self
     }
 
     pub(super) fn name(&self) -> &str {
@@ -304,23 +335,34 @@ impl LarkApi {
         let service_id = Self::query_param(&endpoint_url, "service_id")
             .and_then(|value| value.parse::<i32>().ok())
             .unwrap_or_default();
-        let ping_interval_seconds = if client_config.ping_interval > 0 {
-            client_config.ping_interval as u64
+        let ping_interval_duration = if client_config.ping_interval > 0 {
+            Duration::from_secs(client_config.ping_interval as u64)
         } else {
-            DEFAULT_WS_PING_INTERVAL_SECONDS
+            self.websocket_timing.default_ping_interval
         };
+        let idle_timeout = ping_interval_duration
+            .saturating_mul(2)
+            .max(self.websocket_timing.minimum_idle_timeout);
 
-        let (mut socket, _) = match &self.proxy {
-            Some(proxy) => {
-                let stream = proxy::connect_tunnel(proxy, &endpoint_url).await?;
-                client_async_tls(endpoint_url.as_str(), stream).await
-            }
-            None => connect_async(endpoint_url.as_str()).await,
-        }
-        .context("connect lark websocket failed")?;
+        let connect = async {
+            let connected = match &self.proxy {
+                Some(proxy) => {
+                    let stream = proxy::connect_tunnel(proxy, &endpoint_url).await?;
+                    client_async_tls(endpoint_url.as_str(), stream).await?
+                }
+                None => connect_async(endpoint_url.as_str()).await?,
+            };
+            Ok::<_, anyhow::Error>(connected)
+        };
+        let (mut socket, _) = tokio::time::timeout(self.websocket_timing.connect_timeout, connect)
+            .await
+            .map_err(|_| anyhow!("connect lark websocket timed out"))?
+            .context("connect lark websocket failed")?;
         *connected = true;
         logger::info!("lark websocket connected channel={}", self.name);
-        let mut ping_interval = tokio::time::interval(Duration::from_secs(ping_interval_seconds));
+        let mut ping_interval = tokio::time::interval(ping_interval_duration);
+        let inbound_idle = tokio::time::sleep(idle_timeout);
+        tokio::pin!(inbound_idle);
         let in_flight = Arc::new(Semaphore::new(LARK_MAX_IN_FLIGHT_EVENTS));
         let (acknowledgements, mut acknowledged) =
             mpsc::channel::<Result<LarkFrame>>(LARK_MAX_IN_FLIGHT_EVENTS);
@@ -330,18 +372,23 @@ impl LarkApi {
                 acknowledgement = acknowledged.recv() => {
                     let acknowledgement = acknowledgement
                         .expect("lark acknowledgement sender is retained while connected")?;
-                    socket
-                        .send(WebSocketMessage::Binary(
+                    self.write_websocket(
+                        socket.send(WebSocketMessage::Binary(
                             acknowledgement.encode_to_vec().into(),
-                        ))
-                        .await
-                        .context("send lark websocket ack failed")?;
+                        )),
+                        "send lark websocket ack failed",
+                    )
+                    .await?;
                 }
                 message = socket.next() => {
                     let Some(message) = message else {
                         return Ok(());
                     };
-                    match message.context("read lark websocket message failed")? {
+                    let message = message.context("read lark websocket message failed")?;
+                    inbound_idle
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + idle_timeout);
+                    match message {
                         WebSocketMessage::Binary(payload) => {
                             let frame = LarkFrame::decode(payload)
                                 .context("decode lark websocket frame failed")?;
@@ -350,10 +397,13 @@ impl LarkApi {
                             {
                                 let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
                                     let ack = frame.into_ack(500, 0)?;
-                                    socket
-                                        .send(WebSocketMessage::Binary(ack.encode_to_vec().into()))
-                                        .await
-                                        .context("send overloaded lark websocket ack failed")?;
+                                    self.write_websocket(
+                                        socket.send(WebSocketMessage::Binary(
+                                            ack.encode_to_vec().into(),
+                                        )),
+                                        "send overloaded lark websocket ack failed",
+                                    )
+                                    .await?;
                                     continue;
                                 };
                                 let api = self.clone();
@@ -374,10 +424,11 @@ impl LarkApi {
                             }
                         }
                         WebSocketMessage::Ping(payload) => {
-                            socket
-                                .send(WebSocketMessage::Pong(payload))
-                                .await
-                                .context("send lark websocket pong failed")?;
+                            self.write_websocket(
+                                socket.send(WebSocketMessage::Pong(payload)),
+                                "send lark websocket pong failed",
+                            )
+                            .await?;
                         }
                         WebSocketMessage::Close(_) => return Ok(()),
                         _ => {}
@@ -385,13 +436,27 @@ impl LarkApi {
                 }
                 _ = ping_interval.tick() => {
                     let ping = LarkFrame::ping(service_id);
-                    socket
-                        .send(WebSocketMessage::Binary(ping.encode_to_vec().into()))
-                        .await
-                        .context("send lark websocket ping failed")?;
+                    self.write_websocket(
+                        socket.send(WebSocketMessage::Binary(ping.encode_to_vec().into())),
+                        "send lark websocket ping failed",
+                    )
+                    .await?;
+                }
+                _ = &mut inbound_idle => {
+                    return Err(anyhow!("lark websocket inbound idle timed out"));
                 }
             }
         }
+    }
+
+    async fn write_websocket<F>(&self, write: F, failure_context: &str) -> Result<()>
+    where
+        F: Future<Output = std::result::Result<(), tokio_tungstenite::tungstenite::Error>>,
+    {
+        tokio::time::timeout(self.websocket_timing.write_timeout, write)
+            .await
+            .map_err(|_| anyhow!("write lark websocket timed out: {failure_context}"))?
+            .with_context(|| failure_context.to_string())
     }
 
     async fn websocket_endpoint(&self) -> Result<(String, LarkWebSocketClientConfig)> {

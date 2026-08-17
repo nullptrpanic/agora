@@ -38,7 +38,7 @@ impl Channel for BlockingTerminalChannel {
         "terminal"
     }
 
-    async fn recv(&mut self) -> Result<Option<Self::Task>> {
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
         Ok(None)
     }
 
@@ -57,6 +57,7 @@ impl Channel for BlockingTerminalChannel {
 fn selects_all_agents_subscribed_to_channel() {
     let config = NodeConfig {
         proxy: None,
+        runtime: Default::default(),
         channels: Vec::new(),
         agents: vec![
             agent("codex-dev", "lark1"),
@@ -145,10 +146,23 @@ async fn terminal_publication_does_not_hold_the_execution_queue_ticket() {
         "terminal",
         "session-1",
         SessionKey::new("custom", IsolationScope::Shared),
+        std::path::PathBuf::from("/tmp/agora-dispatcher-test"),
     ));
 
     assert_eq!(next.ahead(), 0);
     drop(next);
+
+    let shutdown_handle = DaemonShutdown {
+        scheduler,
+        task_slots: super::super::TaskSlots::new(32),
+    };
+    let mut shutdown = tokio::spawn(async move { shutdown_handle.interrupt().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+            .await
+            .is_err()
+    );
+    shutdown.abort();
     run.abort();
 }
 
@@ -278,6 +292,7 @@ async fn daemon_rejects_unsupported_channels_even_without_constructor_validation
     let scheduler = super::super::ExecutionScheduler::default();
     let config = NodeConfig {
         proxy: None,
+        runtime: Default::default(),
         channels: vec![
             ChannelConfig::Local(NamedChannelConfig {
                 name: "local".to_string(),
@@ -298,6 +313,7 @@ async fn daemon_rejects_unsupported_channels_even_without_constructor_validation
         config,
         dispatcher: AgentDispatcher::from_parts(store.clone(), scheduler.clone()),
         commands: Arc::new(CommandRuntime::new(store, scheduler).unwrap()),
+        task_slots: super::super::TaskSlots::new(32),
     };
 
     let error = daemon.run().await.unwrap_err();
@@ -405,9 +421,11 @@ async fn shutdown_interrupts_active_execution_and_join_errors_are_handled() {
         "lark",
         "chat",
         SessionKey::new("agent", IsolationScope::Shared),
+        std::path::PathBuf::from("/tmp/agora-dispatcher-test"),
     ));
     let shutdown = DaemonShutdown {
         scheduler: scheduler.clone(),
+        task_slots: super::super::TaskSlots::new(32),
     };
 
     let waiting = tokio::spawn(async move {

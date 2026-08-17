@@ -1,4 +1,4 @@
-use super::super::execution::{ExecutionScheduler, ExecutionScope, ExecutionTicket};
+use super::super::execution::{AdmittedExecution, ExecutionScheduler, ExecutionScope};
 use super::super::{AgentDispatcher, Daemon};
 use super::{
     AgentDispatch, Argument, CommandContext, CommandExecution, CommandHandler, CommandNode,
@@ -8,8 +8,8 @@ use crate::agent::{
     AgentOutput, AgentRunCancellation, AgentRunControl, AgentTask, ConfiguredAgent,
 };
 use crate::channel::{
-    Channel, ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun,
-    ChannelRunContext, ChannelTask, InterruptCallback, RunEvent,
+    Channel, ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelDelivery, ChannelReply,
+    ChannelRun, ChannelRunContext, ChannelTask, InterruptCallback, RunEvent,
 };
 use crate::config::{AgentConfig, AgentType, IsolateMode, IsolationScope};
 use crate::store::{SessionKey, SessionStore};
@@ -35,13 +35,14 @@ fn run_scope(channel_name: &str, session_id: &str, agent_name: &str) -> Executio
             agent_name,
             IsolationScope::session(channel_name, session_id),
         ),
+        std::path::PathBuf::from("/tmp/agora-command-test"),
     )
 }
 
 fn scheduled_run(
     scheduler: &ExecutionScheduler,
     scope: ExecutionScope,
-) -> (ExecutionTicket, AgentRunControl) {
+) -> (AdmittedExecution, AgentRunControl) {
     let ticket = scheduler.enqueue(scope);
     let control = ticket.control();
     (ticket, control)
@@ -187,12 +188,12 @@ impl Channel for CommandTestChannel {
         "lark"
     }
 
-    async fn recv(&mut self) -> Result<Option<Self::Task>> {
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
         if let Some(task) = self.tasks.pop_front() {
             if let Some(received) = &self.received {
                 received.fetch_add(1, Ordering::Release);
             }
-            Ok(Some(task))
+            Ok(Some(ChannelDelivery::untracked(task)))
         } else {
             pending().await
         }

@@ -55,10 +55,67 @@ async fn telegram_api_gets_identity_and_polls_message_updates() {
     let poll: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
     assert_eq!(poll["offset"], 42);
     assert_eq!(poll["timeout"], 50);
+    assert_eq!(poll["limit"], 1);
     assert_eq!(
         poll["allowed_updates"],
         serde_json::json!(["message", "callback_query"])
     );
+}
+
+#[tokio::test]
+async fn telegram_channel_waits_for_acceptance_before_advancing_offset() {
+    let server = HttpMockServer::start_json_queue([
+        r#"{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}}"#,
+        r#"{"ok":true,"result":true}"#,
+        r#"{"ok":true,"result":[{"update_id":701,"message":{"message_id":31,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"text":"first"}}]}"#,
+        r#"{"ok":true,"result":[{"update_id":702,"message":{"message_id":32,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"text":"second"}}]}"#,
+    ])
+    .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+    let mut channel = TelegramChannel::with_api(api);
+
+    let first = channel.recv().await.unwrap().unwrap();
+    assert_eq!(first.input().message().unwrap().text(), "first");
+    let (_, receipt) = first.into_parts();
+    let mut second = Box::pin(channel.recv());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), &mut second)
+            .await
+            .is_err()
+    );
+
+    receipt.accept();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.input().message().unwrap().text(), "second");
+    let requests = server.requests().await;
+    let poll: serde_json::Value = serde_json::from_str(&requests[3].body).unwrap();
+    assert_eq!(poll["offset"], 702);
+}
+
+#[tokio::test]
+async fn telegram_channel_retries_a_delivery_without_advancing_offset() {
+    let server = HttpMockServer::start_json_queue([
+        r#"{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}}"#,
+        r#"{"ok":true,"result":true}"#,
+        r#"{"ok":true,"result":[{"update_id":801,"message":{"message_id":41,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"text":"retry me"}}]}"#,
+        r#"{"ok":true,"result":[{"update_id":801,"message":{"message_id":41,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"text":"retry me"}}]}"#,
+    ])
+    .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+    let mut channel = TelegramChannel::with_api(api);
+
+    let first = channel.recv().await.unwrap().unwrap();
+    drop(first);
+    let retried = channel.recv().await.unwrap().unwrap();
+
+    assert_eq!(retried.task_id(), "801");
+    let requests = server.requests().await;
+    let retry_poll: serde_json::Value = serde_json::from_str(&requests[3].body).unwrap();
+    assert_eq!(retry_poll.get("offset"), None);
 }
 
 #[tokio::test]

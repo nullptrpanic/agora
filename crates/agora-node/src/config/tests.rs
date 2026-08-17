@@ -1,6 +1,93 @@
 use super::*;
 
 #[test]
+fn node_runtime_limits_use_safe_defaults() {
+    let config: NodeConfig = serde_json::from_str(r#"{"channels":[],"agents":[]}"#).unwrap();
+
+    assert_eq!(config.runtime.max_in_flight_tasks, 32);
+    assert_eq!(config.runtime.max_in_flight_runs, 64);
+    assert_eq!(config.runtime.max_concurrent_runs, 4);
+}
+
+#[test]
+fn node_runtime_limits_accept_explicit_values() {
+    let config: NodeConfig = serde_json::from_str(
+        r#"{
+            "runtime": {
+                "max_in_flight_tasks": 7,
+                "max_in_flight_runs": 11,
+                "max_concurrent_runs": 3
+            },
+            "channels": [],
+            "agents": []
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(config.runtime.max_in_flight_tasks, 7);
+    assert_eq!(config.runtime.max_in_flight_runs, 11);
+    assert_eq!(config.runtime.max_concurrent_runs, 3);
+    config.validate().unwrap();
+}
+
+#[test]
+fn node_runtime_limits_reject_zero_and_inconsistent_values() {
+    for (runtime, expected) in [
+        (
+            r#"{"max_in_flight_tasks":0,"max_in_flight_runs":2,"max_concurrent_runs":1}"#,
+            "runtime max_in_flight_tasks must be positive",
+        ),
+        (
+            r#"{"max_in_flight_tasks":2,"max_in_flight_runs":0,"max_concurrent_runs":1}"#,
+            "runtime max_in_flight_runs must be positive",
+        ),
+        (
+            r#"{"max_in_flight_tasks":2,"max_in_flight_runs":2,"max_concurrent_runs":0}"#,
+            "runtime max_concurrent_runs must be positive",
+        ),
+        (
+            r#"{"max_in_flight_tasks":2,"max_in_flight_runs":2,"max_concurrent_runs":3}"#,
+            "runtime max_concurrent_runs must not exceed max_in_flight_runs",
+        ),
+    ] {
+        let document = format!(r#"{{"runtime":{runtime},"channels":[],"agents":[]}}"#);
+        let config: NodeConfig = serde_json::from_str(&document).unwrap();
+
+        let error = config.validate().unwrap_err();
+
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn node_runtime_limits_reject_unadmittable_channel_fanout() {
+    let config: NodeConfig = serde_json::from_str(
+        r#"{
+            "runtime": {
+                "max_in_flight_tasks": 2,
+                "max_in_flight_runs": 1,
+                "max_concurrent_runs": 1
+            },
+            "channels": [
+                {"type":"lark","name":"lark","app_id":"id","secret":"secret"}
+            ],
+            "agents": [
+                {"name":"one","isolate":"none","type":"custom","path":"agent","subscribe":[{"channel":"lark"}]},
+                {"name":"two","isolate":"none","type":"custom","path":"agent","subscribe":[{"channel":"lark"}]}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let error = config.validate().unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "runtime max_in_flight_runs cannot admit channel fan-out: lark requires 2, limit is 1"
+    );
+}
+
+#[test]
 fn http_proxy_accepts_optional_credentials_and_rejects_invalid_addresses() {
     for (value, expected) in [
         ("proxy.local:8080", "http://proxy.local:8080"),

@@ -44,10 +44,12 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
     let key = SessionKey::new(agent.name(), agent.isolation_scope("lark", "chat-1"));
     store.save(&key, "old-session").unwrap();
 
-    let active_ticket =
-        dispatcher
-            .scheduler
-            .enqueue(ExecutionScope::new("telegram", "chat-2", key.clone()));
+    let active_ticket = dispatcher.scheduler.enqueue(ExecutionScope::new(
+        "telegram",
+        "chat-2",
+        key.clone(),
+        std::path::PathBuf::from("/tmp/agora-command-test"),
+    ));
     let active_control = active_ticket.control();
     let active_run = tokio::spawn(async move {
         assert_eq!(

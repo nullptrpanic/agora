@@ -1,9 +1,9 @@
 use crate::config::{AgentConfig, AgentType, HttpProxy, IsolationScope};
 use crate::task::{OutputEvent, TaskContent};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub mod command;
 
@@ -140,10 +140,12 @@ impl Agent for AgentBackend {
 pub struct ConfiguredAgent {
     config: AgentConfig,
     backend: AgentBackend,
+    workspace_key: PathBuf,
 }
 
 impl ConfiguredAgent {
     pub fn from_config(config: AgentConfig) -> Result<Self> {
+        let workspace_key = normalize_workspace_key(&config.workdir())?;
         let env = Self::proxy_environment(config.proxy.as_ref());
         let limits = CommandLimits::new(
             std::time::Duration::from_secs(config.timeout_seconds),
@@ -171,7 +173,11 @@ impl ConfiguredAgent {
                 ));
             }
         };
-        Ok(Self { config, backend })
+        Ok(Self {
+            config,
+            backend,
+            workspace_key,
+        })
     }
 
     fn proxy_environment(proxy: Option<&HttpProxy>) -> HashMap<String, String> {
@@ -200,6 +206,10 @@ impl ConfiguredAgent {
         self.config.isolation_scope(channel_name, session_id)
     }
 
+    pub fn workspace_key(&self) -> &Path {
+        &self.workspace_key
+    }
+
     pub async fn run<O>(
         &self,
         task: AgentTask,
@@ -225,6 +235,50 @@ impl ConfiguredAgent {
     pub async fn delete_session(&self, session_id: &str) -> Result<DeleteSessionOutcome> {
         self.backend.delete_session(session_id).await
     }
+}
+
+fn normalize_workspace_key(path: &Path) -> Result<PathBuf> {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = existing.file_name().ok_or_else(|| {
+                    anyhow!(
+                        "agent workspace has no existing ancestor: {}",
+                        path.display()
+                    )
+                })?;
+                missing.push(component.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    anyhow!(
+                        "agent workspace has no existing ancestor: {}",
+                        path.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect agent workspace path failed: {}",
+                        existing.display()
+                    )
+                });
+            }
+        }
+    }
+
+    let mut normalized = std::fs::canonicalize(existing).with_context(|| {
+        format!(
+            "canonicalize agent workspace ancestor failed: {}",
+            existing.display()
+        )
+    })?;
+    for component in missing.into_iter().rev() {
+        normalized.push(component);
+    }
+    Ok(normalized)
 }
 
 pub struct AgentRegistry {

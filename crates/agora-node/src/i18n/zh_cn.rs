@@ -48,6 +48,7 @@ pub(crate) const AGENT_DISABLED_DESCRIPTION: &str = "不接收后续消息";
 pub(crate) const ENABLE_AGENT: &str = "启用";
 pub(crate) const DISABLE_AGENT: &str = "禁用";
 pub(crate) const NO_ENABLED_AGENTS: &str = "当前对话没有启用的 Agent。";
+pub(crate) const NODE_BUSY: &str = "服务繁忙，请稍后重试。";
 
 pub(crate) const STOP_COMMAND_DESCRIPTION: &str = "停止当前对话中正在运行或排队的 Agent 任务。";
 pub(crate) const STOP_AGENT_ARGUMENT_DESCRIPTION: &str =
@@ -104,7 +105,11 @@ pub(crate) fn progress_count(status: ProgressStatus, count: usize) -> String {
 }
 
 pub(crate) fn queued_message(ahead: usize) -> String {
-    format!("正在排队，前面还有 {ahead} 个任务...")
+    if ahead == 0 {
+        "已接收，正在等待可用执行资源...".to_string()
+    } else {
+        format!("正在排队，前面还有 {ahead} 个任务...")
+    }
 }
 
 pub(crate) fn cached_tokens(tokens: impl std::fmt::Display) -> String {

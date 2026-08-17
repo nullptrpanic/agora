@@ -12,12 +12,59 @@ pub mod generate;
 pub struct NodeConfig {
     #[serde(default)]
     pub proxy: Option<HttpProxy>,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
     pub channels: Vec<ChannelConfig>,
     pub agents: Vec<AgentConfig>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct RuntimeConfig {
+    #[serde(default = "default_max_in_flight_tasks")]
+    pub max_in_flight_tasks: usize,
+    #[serde(default = "default_max_in_flight_runs")]
+    pub max_in_flight_runs: usize,
+    #[serde(default = "default_max_concurrent_runs")]
+    pub max_concurrent_runs: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_in_flight_tasks: default_max_in_flight_tasks(),
+            max_in_flight_runs: default_max_in_flight_runs(),
+            max_concurrent_runs: default_max_concurrent_runs(),
+        }
+    }
+}
+
+fn default_max_in_flight_tasks() -> usize {
+    32
+}
+
+fn default_max_in_flight_runs() -> usize {
+    64
+}
+
+fn default_max_concurrent_runs() -> usize {
+    4
+}
+
 impl NodeConfig {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.runtime.max_in_flight_tasks == 0 {
+            anyhow::bail!("runtime max_in_flight_tasks must be positive");
+        }
+        if self.runtime.max_in_flight_runs == 0 {
+            anyhow::bail!("runtime max_in_flight_runs must be positive");
+        }
+        if self.runtime.max_concurrent_runs == 0 {
+            anyhow::bail!("runtime max_concurrent_runs must be positive");
+        }
+        if self.runtime.max_concurrent_runs > self.runtime.max_in_flight_runs {
+            anyhow::bail!("runtime max_concurrent_runs must not exceed max_in_flight_runs");
+        }
+
         let mut channel_names = HashSet::new();
         for channel in &self.channels {
             let name = channel.name();
@@ -58,6 +105,27 @@ impl NodeConfig {
                         subscription.channel
                     );
                 }
+            }
+        }
+
+        for channel in &self.channels {
+            let required = self
+                .agents
+                .iter()
+                .filter(|agent| {
+                    agent
+                        .subscribe
+                        .iter()
+                        .any(|subscription| subscription.channel == channel.name())
+                })
+                .count();
+            if required > self.runtime.max_in_flight_runs {
+                anyhow::bail!(
+                    "runtime max_in_flight_runs cannot admit channel fan-out: {} requires {}, limit is {}",
+                    channel.name(),
+                    required,
+                    self.runtime.max_in_flight_runs
+                );
             }
         }
         Ok(())

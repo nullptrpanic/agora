@@ -67,12 +67,21 @@ fn event_receiver(events: impl IntoIterator<Item = LarkEvent>) -> LarkWebSocketR
 
 fn acknowledged_event_receiver(
     event: LarkEvent,
-) -> (LarkWebSocketReceiver, tokio::sync::oneshot::Receiver<u16>) {
+) -> (
+    LarkWebSocketReceiver,
+    tokio::sync::oneshot::Receiver<u16>,
+    tokio::time::Instant,
+) {
     let (sender, events) = mpsc::channel(1);
     let (delivery, acknowledged) = LarkDelivery::new(event);
+    let deadline = delivery.deadline();
     sender.try_send(delivery).unwrap();
     drop(sender);
-    (LarkWebSocketReceiver { events, task: None }, acknowledged)
+    (
+        LarkWebSocketReceiver { events, task: None },
+        acknowledged,
+        deadline,
+    )
 }
 
 async fn permission_api() -> (LarkApi, HttpMockServer) {
@@ -168,7 +177,7 @@ async fn receiver_routes_ignored_interrupt_card_and_message_events() {
     assert_eq!(task.input().command().unwrap().path(), &["ask", "list"]);
 
     channel.receiver = Some(event_receiver([]));
-    assert_eq!(channel.recv().await.unwrap(), None);
+    assert!(channel.recv().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -232,13 +241,43 @@ async fn private_messages_support_text_replies_runs_and_actions() {
 }
 
 #[tokio::test]
-async fn receiver_acknowledges_a_message_after_task_normalization() {
+async fn receiver_defers_message_acknowledgement_until_daemon_acceptance() {
     let mut channel = LarkChannel::with_api(api());
-    let (receiver, acknowledged) = acknowledged_event_receiver(LarkEvent::Message(message("text")));
+    let (receiver, mut acknowledged, deadline) =
+        acknowledged_event_receiver(LarkEvent::Message(message("text")));
     channel.receiver = Some(receiver);
 
-    assert!(channel.recv().await.unwrap().is_some());
+    let delivery = channel.recv().await.unwrap().unwrap();
+    assert_eq!(delivery.task().task_id(), "om-message");
+    let (_, receipt) = delivery.into_parts();
+    assert_eq!(receipt.deadline(), deadline);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut acknowledged)
+            .await
+            .is_err()
+    );
+    receipt.accept();
     assert_eq!(acknowledged.await.unwrap(), 200);
+}
+
+#[tokio::test]
+async fn receiver_maps_daemon_acceptance_and_retry_to_lark_status() {
+    for (accept, expected) in [(true, 200), (false, 500)] {
+        let mut channel = LarkChannel::with_api(api());
+        let (receiver, acknowledged, _) =
+            acknowledged_event_receiver(LarkEvent::Message(message("text")));
+        channel.receiver = Some(receiver);
+
+        let delivery = channel.recv().await.unwrap().unwrap();
+        let (_, receipt) = delivery.into_parts();
+        if accept {
+            receipt.accept();
+        } else {
+            drop(receipt);
+        }
+
+        assert_eq!(acknowledged.await.unwrap(), expected);
+    }
 }
 
 #[tokio::test]
@@ -265,7 +304,7 @@ async fn receiver_rejects_ack_when_attachment_normalization_fails() {
     let mut event = message("post");
     event.image_keys = vec!["img-failed".to_string()];
     let mut channel = LarkChannel::with_api(api);
-    let (receiver, acknowledged) = acknowledged_event_receiver(LarkEvent::Message(event));
+    let (receiver, acknowledged, _) = acknowledged_event_receiver(LarkEvent::Message(event));
     channel.receiver = Some(receiver);
 
     assert!(channel.recv().await.is_err());
@@ -296,7 +335,7 @@ async fn receiver_acknowledges_permanent_attachment_failures() {
     let mut event = message("post");
     event.image_keys = vec!["img-missing".to_string()];
     let mut channel = LarkChannel::with_api(api);
-    let (receiver, acknowledged) = acknowledged_event_receiver(LarkEvent::Message(event));
+    let (receiver, acknowledged, _) = acknowledged_event_receiver(LarkEvent::Message(event));
     channel.receiver = Some(receiver);
 
     assert!(channel.recv().await.is_err());

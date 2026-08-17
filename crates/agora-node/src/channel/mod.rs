@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use uuid::Uuid;
 
 pub mod lark;
@@ -16,13 +17,101 @@ mod telegram;
 #[cfg(test)]
 pub(crate) mod test_http;
 
+pub(crate) const CHANNEL_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryDisposition {
+    Accepted,
+    Retry,
+}
+
+pub struct DeliveryReceipt {
+    deadline: tokio::time::Instant,
+    acknowledgement: Option<Box<dyn FnOnce(DeliveryDisposition) + Send>>,
+}
+
+impl DeliveryReceipt {
+    pub fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+
+    pub fn accept(mut self) {
+        self.resolve(DeliveryDisposition::Accepted);
+    }
+
+    fn resolve(&mut self, disposition: DeliveryDisposition) {
+        if let Some(acknowledgement) = self.acknowledgement.take() {
+            acknowledgement(disposition);
+        }
+    }
+}
+
+impl Drop for DeliveryReceipt {
+    fn drop(&mut self) {
+        self.resolve(DeliveryDisposition::Retry);
+    }
+}
+
+pub struct ChannelDelivery<T> {
+    task: T,
+    receipt: DeliveryReceipt,
+}
+
+impl<T> ChannelDelivery<T> {
+    pub fn new(
+        task: T,
+        deadline: tokio::time::Instant,
+        acknowledgement: impl FnOnce(DeliveryDisposition) + Send + 'static,
+    ) -> Self {
+        Self {
+            task,
+            receipt: DeliveryReceipt {
+                deadline,
+                acknowledgement: Some(Box::new(acknowledgement)),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn untracked(task: T) -> Self {
+        Self::new(
+            task,
+            tokio::time::Instant::now() + CHANNEL_ADMISSION_TIMEOUT,
+            |_| {},
+        )
+    }
+
+    pub fn task(&self) -> &T {
+        &self.task
+    }
+
+    pub fn into_parts(self) -> (T, DeliveryReceipt) {
+        (self.task, self.receipt)
+    }
+
+    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> ChannelDelivery<U> {
+        ChannelDelivery {
+            task: map(self.task),
+            receipt: self.receipt,
+        }
+    }
+}
+
+impl<T> std::ops::Deref for ChannelDelivery<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.task
+    }
+}
+
 pub trait Channel {
     type Task: ChannelTask;
     type Run: ChannelRun;
 
     fn name(&self) -> &str;
 
-    fn recv(&mut self) -> impl Future<Output = Result<Option<Self::Task>>> + Send;
+    fn recv(&mut self) -> impl Future<Output = Result<Option<ChannelDelivery<Self::Task>>>> + Send;
 
     fn open_run(
         &self,
@@ -312,12 +401,16 @@ impl Channel for ConfiguredChannel {
         }
     }
 
-    async fn recv(&mut self) -> Result<Option<Self::Task>> {
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
         match self {
-            ConfiguredChannel::Lark(channel) => Ok(channel.recv().await?.map(ConfiguredTask::Lark)),
-            ConfiguredChannel::Telegram(channel) => {
-                Ok(channel.recv().await?.map(ConfiguredTask::Telegram))
-            }
+            ConfiguredChannel::Lark(channel) => Ok(channel
+                .recv()
+                .await?
+                .map(|delivery| delivery.map(ConfiguredTask::Lark))),
+            ConfiguredChannel::Telegram(channel) => Ok(channel
+                .recv()
+                .await?
+                .map(|delivery| delivery.map(ConfiguredTask::Telegram))),
         }
     }
 

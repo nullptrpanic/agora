@@ -389,6 +389,10 @@ fn node_help_describes_the_config_fields() {
     for expected in [
         "CONFIGURATION FILE",
         "Existing files are overwritten",
+        "runtime",
+        "max_in_flight_tasks",
+        "max_in_flight_runs",
+        "max_concurrent_runs",
         "channels",
         "app_id",
         "secret",

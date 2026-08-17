@@ -3,7 +3,8 @@ use super::card::{LarkAgentCard, LarkReplyCard};
 use super::lark_api::{LarkApi, LarkImageDownloadError};
 use crate::channel::permission::{AccessContext, PermissionGate};
 use crate::channel::{
-    Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, InterruptCallbacks, RunEvent,
+    Channel, ChannelDelivery, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask,
+    DeliveryDisposition, InterruptCallbacks, RunEvent,
 };
 #[cfg(test)]
 use crate::config::ChannelPermissionConfig;
@@ -760,7 +761,7 @@ impl Channel for LarkChannel {
         self.api.name()
     }
 
-    async fn recv(&mut self) -> Result<Option<Self::Task>> {
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
         loop {
             let Some(delivery) = self.receiver().next_delivery().await? else {
                 return Ok(None);
@@ -774,8 +775,17 @@ impl Channel for LarkChannel {
                     return Err(anyhow!("lark event admission timed out"));
                 }
                 Ok(Ok(Some(task))) => {
-                    let _ = acknowledgement.send(200);
-                    return Ok(Some(task));
+                    return Ok(Some(ChannelDelivery::new(
+                        task,
+                        deadline,
+                        move |disposition| {
+                            let status = match disposition {
+                                DeliveryDisposition::Accepted => 200,
+                                DeliveryDisposition::Retry => 500,
+                            };
+                            let _ = acknowledgement.send(status);
+                        },
+                    )));
                 }
                 Ok(Ok(None)) => {
                     let _ = acknowledgement.send(200);

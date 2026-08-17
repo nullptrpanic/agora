@@ -49,6 +49,7 @@ async fn channel_loop_routes_stop_without_sending_it_to_the_agent() {
         vec![agent],
         dispatcher,
         commands,
+        super::super::super::TaskSlots::new(32),
     ));
     timeout(Duration::from_secs(2), async {
         loop {
@@ -98,6 +99,7 @@ async fn channel_loop_keeps_receiving_while_reset_waits_for_its_barrier() {
         vec![agent],
         dispatcher,
         commands,
+        super::super::super::TaskSlots::new(32),
     ));
 
     timeout(Duration::from_secs(1), async {

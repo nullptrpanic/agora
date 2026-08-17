@@ -2,8 +2,9 @@ use super::rich_message::TelegramRichMessage;
 use super::telegram_api::{TelegramApi, TelegramBotCommand, TelegramFileDownloadError};
 use crate::channel::permission::{AccessContext, PermissionDenial, PermissionGate};
 use crate::channel::{
-    Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, InterruptCallback,
-    InterruptCallbacks, InterruptRegistration, RunEvent,
+    CHANNEL_ADMISSION_TIMEOUT, Channel, ChannelDelivery, ChannelReply, ChannelRun,
+    ChannelRunContext, ChannelTask, DeliveryDisposition, InterruptCallback, InterruptCallbacks,
+    InterruptRegistration, RunEvent,
 };
 #[cfg(test)]
 use crate::config::ChannelPermissionConfig;
@@ -15,6 +16,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::VecDeque;
+use tokio::sync::oneshot;
 
 const TELEGRAM_INTERRUPT_PREFIX: &str = "agora_interrupt:";
 const TELEGRAM_IMAGE_MAX_ATTEMPTS: usize = 3;
@@ -29,7 +31,8 @@ pub struct TelegramChannel {
     api: TelegramApi,
     permission: PermissionGate,
     interrupts: TelegramInterruptCallbacks,
-    pending: VecDeque<TelegramTask>,
+    pending_updates: VecDeque<Value>,
+    pending_acknowledgement: Option<(i64, oneshot::Receiver<DeliveryDisposition>)>,
     next_offset: Option<i64>,
     image_retry: Option<(i64, usize)>,
     bot_username: Option<String>,
@@ -41,7 +44,8 @@ impl Clone for TelegramChannel {
             api: self.api.clone(),
             permission: self.permission.clone(),
             interrupts: self.interrupts.clone(),
-            pending: VecDeque::new(),
+            pending_updates: VecDeque::new(),
+            pending_acknowledgement: None,
             next_offset: None,
             image_retry: None,
             bot_username: None,
@@ -98,7 +102,8 @@ impl TelegramChannel {
             api,
             permission,
             interrupts: TelegramInterruptCallbacks::default(),
-            pending: VecDeque::new(),
+            pending_updates: VecDeque::new(),
+            pending_acknowledgement: None,
             next_offset: None,
             image_retry: None,
             bot_username: None,
@@ -129,124 +134,161 @@ impl TelegramChannel {
         Self::with_api_inner(api, PermissionGate::new(permission))
     }
 
-    pub(super) async fn next_task(&mut self) -> Result<TelegramTask> {
+    async fn next_delivery(&mut self) -> Result<ChannelDelivery<TelegramTask>> {
         loop {
-            if let Some(task) = self.pending.pop_front() {
-                return Ok(task);
-            }
+            self.settle_pending_delivery().await;
             self.ensure_bot_username().await?;
-            let updates = self.api.get_updates(self.next_offset).await?;
+            if self.pending_updates.is_empty() {
+                self.pending_updates
+                    .extend(self.api.get_updates(self.next_offset).await?);
+            }
+            let Some(value) = self.pending_updates.pop_front() else {
+                continue;
+            };
             let bot_username = self.bot_username.clone().unwrap_or_default();
-            for value in updates {
-                let Some(update_id) = value.get("update_id").and_then(Value::as_i64) else {
-                    logger::error!(
-                        "telegram update ignored channel={} reason=missing_update_id",
-                        self.api.name()
-                    );
-                    continue;
-                };
-                match TelegramUpdate::from_value(value) {
-                    Ok(update) => {
-                        debug_assert_eq!(update.update_id(), update_id);
-                        if let Some(callback) = update.callback_query() {
-                            let access = callback.access();
-                            let admitted = if let Some(access) = access.as_ref() {
-                                let context = access.context();
-                                let target = access.target.clone();
-                                let api = self.api.clone();
-                                self.permission
-                                    .admit(self.api.name(), &context, move |denial| async move {
-                                        let markdown =
-                                            TelegramChannel::render_permission_denial(&denial);
-                                        api.send_rich_message(&target, &markdown, None).await
-                                    })
-                                    .await
-                            } else {
-                                false
-                            };
-                            let interrupt_id = callback
-                                .data
-                                .as_deref()
-                                .and_then(|data| data.strip_prefix(TELEGRAM_INTERRUPT_PREFIX));
-                            let triggered = admitted
-                                && interrupt_id.is_some_and(|id| self.interrupts.trigger(id));
-                            logger::info!(
-                                "telegram callback received channel={} update_id={} triggered={}",
-                                self.api.name(),
-                                update_id,
-                                triggered
-                            );
-                            if access.is_none() {
-                                logger::error!(
-                                    "telegram callback ignored channel={} update_id={} reason=missing_access_identity",
-                                    self.api.name(),
-                                    update_id
-                                );
-                            }
-                            self.answer_callback_query(callback.id.clone());
-                        } else if let Some(task) = update.into_task(&bot_username) {
-                            let context = task.access_context();
-                            let target = task.reply_target().clone();
+            let Some(update_id) = value.get("update_id").and_then(Value::as_i64) else {
+                logger::error!(
+                    "telegram update ignored channel={} reason=missing_update_id",
+                    self.api.name()
+                );
+                continue;
+            };
+            match TelegramUpdate::from_value(value) {
+                Ok(update) => {
+                    debug_assert_eq!(update.update_id(), update_id);
+                    if let Some(callback) = update.callback_query() {
+                        let access = callback.access();
+                        let admitted = if let Some(access) = access.as_ref() {
+                            let context = access.context();
+                            let target = access.target.clone();
                             let api = self.api.clone();
-                            if !self
-                                .permission
+                            self.permission
                                 .admit(self.api.name(), &context, move |denial| async move {
                                     let markdown =
                                         TelegramChannel::render_permission_denial(&denial);
                                     api.send_rich_message(&target, &markdown, None).await
                                 })
                                 .await
+                        } else {
+                            false
+                        };
+                        let interrupt_id = callback
+                            .data
+                            .as_deref()
+                            .and_then(|data| data.strip_prefix(TELEGRAM_INTERRUPT_PREFIX));
+                        let triggered =
+                            admitted && interrupt_id.is_some_and(|id| self.interrupts.trigger(id));
+                        logger::info!(
+                            "telegram callback received channel={} update_id={} triggered={}",
+                            self.api.name(),
+                            update_id,
+                            triggered
+                        );
+                        if access.is_none() {
+                            logger::error!(
+                                "telegram callback ignored channel={} update_id={} reason=missing_access_identity",
+                                self.api.name(),
+                                update_id
+                            );
+                        }
+                        self.answer_callback_query(callback.id.clone());
+                    } else if let Some(task) = update.into_task(&bot_username) {
+                        let context = task.access_context();
+                        let target = task.reply_target().clone();
+                        let api = self.api.clone();
+                        if !self
+                            .permission
+                            .admit(self.api.name(), &context, move |denial| async move {
+                                let markdown = TelegramChannel::render_permission_denial(&denial);
+                                api.send_rich_message(&target, &markdown, None).await
+                            })
+                            .await
+                        {
+                            self.advance_offset(update_id);
+                            continue;
+                        }
+                        let task = match self.resolve_task_image(task).await {
+                            Ok(task) => {
+                                self.image_retry = None;
+                                task
+                            }
+                            Err(error)
+                                if error.is_retryable() && self.retry_image_update(update_id) =>
                             {
+                                self.pending_updates.clear();
+                                return Err(error.into());
+                            }
+                            Err(error) => {
+                                logger::error!(
+                                    "telegram image update discarded channel={} update_id={} retryable={} error={}",
+                                    self.api.name(),
+                                    update_id,
+                                    error.is_retryable(),
+                                    error
+                                );
+                                self.image_retry = None;
                                 self.advance_offset(update_id);
                                 continue;
                             }
-                            let task = match self.resolve_task_image(task).await {
-                                Ok(task) => {
-                                    self.image_retry = None;
-                                    task
-                                }
-                                Err(error)
-                                    if error.is_retryable()
-                                        && self.retry_image_update(update_id) =>
-                                {
-                                    return Err(error.into());
-                                }
-                                Err(error) => {
-                                    logger::error!(
-                                        "telegram image update discarded channel={} update_id={} retryable={} error={}",
-                                        self.api.name(),
-                                        update_id,
-                                        error.is_retryable(),
-                                        error
-                                    );
-                                    self.image_retry = None;
-                                    self.advance_offset(update_id);
-                                    continue;
-                                }
-                            };
-                            let (input, input_bytes, attachments) = task.input.receipt_log_fields();
-                            logger::info!(
-                                "telegram message received channel={} session={} message_id={} input={} input_bytes={} attachments={}",
-                                self.api.name(),
-                                task.session_id(),
-                                task.reply_target.message_id,
-                                input,
-                                input_bytes,
-                                attachments
-                            );
-                            self.pending.push_back(task);
-                        }
+                        };
+                        let (input, input_bytes, attachments) = task.input.receipt_log_fields();
+                        logger::info!(
+                            "telegram message received channel={} session={} message_id={} input={} input_bytes={} attachments={}",
+                            self.api.name(),
+                            task.session_id(),
+                            task.reply_target.message_id,
+                            input,
+                            input_bytes,
+                            attachments
+                        );
+                        return Ok(self.defer_task(update_id, task));
                     }
-                    Err(err) => logger::error!(
-                        "telegram update ignored channel={} update_id={} error={}",
-                        self.api.name(),
-                        update_id,
-                        err
-                    ),
                 }
-                self.advance_offset(update_id);
+                Err(err) => logger::error!(
+                    "telegram update ignored channel={} update_id={} error={}",
+                    self.api.name(),
+                    update_id,
+                    err
+                ),
+            }
+            self.advance_offset(update_id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn next_task(&mut self) -> Result<TelegramTask> {
+        let (task, receipt) = self.next_delivery().await?.into_parts();
+        receipt.accept();
+        Ok(task)
+    }
+
+    async fn settle_pending_delivery(&mut self) {
+        let Some((update_id, acknowledged)) = self.pending_acknowledgement.take() else {
+            return;
+        };
+        match acknowledged.await.unwrap_or(DeliveryDisposition::Retry) {
+            DeliveryDisposition::Accepted => self.advance_offset(update_id),
+            DeliveryDisposition::Retry => {
+                self.pending_updates.clear();
+                logger::info!(
+                    "telegram delivery scheduled for retry channel={} update_id={}",
+                    self.api.name(),
+                    update_id
+                );
             }
         }
+    }
+
+    fn defer_task(&mut self, update_id: i64, task: TelegramTask) -> ChannelDelivery<TelegramTask> {
+        let (acknowledgement, acknowledged) = oneshot::channel();
+        self.pending_acknowledgement = Some((update_id, acknowledged));
+        ChannelDelivery::new(
+            task,
+            tokio::time::Instant::now() + CHANNEL_ADMISSION_TIMEOUT,
+            move |disposition| {
+                let _ = acknowledgement.send(disposition);
+            },
+        )
     }
 
     async fn ensure_bot_username(&mut self) -> Result<()> {
@@ -387,8 +429,8 @@ impl Channel for TelegramChannel {
         self.api.name()
     }
 
-    async fn recv(&mut self) -> Result<Option<Self::Task>> {
-        self.next_task().await.map(Some)
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
+        self.next_delivery().await.map(Some)
     }
 
     async fn open_run(&self, task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {

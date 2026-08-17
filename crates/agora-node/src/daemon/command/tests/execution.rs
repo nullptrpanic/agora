@@ -99,10 +99,22 @@ async fn interrupt_callback_stops_only_its_registered_agent_run() {
     let key = SessionKey::new("codex", IsolationScope::session("lark", "chat-1"));
     let (_target_ticket, target) = scheduled_run(
         &scheduler,
-        ExecutionScope::new("lark", "chat-1", key.clone()),
+        ExecutionScope::new(
+            "lark",
+            "chat-1",
+            key.clone(),
+            std::path::PathBuf::from("/tmp/agora-command-test"),
+        ),
     );
-    let (_duplicate_ticket, duplicate) =
-        scheduled_run(&scheduler, ExecutionScope::new("lark", "chat-1", key));
+    let (_duplicate_ticket, duplicate) = scheduled_run(
+        &scheduler,
+        ExecutionScope::new(
+            "lark",
+            "chat-1",
+            key,
+            std::path::PathBuf::from("/tmp/agora-command-test"),
+        ),
+    );
     let interrupt_control = target.clone();
     let interrupt = InterruptCallback::new(move || interrupt_control.stop());
 
@@ -122,6 +134,7 @@ async fn execution_ticket_combines_fifo_admission_and_run_cancellation() {
         "lark",
         "chat-1",
         SessionKey::new("codex", IsolationScope::session("lark", "chat-1")),
+        std::path::PathBuf::from("/tmp/agora-command-test"),
     );
     let first = scheduler.enqueue(scope.clone());
     let mut second = scheduler.enqueue(scope);
@@ -149,8 +162,13 @@ async fn execution_ticket_combines_fifo_admission_and_run_cancellation() {
 async fn scheduler_barrier_serializes_reset_without_becoming_an_agent_run() {
     let scheduler = ExecutionScheduler::default();
     let key = SessionKey::new("codex", IsolationScope::session("lark", "chat-1"));
-    let run = scheduler.enqueue(ExecutionScope::new("lark", "chat-1", key.clone()));
-    let mut barrier = scheduler.barrier(&key);
+    let run = scheduler.enqueue(ExecutionScope::new(
+        "lark",
+        "chat-1",
+        key.clone(),
+        std::path::PathBuf::from("/tmp/agora-command-test"),
+    ));
+    let mut barrier = scheduler.barrier(&key).unwrap();
 
     assert_eq!(barrier.ahead(), 1);
     assert_eq!(scheduler.interrupt_all(), 1);
@@ -359,14 +377,31 @@ async fn execution_stops_every_run_using_a_reset_session_key() {
     let other = SessionKey::new("reviewer", IsolationScope::Shared);
     let (_lark_ticket, lark) = scheduled_run(
         &scheduler,
-        ExecutionScope::new("lark", "chat-1", shared.clone()),
+        ExecutionScope::new(
+            "lark",
+            "chat-1",
+            shared.clone(),
+            std::path::PathBuf::from("/tmp/agora-command-test"),
+        ),
     );
     let (_telegram_ticket, telegram) = scheduled_run(
         &scheduler,
-        ExecutionScope::new("telegram", "chat-2", shared.clone()),
+        ExecutionScope::new(
+            "telegram",
+            "chat-2",
+            shared.clone(),
+            std::path::PathBuf::from("/tmp/agora-command-test"),
+        ),
     );
-    let (_reviewer_ticket, reviewer) =
-        scheduled_run(&scheduler, ExecutionScope::new("lark", "chat-1", other));
+    let (_reviewer_ticket, reviewer) = scheduled_run(
+        &scheduler,
+        ExecutionScope::new(
+            "lark",
+            "chat-1",
+            other,
+            std::path::PathBuf::from("/tmp/agora-command-test"),
+        ),
+    );
 
     assert_eq!(
         scheduler.stop_session_keys(std::slice::from_ref(&shared)),

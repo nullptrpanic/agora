@@ -53,8 +53,16 @@ CHANNEL PERMISSIONS
 FIELD REFERENCE
   Top level
     proxy                    Optional default HTTP proxy for agents and channels.
+    runtime                  Optional process-local capacity and concurrency limits.
     channels                 Reusable channel definitions.
     agents                   Local agent definitions.
+
+  Runtime fields
+    max_in_flight_tasks      Maximum accepted channel tasks; defaults to 32.
+    max_in_flight_runs       Maximum admitted agent runs; defaults to 64 and must
+                             fit every channel's complete subscribed-agent fan-out.
+    max_concurrent_runs      Maximum concurrently executing agent backends; defaults
+                             to 4 and cannot exceed max_in_flight_runs.
 
   Channel fields
     type                     Active types: "lark" and "telegram". "local" and

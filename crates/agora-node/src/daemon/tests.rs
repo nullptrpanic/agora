@@ -1,7 +1,8 @@
 use super::{AgentDispatcher, AgentRunOutput, CommandRuntime, Daemon, DaemonShutdown};
 use crate::agent::{AgentRegistry, ConfiguredAgent};
 use crate::channel::{
-    Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, ConfiguredChannel, RunEvent,
+    Channel, ChannelDelivery, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask,
+    ConfiguredChannel, RunEvent,
 };
 use crate::config::{
     AgentConfig, AgentSubscription, AgentType, ChannelConfig, IsolateMode, IsolationScope,
@@ -42,6 +43,7 @@ impl AgentDispatcher {
 
 mod dispatcher;
 mod queue;
+mod reliability;
 mod sessions;
 
 fn agent(name: &str, channel: &str) -> AgentConfig {
@@ -147,7 +149,7 @@ impl Channel for ReplyChannel {
         "reply"
     }
 
-    async fn recv(&mut self) -> Result<Option<Self::Task>> {
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
         Ok(None)
     }
 
@@ -180,7 +182,7 @@ impl Channel for RecordingChannel {
         "test"
     }
 
-    async fn recv(&mut self) -> Result<Option<Self::Task>> {
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
         Ok(None)
     }
 
@@ -253,7 +255,7 @@ impl Channel for ScopedChannel {
         &self.name
     }
 
-    async fn recv(&mut self) -> Result<Option<Self::Task>> {
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
         Ok(None)
     }
 

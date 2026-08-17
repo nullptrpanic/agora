@@ -1,6 +1,40 @@
 use super::*;
 use crate::config::{LarkChannelConfig, NamedChannelConfig, TelegramChannelConfig};
 
+#[tokio::test]
+async fn channel_delivery_accepts_the_source_exactly_once() {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (sender, received) = tokio::sync::oneshot::channel();
+    let delivery = ChannelDelivery::new("task", deadline, move |disposition| {
+        sender.send(disposition).unwrap();
+    });
+
+    assert_eq!(delivery.task(), &"task");
+    let (task, receipt) = delivery.into_parts();
+    assert_eq!(task, "task");
+    assert_eq!(receipt.deadline(), deadline);
+    receipt.accept();
+
+    assert_eq!(received.await.unwrap(), DeliveryDisposition::Accepted);
+}
+
+#[tokio::test]
+async fn unresolved_channel_delivery_requests_retry_after_mapping() {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (sender, received) = tokio::sync::oneshot::channel();
+    let delivery = ChannelDelivery::new(7_u32, deadline, move |disposition| {
+        sender.send(disposition).unwrap();
+    })
+    .map(|task| task.to_string());
+
+    assert_eq!(delivery.task(), "7");
+    let (_, receipt) = delivery.into_parts();
+    assert_eq!(receipt.deadline(), deadline);
+    drop(receipt);
+
+    assert_eq!(received.await.unwrap(), DeliveryDisposition::Retry);
+}
+
 #[test]
 fn channel_value_objects_expose_buttons_statuses_replies_and_callbacks() {
     let command = CommandRequest::new(["ask", "enable"]).with_argument("agent_name", "reviewer");

@@ -80,3 +80,42 @@ fn configured_agent_rejects_unimplemented_one_shot_backends() {
         assert!(error.to_string().contains(expected));
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn configured_agent_workspace_key_resolves_symlink_aliases() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let alias = temp.path().join("alias");
+    std::fs::create_dir(&workspace).unwrap();
+    symlink(&workspace, &alias).unwrap();
+
+    let direct =
+        ConfiguredAgent::from_config(agent(AgentType::Custom, "/bin/cat", &workspace)).unwrap();
+    let aliased =
+        ConfiguredAgent::from_config(agent(AgentType::Custom, "/bin/cat", &alias)).unwrap();
+
+    assert_eq!(direct.workspace_key(), aliased.workspace_key());
+    assert_eq!(
+        direct.workspace_key(),
+        std::fs::canonicalize(workspace).unwrap()
+    );
+}
+
+#[test]
+fn configured_agent_workspace_key_normalizes_missing_suffix_without_creating_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("missing").join("nested");
+    let expected = std::fs::canonicalize(temp.path())
+        .unwrap()
+        .join("missing")
+        .join("nested");
+
+    let configured =
+        ConfiguredAgent::from_config(agent(AgentType::Custom, "/bin/cat", &workspace)).unwrap();
+
+    assert_eq!(configured.workspace_key(), expected);
+    assert!(!workspace.exists());
+}
