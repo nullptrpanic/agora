@@ -141,6 +141,17 @@ async fn audit_controller_enriches_hook_events_and_ignores_audit_decisions() {
     .unwrap()
     .unwrap();
 
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if events.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
     {
         let events = events.lock().unwrap();
         let Event::Process(event) = &events[0] else {

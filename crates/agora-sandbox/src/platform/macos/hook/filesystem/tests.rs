@@ -1913,7 +1913,8 @@ fn allowlisted_device_mutations_use_native_libc_semantics() {
 }
 
 fn audit_server(
-    responses: Vec<&'static str>,
+    first_response: &'static str,
+    request_count: usize,
 ) -> (AuditClient, thread::JoinHandle<Vec<serde_json::Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -1926,16 +1927,18 @@ fn audit_server(
         stream
             .set_write_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        for response in responses {
+        for request in 0..request_count {
             let mut prefix = [0_u8; 4];
             stream.read_exact(&mut prefix).unwrap();
             let mut frame = vec![0_u8; u32::from_be_bytes(prefix) as usize];
             stream.read_exact(&mut frame).unwrap();
             requests.push(serde_json::from_slice(&frame).unwrap());
-            stream
-                .write_all(&(response.len() as u32).to_be_bytes())
-                .unwrap();
-            stream.write_all(response.as_bytes()).unwrap();
+            if request == 0 {
+                stream
+                    .write_all(&(first_response.len() as u32).to_be_bytes())
+                    .unwrap();
+                stream.write_all(first_response.as_bytes()).unwrap();
+            }
         }
         requests
     });
@@ -5267,7 +5270,7 @@ fn filesystem_interposers_publish_open_and_close_audit_events() {
     let file = fixture.lower.join("audited");
     std::fs::write(&file, b"content").unwrap();
     let path = Fixture::c_path(&file);
-    let (audit, server) = audit_server(vec![r#""Accepted""#, r#""Accepted""#]);
+    let (audit, server) = audit_server(r#""Accepted""#, 2);
     fixture.runtime.audit = Some(audit);
 
     with_test_runtime(&fixture.runtime, || unsafe {
@@ -5289,58 +5292,22 @@ fn filesystem_interposers_publish_open_and_close_audit_events() {
 }
 
 #[test]
-fn filesystem_interposers_fail_closed_when_audit_rejects_an_operation() {
-    const ACCEPTED: &str = r#""Accepted""#;
+fn filesystem_interposers_fail_closed_when_initial_audit_validation_rejects_an_operation() {
     const DENIED: &str = r#"{"Error":{"errno":13,"message":"denied"}}"#;
 
     let mut fixture = Fixture::new();
     let file = fixture.lower.join("denied");
     std::fs::write(&file, b"content").unwrap();
     let path = Fixture::c_path(&file);
-    let (audit, server) = audit_server(vec![
-        DENIED, DENIED, DENIED, DENIED, DENIED, ACCEPTED, DENIED, ACCEPTED, DENIED,
-    ]);
+    let (audit, server) = audit_server(DENIED, 1);
     fixture.runtime.audit = Some(audit);
-    let mut descriptor = -1;
-    let mut stream = std::ptr::null_mut();
 
     with_test_runtime(&fixture.runtime, || unsafe {
         assert_eq!(sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0), -1);
         assert_eq!(*libc::__error(), libc::EACCES);
-        assert_eq!(
-            sandbox_openat_with_mode(libc::AT_FDCWD, path.as_ptr(), libc::O_RDONLY, 0),
-            -1
-        );
-        assert_eq!(*libc::__error(), libc::EACCES);
-        assert!(sandbox_fopen(path.as_ptr(), c"r".as_ptr()).is_null());
-        assert_eq!(*libc::__error(), libc::EACCES);
-        assert_eq!(sandbox_truncate(path.as_ptr(), 0), -1);
-        assert_eq!(*libc::__error(), libc::EACCES);
-
-        let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
-        assert_eq!(libc::posix_spawn_file_actions_init(&mut actions), 0);
-        assert_eq!(
-            sandbox_spawn_addopen(&mut actions, 9, path.as_ptr(), libc::O_RDONLY, 0),
-            libc::EACCES
-        );
-        assert_eq!(libc::posix_spawn_file_actions_destroy(&mut actions), 0);
-
-        descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
-        assert!(descriptor >= 0);
-        assert_eq!(sandbox_close(descriptor), -1);
-        assert_eq!(*libc::__error(), libc::EACCES);
-
-        stream = sandbox_fopen(path.as_ptr(), c"r".as_ptr());
-        assert!(!stream.is_null());
-        assert_eq!(sandbox_fclose(stream), -1);
-        assert_eq!(*libc::__error(), libc::EACCES);
     });
 
-    unsafe {
-        assert_eq!(libc::close(descriptor), 0);
-        assert_eq!(libc::fclose(stream), 0);
-    }
-    assert_eq!(server.join().unwrap().len(), 9);
+    assert_eq!(server.join().unwrap().len(), 1);
 }
 
 #[test]

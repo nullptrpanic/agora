@@ -1,7 +1,7 @@
 use super::super::protocol::{
     AuditEventRequest, AuditResponse, decode_request, encode_response, frame_length,
 };
-use super::{AuditClient, AuditConnection, AuditError, CONNECTIONS, io};
+use super::{AUDIT_CONNECTION_MAX_IDLE, AuditClient, AuditConnection, AuditError, CONNECTIONS, io};
 use crate::callback::{FileAccessMode, FileContext, FileOpenMode, ProcessContext};
 use std::cell::RefCell;
 use std::io::{Read, Write};
@@ -114,7 +114,33 @@ fn audit_client_reuses_one_connection_for_multiple_events() {
 }
 
 #[test]
-fn audit_client_reconnects_once_after_an_idle_peer_closes() {
+fn audit_client_does_not_wait_for_reused_connection_responses() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut stream = accept_request(&listener).unwrap();
+        read_request(&mut stream).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        stream
+            .write_all(&encode_response(&AuditResponse::Accepted).unwrap())
+            .unwrap();
+    });
+    let client = AuditClient::new(address, "token");
+
+    client.publish(file_request("/first")).unwrap();
+    let started = Instant::now();
+    client.publish(file_request("/second")).unwrap();
+    let elapsed = started.elapsed();
+
+    server.join().unwrap();
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "reused audit publication waited {elapsed:?} for a response"
+    );
+}
+
+#[test]
+fn audit_client_refreshes_a_connection_before_the_server_idle_timeout() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
@@ -124,6 +150,14 @@ fn audit_client_reconnects_once_after_an_idle_peer_closes() {
     let client = AuditClient::new(address, "token");
 
     client.publish(file_request("/first")).unwrap();
+    CONNECTIONS.with(|connections| {
+        connections
+            .borrow_mut()
+            .entries
+            .get_mut(&client.endpoint)
+            .unwrap()
+            .last_used = Instant::now() - AUDIT_CONNECTION_MAX_IDLE;
+    });
     client.publish(file_request("/after-idle-close")).unwrap();
 
     server.join().unwrap();
@@ -145,6 +179,7 @@ fn audit_client_abandons_connections_cached_by_another_process() {
             client.endpoint.clone(),
             AuditConnection {
                 stream: stale_stream,
+                last_used: Instant::now(),
             },
         );
     });

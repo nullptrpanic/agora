@@ -2,6 +2,7 @@ use super::*;
 use crate::audit::protocol::{decode_response, encode_ping_request, encode_request};
 use crate::callback::{Decision, FileAccessMode, FileContext, FileOpenMode, ProcessContext};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::Notify;
 
 async fn controller() -> AuditController {
     AuditController::start(
@@ -24,7 +25,6 @@ async fn audit_server_drops_connections_above_its_concurrency_limit() {
         run_id: "run".to_string(),
         callback: |_| std::future::ready(Decision::Allow),
         callback_timeout: Duration::from_secs(1),
-        requests: Mutex::new(AuditRequestCache::default()),
     });
     let server = AuditServer::new(listener, state);
     let permits = (0..AUDIT_MAX_CONNECTIONS)
@@ -46,6 +46,89 @@ async fn audit_server_drops_connections_above_its_concurrency_limit() {
     drop(permits);
     shutdown.send(true).unwrap();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn audit_server_drains_an_accepted_event_during_shutdown() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let callback_entered = Arc::clone(&entered);
+    let callback_release = Arc::clone(&release);
+    let callback_completed = Arc::clone(&completed);
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let callback_invocations = Arc::clone(&invocations);
+    let state = Arc::new(AuditState {
+        token: "token".to_string(),
+        sandbox_id: "sandbox".to_string(),
+        run_id: "run".to_string(),
+        callback: move |_| {
+            let entered = Arc::clone(&callback_entered);
+            let release = Arc::clone(&callback_release);
+            let completed = Arc::clone(&callback_completed);
+            let invocation = callback_invocations.fetch_add(1, Ordering::Relaxed);
+            async move {
+                if invocation == 1 {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                completed.fetch_add(1, Ordering::Relaxed);
+                Decision::Allow
+            }
+        },
+        callback_timeout: Duration::from_secs(1),
+    });
+    let server = AuditServer::new(listener, state);
+    let (shutdown, receiver) = watch::channel(false);
+    let task = tokio::spawn(server.run(receiver));
+    let mut client = TcpStream::connect(address).await.unwrap();
+    let event = AuditEventRequest::File {
+        trace_id: "trace".to_string(),
+        process: ProcessContext {
+            pid: 1,
+            ppid: 0,
+            executable: "/bin/tool".to_string(),
+        },
+        operation: FileOperation::Open,
+        file: FileContext {
+            path: "/tmp/file".to_string(),
+            mode: FileOpenMode {
+                access: FileAccessMode::Read,
+                create: false,
+                truncate: false,
+                append: false,
+                exclusive: false,
+            },
+        },
+    };
+
+    client
+        .write_all(&encode_request("token", event.clone()).unwrap())
+        .await
+        .unwrap();
+    let mut prefix = [0_u8; 4];
+    client.read_exact(&mut prefix).await.unwrap();
+    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
+    client.read_exact(&mut response).await.unwrap();
+    assert_eq!(decode_response(&response).unwrap(), AuditResponse::Accepted);
+    client
+        .write_all(&encode_request("token", event).unwrap())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+
+    shutdown.send(true).unwrap();
+    let release_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release.notify_waiters();
+    });
+    task.await.unwrap().unwrap();
+    release_task.await.unwrap();
+    assert_eq!(completed.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]
@@ -108,7 +191,6 @@ async fn audit_server_times_out_idle_established_connections() {
         run_id: "run".to_string(),
         callback: |_| std::future::ready(Decision::Allow),
         callback_timeout: Duration::from_secs(1),
-        requests: Mutex::new(AuditRequestCache::default()),
     });
     let task = tokio::spawn(AuditServer::handle_with_timeouts(
         server,
@@ -158,13 +240,17 @@ async fn audit_server_keeps_an_authenticated_control_stream() {
     let address = listener.local_addr().unwrap();
     let mut client = TcpStream::connect(address).await.unwrap();
     let (server, _) = listener.accept().await.unwrap();
+    let published = Arc::new(AtomicUsize::new(0));
+    let callback_count = Arc::clone(&published);
     let state = Arc::new(AuditState {
         token: "token".to_string(),
         sandbox_id: "sandbox".to_string(),
         run_id: "run".to_string(),
-        callback: |_| std::future::ready(Decision::Allow),
+        callback: move |_| {
+            callback_count.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Decision::Allow)
+        },
         callback_timeout: Duration::from_secs(1),
-        requests: Mutex::new(AuditRequestCache::default()),
     });
     let task = tokio::spawn(AuditServer::handle_with_timeouts(
         server,
@@ -211,17 +297,20 @@ async fn audit_server_keeps_an_authenticated_control_stream() {
         )
         .await
         .unwrap();
-    client.read_exact(&mut prefix).await.unwrap();
-    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
-    client.read_exact(&mut response).await.unwrap();
-    assert_eq!(decode_response(&response).unwrap(), AuditResponse::Accepted);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while published.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 
     drop(client);
     task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
-async fn duplicate_audit_request_ids_publish_one_logical_event() {
+async fn duplicate_audit_deliveries_each_invoke_the_callback() {
     let published = Arc::new(AtomicUsize::new(0));
     let callback_count = Arc::clone(&published);
     let state = Arc::new(AuditState {
@@ -233,7 +322,6 @@ async fn duplicate_audit_request_ids_publish_one_logical_event() {
             std::future::ready(Decision::Allow)
         },
         callback_timeout: Duration::from_secs(1),
-        requests: Mutex::new(AuditRequestCache::default()),
     });
     let event = AuditEventRequest::File {
         trace_id: "trace".to_string(),
@@ -255,14 +343,16 @@ async fn duplicate_audit_request_ids_publish_one_logical_event() {
         },
     };
 
-    let (first, replay) = tokio::join!(
-        state.publish_once("request".to_string(), event.clone()),
-        state.publish_once("request".to_string(), event),
-    );
+    let first = state.event("request".to_string(), event.clone()).unwrap();
+    let replay = state.event("request".to_string(), event).unwrap();
+    let (first_id, replay_id) = match (&first, &replay) {
+        (Event::File(first), Event::File(replay)) => (&first.event_id, &replay.event_id),
+        _ => panic!("expected file events"),
+    };
+    assert_eq!(first_id, replay_id);
 
-    assert_eq!(first, AuditResponse::Accepted);
-    assert_eq!(replay, AuditResponse::Accepted);
-    assert_eq!(published.load(Ordering::Relaxed), 1);
+    tokio::join!(state.publish(first), state.publish(replay));
+    assert_eq!(published.load(Ordering::Relaxed), 2);
 
     let different = AuditEventRequest::File {
         trace_id: "different".to_string(),
@@ -283,12 +373,7 @@ async fn duplicate_audit_request_ids_publish_one_logical_event() {
             },
         },
     };
-    assert!(matches!(
-        state.publish_once("request".to_string(), different).await,
-        AuditResponse::Error {
-            errno: libc::EPROTO,
-            ..
-        }
-    ));
-    assert_eq!(published.load(Ordering::Relaxed), 1);
+    let different = state.event("request".to_string(), different).unwrap();
+    state.publish(different).await;
+    assert_eq!(published.load(Ordering::Relaxed), 3);
 }

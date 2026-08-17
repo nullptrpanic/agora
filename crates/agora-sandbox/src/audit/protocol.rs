@@ -2,7 +2,7 @@ use crate::callback::{CommandContext, FileContext, ProcessContext};
 use serde::{Deserialize, Serialize};
 use std::io;
 
-pub(super) const AUDIT_PROTOCOL_VERSION: u16 = 3;
+pub(super) const AUDIT_PROTOCOL_VERSION: u16 = 4;
 pub(super) const MAX_AUDIT_FRAME_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
