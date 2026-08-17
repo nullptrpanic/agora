@@ -15,6 +15,7 @@ pub(super) struct RunConfig {
     workdir: PathBuf,
     tls: TlsMode,
     local: LocalFilesystem,
+    native_passthrough_roots: Vec<PathBuf>,
     remotes: Vec<SmbRemoteConfig>,
     log_file: PathBuf,
     identity_seed: [u8; 32],
@@ -68,6 +69,9 @@ impl RunConfig {
             LocalFilesystem::Plain => config.with_plain_workspace(),
             LocalFilesystem::Encrypted(key) => config.with_encrypted_workspace(key),
         };
+        for root in self.native_passthrough_roots {
+            config = config.with_native_passthrough_root(root);
+        }
         for remote in self.remotes {
             config = config.with_smb_remote(remote);
         }
@@ -137,6 +141,26 @@ impl StoredConfig {
                 identity.field(key.as_bytes());
             }
         }
+        let mut native_passthrough_roots = self
+            .filesystem
+            .bypass
+            .into_iter()
+            .map(|root| {
+                if !root.is_absolute() {
+                    bail!(
+                        "filesystem bypass root must be absolute: {}",
+                        root.display()
+                    );
+                }
+                normalize_absolute_path(&root)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        native_passthrough_roots.sort();
+        native_passthrough_roots.dedup();
+        identity.usize(native_passthrough_roots.len());
+        for root in &native_passthrough_roots {
+            identity.path(root);
+        }
         let remotes = self.filesystem.nfs;
         identity.usize(remotes.len());
         let remotes = remotes
@@ -147,6 +171,7 @@ impl StoredConfig {
             workdir,
             tls,
             local,
+            native_passthrough_roots,
             remotes,
             log_file,
             identity_seed: identity.finish(),
@@ -174,6 +199,8 @@ impl From<StoredTlsMode> for TlsMode {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredFilesystem {
+    #[serde(default)]
+    bypass: Vec<PathBuf>,
     #[serde(default)]
     local: StoredLocalFilesystem,
     #[serde(default)]

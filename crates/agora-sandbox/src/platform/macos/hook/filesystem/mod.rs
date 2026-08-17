@@ -35,7 +35,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use content::{EncryptedContent, LocalContentInheritance, ManagedContent, NfsContent};
 
-const NATIVE_PASSTHROUGH_ROOTS: &[&str] = &["/dev"];
 type GuardId = u64;
 const INHERITED_LOCAL_DESCRIPTOR_VERSION: u8 = 5;
 const MAX_INHERITED_LOCAL_DESCRIPTORS: usize = 256;
@@ -217,6 +216,7 @@ struct FilesystemHookRuntime {
     remote: Option<RemoteFilesystem>,
     audit: Option<AuditClient>,
     trace: TraceContext,
+    native_passthrough_roots: Vec<PathBuf>,
     current_directory: Mutex<CurrentDirectory>,
     open_files: Mutex<HashMap<libc::c_int, Arc<OpenFile>>>,
     mappings: Mutex<Vec<MemoryMapping>>,
@@ -597,6 +597,7 @@ impl FilesystemHookRuntime {
                                 },
                             )),
                             trace: config.trace().clone(),
+                            native_passthrough_roots: config.native_passthrough_roots().to_vec(),
                             current_directory: Mutex::new(current_directory),
                             open_files: Mutex::new(HashMap::new()),
                             mappings: Mutex::new(Vec::new()),
@@ -624,6 +625,7 @@ impl FilesystemHookRuntime {
             remote: None,
             audit: None,
             trace: TraceContext::parse("test-trace").map_err(anyhow::Error::msg)?,
+            native_passthrough_roots: vec![PathBuf::from("/dev")],
             current_directory: Mutex::new(CurrentDirectory {
                 logical: current_directory,
                 remote: false,
@@ -648,6 +650,7 @@ impl FilesystemHookRuntime {
             remote: None,
             audit: None,
             trace: TraceContext::parse("test-trace").map_err(anyhow::Error::msg)?,
+            native_passthrough_roots: vec![PathBuf::from("/dev")],
             current_directory: Mutex::new(CurrentDirectory {
                 logical: current_directory,
                 remote: false,
@@ -702,9 +705,9 @@ impl FilesystemHookRuntime {
 
     fn native_passthrough_path(&self, path: &Path) -> Result<Option<PathBuf>> {
         let normalized = normalize_path(path)?;
-        Ok(NATIVE_PASSTHROUGH_ROOTS
+        Ok(self
+            .native_passthrough_roots
             .iter()
-            .map(Path::new)
             .any(|root| normalized.starts_with(root))
             .then_some(normalized))
     }

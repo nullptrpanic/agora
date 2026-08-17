@@ -641,6 +641,64 @@ fn sandbox_config_rejects_remote_root_collisions() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_config_validates_native_passthrough_roots() {
+    let root = std::env::temp_dir().join(format!(
+        "agora-native-passthrough-config-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let hook = root.join("hook.dylib");
+    std::fs::write(&hook, b"hook").unwrap();
+    let workdir = root.join("workspace");
+
+    let valid = SandboxConfig::new(&hook)
+        .with_workdir(&workdir)
+        .with_native_passthrough_root("/opt/agora-tools");
+    assert_eq!(
+        valid.native_passthrough_roots(),
+        [PathBuf::from("/dev"), PathBuf::from("/opt/agora-tools")]
+    );
+    assert!(valid.validate().is_ok());
+
+    let relative = SandboxConfig::new(&hook)
+        .with_workdir(&workdir)
+        .with_native_passthrough_root("relative/tools");
+    assert!(
+        relative
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must be absolute")
+    );
+
+    let private = SandboxConfig::new(&hook)
+        .with_workdir(&workdir)
+        .with_native_passthrough_root(workdir.join("fs"));
+    assert!(
+        private
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("work directory")
+    );
+
+    let remote = SandboxConfig::new(&hook)
+        .with_workdir(&workdir)
+        .with_native_passthrough_root("/remote/tools")
+        .with_smb_remote(SmbRemoteConfig::new("/remote", "server", "share").unwrap());
+    assert!(
+        remote
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("SMB logical root")
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(all(target_os = "macos", feature = "remote-smb"))]
 #[test]
 fn remote_connection_probe_requires_a_visible_logical_parent_directory() {

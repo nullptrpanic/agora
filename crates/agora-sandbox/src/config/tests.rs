@@ -26,6 +26,7 @@ fn unified_config_resolves_runtime_settings_and_redacts_secrets() {
           "workdir": "state",
           "tls": "auto",
           "filesystem": {
+            "bypass": ["/opt/agora-tools"],
             "local": { "encrypt": "encrypted", "key": "local-secret" },
             "nfs": [
               {
@@ -56,6 +57,10 @@ fn unified_config_resolves_runtime_settings_and_redacts_secrets() {
 
     assert!(matches!(runtime.network.tls, TlsMode::Auto));
     assert_eq!(runtime.filesystem_mode(), FilesystemMode::Encrypted);
+    assert_eq!(
+        runtime.native_passthrough_roots(),
+        [PathBuf::from("/dev"), PathBuf::from("/opt/agora-tools")]
+    );
     assert_eq!(
         runtime.encrypted_workspace_key(),
         Some(&b"local-secret"[..])
@@ -110,6 +115,7 @@ fn empty_config_uses_all_runtime_defaults() {
     assert_eq!(runtime.filesystem_mode(), FilesystemMode::Plain);
     assert!(runtime.encrypted_workspace_key().is_none());
     assert!(runtime.smb_remotes().is_empty());
+    assert_eq!(runtime.native_passthrough_roots(), [PathBuf::from("/dev")]);
 }
 
 #[test]
@@ -153,6 +159,17 @@ fn config_rejects_unknown_fields_and_invalid_local_encryption() {
         }"#,
     );
     assert!(load_error(&missing).contains("key is required"));
+}
+
+#[test]
+fn config_rejects_relative_filesystem_bypass_roots() {
+    let root = tempfile::tempdir().unwrap();
+    let path = write_config(
+        root.path(),
+        r#"{ "filesystem": { "bypass": ["relative/tools"] } }"#,
+    );
+
+    assert!(load_error(&path).contains("filesystem bypass root must be absolute"));
 }
 
 #[test]
@@ -210,6 +227,7 @@ fn semantic_session_identity_ignores_json_formatting_but_tracks_runtime_changes(
     let first_path = root.path().join("first.json");
     let second_path = root.path().join("second.json");
     let changed_path = root.path().join("changed.json");
+    let bypass_path = root.path().join("bypass.json");
     std::fs::write(
         &first_path,
         format!(
@@ -238,16 +256,29 @@ fn semantic_session_identity_ignores_json_formatting_but_tracks_runtime_changes(
         ),
     )
     .unwrap();
+    std::fs::write(
+        &bypass_path,
+        format!(
+            r#"{{"workdir":"{}","filesystem":{{"bypass":["/opt/agora-tools"],"local":{{"encrypt":"encrypted","key":"secret-a"}}}}}}"#,
+            workdir.display()
+        ),
+    )
+    .unwrap();
 
     let first = RunConfig::load(&first_path).unwrap();
     let second = RunConfig::load(&second_path).unwrap();
     let changed = RunConfig::load(&changed_path).unwrap();
+    let bypass = RunConfig::load(&bypass_path).unwrap();
 
     let original_identity = first.session_identity(&hook).unwrap();
     assert_eq!(original_identity, second.session_identity(&hook).unwrap());
     assert_ne!(
         first.session_identity(&hook).unwrap(),
         changed.session_identity(&hook).unwrap()
+    );
+    assert_ne!(
+        first.session_identity(&hook).unwrap(),
+        bypass.session_identity(&hook).unwrap()
     );
     std::fs::write(&hook, b"hook-b").unwrap();
     assert_ne!(original_identity, first.session_identity(&hook).unwrap());

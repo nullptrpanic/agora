@@ -251,7 +251,7 @@ fn child_environment_accepts_a_null_source_environment() {
             .unwrap();
 
     assert!(!environment.as_exec_ptr().is_null());
-    assert_eq!(environment.values.len(), 12);
+    assert_eq!(environment.values.len(), 13);
 }
 
 #[test]

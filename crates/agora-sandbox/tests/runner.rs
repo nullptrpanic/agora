@@ -1582,6 +1582,42 @@ async fn logical_permissions_match_in_plain_and_encrypted_workspaces() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn configured_native_passthrough_root_writes_directly_to_host() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-native-passthrough-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("existing.txt"), b"host").unwrap();
+    let config = sandbox_config_in(&workdir).with_native_passthrough_root(&source);
+    let command = SandboxCommand::new("/bin/sh")
+        .args([
+            "-c",
+            "printf native > existing.txt && printf created > created.txt",
+        ])
+        .current_dir(&source);
+
+    let outcome = Sandbox::new(config, NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    assert_eq!(
+        std::fs::read(source.join("existing.txt")).unwrap(),
+        b"native"
+    );
+    assert_eq!(
+        std::fs::read(source.join("created.txt")).unwrap(),
+        b"created"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn runner_rejects_concurrent_plain_sandboxes_in_the_same_workdir() {
     let directory = std::env::temp_dir().join(format!(
         "agora-sandbox-plain-lock-test-{}",
@@ -1980,6 +2016,81 @@ fn cloexec_default_spawn_child_process() {
         c"printf cloexec-control-ok > \"$AGORA_SANDBOX_TEST_CLOEXEC_PATH\" && test \"$(cat \"$AGORA_SANDBOX_TEST_CLOEXEC_PATH\")\" = cloexec-control-ok".as_ptr(),
         std::ptr::null(),
     ];
+    let environment = unsafe { *libc::_NSGetEnviron() };
+    let mut pid = 0;
+    let result = unsafe {
+        libc::posix_spawn(
+            &mut pid,
+            arguments[0],
+            &actions,
+            &attributes,
+            arguments.as_ptr().cast_mut().cast(),
+            environment,
+        )
+    };
+    assert_eq!(
+        unsafe { libc::posix_spawn_file_actions_destroy(&mut actions) },
+        0
+    );
+    assert_eq!(unsafe { libc::posix_spawnattr_destroy(&mut attributes) }, 0);
+    assert_eq!(result, 0);
+
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cloexec_default_spawn_closes_existing_descriptors() {
+    if std::env::var_os("AGORA_SANDBOX_TEST_CLOEXEC_CLOSE").is_none() {
+        return;
+    }
+
+    unsafe extern "C" {
+        fn posix_spawn_file_actions_addinherit_np(
+            actions: *mut libc::posix_spawn_file_actions_t,
+            descriptor: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    const POSIX_SPAWN_CLOEXEC_DEFAULT: libc::c_short = 0x4000;
+    let mut attributes: libc::posix_spawnattr_t = std::ptr::null_mut();
+    assert_eq!(unsafe { libc::posix_spawnattr_init(&mut attributes) }, 0);
+    assert_eq!(
+        unsafe { libc::posix_spawnattr_setflags(&mut attributes, POSIX_SPAWN_CLOEXEC_DEFAULT) },
+        0
+    );
+    let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { libc::posix_spawn_file_actions_init(&mut actions) },
+        0
+    );
+    for descriptor in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        if unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0 {
+            assert_eq!(
+                unsafe { posix_spawn_file_actions_addinherit_np(&mut actions, descriptor) },
+                0
+            );
+        }
+    }
+    let mut closed = 0;
+    for descriptor in 3..1024 {
+        if unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0 {
+            assert_eq!(
+                unsafe { libc::posix_spawn_file_actions_addclose(&mut actions, descriptor) },
+                0
+            );
+            closed += 1;
+        }
+    }
+    assert!(
+        closed > 0,
+        "the injected process must own internal descriptors"
+    );
+
+    let arguments = [c"/usr/bin/true".as_ptr(), std::ptr::null()];
     let environment = unsafe { *libc::_NSGetEnviron() };
     let mut pid = 0;
     let result = unsafe {
@@ -3911,6 +4022,29 @@ async fn runner_control_channels_reconnect_after_cloexec_default_spawn() {
 
     assert!(outcome.status().success());
     assert!(!logical.exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_cloexec_default_spawn_allows_launcher_to_close_internal_descriptors() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-cloexec-close-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let command = SandboxCommand::new(std::env::current_exe().unwrap())
+        .arg("cloexec_default_spawn_closes_existing_descriptors")
+        .arg("--exact")
+        .arg("--nocapture")
+        .current_dir(workspace_root())
+        .env("AGORA_SANDBOX_TEST_CLOEXEC_CLOSE", "1");
+
+    let outcome = Sandbox::new(sandbox_config_in(directory.join("cache")), NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
     std::fs::remove_dir_all(directory).unwrap();
 }
 

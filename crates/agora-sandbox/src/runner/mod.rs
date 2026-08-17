@@ -84,11 +84,14 @@ const REMOTE_ROOTS: &str = "AGORA_SANDBOX_REMOTE_ROOTS";
 #[cfg(target_os = "macos")]
 const REMOTE_CURRENT_DIRECTORY: &str = "AGORA_SANDBOX_REMOTE_CURRENT_DIRECTORY";
 #[cfg(target_os = "macos")]
+const NATIVE_PASSTHROUGH_ROOTS: &str = "AGORA_SANDBOX_NATIVE_PASSTHROUGH_ROOTS";
+#[cfg(target_os = "macos")]
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
 #[cfg(target_os = "macos")]
 const TLS_TRUST_BUNDLE: &str = "AGORA_SANDBOX_TLS_TRUST_BUNDLE";
 const DEFAULT_TLS_CA_CERTIFICATE: &str = "ca/ca.crt";
 const DEFAULT_TLS_CA_PRIVATE_KEY: &str = "ca/ca.key";
+const DEFAULT_NATIVE_PASSTHROUGH_ROOT: &str = "/dev";
 #[cfg(target_os = "macos")]
 const TLS_TRUST_BUNDLE_DIRECTORY: &str = "ca";
 #[cfg(target_os = "macos")]
@@ -117,6 +120,7 @@ pub struct SandboxConfig {
     workdir: PathBuf,
     filesystem_mode: FilesystemMode,
     encrypted_workspace_key: Option<SecretBytes>,
+    native_passthrough_roots: Vec<PathBuf>,
     tls_ca: Option<TlsCaFiles>,
     smb_remotes: Vec<SmbRemoteConfig>,
     #[cfg(test)]
@@ -156,6 +160,7 @@ impl SandboxConfig {
             workdir: Self::default_workdir(),
             filesystem_mode: FilesystemMode::default(),
             encrypted_workspace_key: None,
+            native_passthrough_roots: vec![PathBuf::from(DEFAULT_NATIVE_PASSTHROUGH_ROOT)],
             tls_ca: None,
             smb_remotes: Vec::new(),
             #[cfg(test)]
@@ -205,6 +210,15 @@ impl SandboxConfig {
             .map(SecretBytes::as_bytes)
     }
 
+    pub fn with_native_passthrough_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.native_passthrough_roots.push(root.into());
+        self
+    }
+
+    pub fn native_passthrough_roots(&self) -> &[PathBuf] {
+        &self.native_passthrough_roots
+    }
+
     pub fn with_tls_ca(
         mut self,
         certificate: impl Into<PathBuf>,
@@ -243,7 +257,8 @@ impl SandboxConfig {
 
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
-        self.validate_smb_remotes()?;
+        let native_passthrough_roots = self.native_passthrough_root_aliases()?;
+        self.validate_smb_remotes(&native_passthrough_roots)?;
         #[cfg(not(feature = "remote-smb"))]
         if !self.smb_remotes.is_empty() {
             bail!("this build does not include SMB remote filesystem support");
@@ -270,7 +285,62 @@ impl SandboxConfig {
         Ok(())
     }
 
-    fn validate_smb_remotes(&self) -> Result<()> {
+    fn normalized_native_passthrough_roots(&self) -> Result<Vec<PathBuf>> {
+        let mut roots = self
+            .native_passthrough_roots
+            .iter()
+            .map(|root| {
+                if !root.is_absolute() {
+                    bail!(
+                        "native passthrough root must be absolute: {}",
+                        root.display()
+                    );
+                }
+                crate::filesystem::normalize_path(root)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        roots.sort();
+        roots.dedup();
+        Ok(roots)
+    }
+
+    fn native_passthrough_root_aliases(&self) -> Result<Vec<(PathBuf, PathBuf)>> {
+        let workdir = if self.workdir.is_absolute() {
+            self.workdir.clone()
+        } else {
+            std::env::current_dir()
+                .context("failed to resolve current directory")?
+                .join(&self.workdir)
+        };
+        let workdir = crate::filesystem::normalize_path(&workdir)?;
+        let resolved_workdir = crate::filesystem::resolve_existing_ancestor(&workdir)?;
+        self.normalized_native_passthrough_roots()?
+            .into_iter()
+            .map(|root| {
+                let resolved = crate::filesystem::resolve_existing_ancestor(&root)?;
+                if path_aliases_overlap(&root, &resolved, &workdir, &resolved_workdir) {
+                    bail!(
+                        "native passthrough root overlaps sandbox work directory: {}",
+                        root.display()
+                    );
+                }
+                Ok((root, resolved))
+            })
+            .collect()
+    }
+
+    fn effective_native_passthrough_roots(&self) -> Result<Vec<PathBuf>> {
+        let roots = self.normalized_native_passthrough_roots()?;
+        let mut effective = roots.clone();
+        for root in roots {
+            effective.push(crate::filesystem::resolve_existing_ancestor(&root)?);
+        }
+        effective.sort();
+        effective.dedup();
+        Ok(effective)
+    }
+
+    fn validate_smb_remotes(&self, native_passthrough_roots: &[(PathBuf, PathBuf)]) -> Result<()> {
         let workdir = if self.workdir.is_absolute() {
             self.workdir.clone()
         } else {
@@ -290,9 +360,12 @@ impl SandboxConfig {
             })
             .collect::<Result<Vec<_>>>()?;
         for (index, (root, resolved_root)) in roots.iter().enumerate() {
-            if root.starts_with("/dev") || resolved_root.starts_with("/dev") {
+            if let Some((native, _)) = native_passthrough_roots.iter().find(|(native, resolved)| {
+                path_aliases_overlap(root, resolved_root, native, resolved)
+            }) {
                 bail!(
-                    "SMB logical root overlaps native passthrough root /dev: {}",
+                    "SMB logical root overlaps native passthrough root {}: {}",
+                    native.display(),
                     root.display()
                 );
             }

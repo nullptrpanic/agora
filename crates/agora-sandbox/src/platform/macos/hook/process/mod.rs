@@ -37,6 +37,9 @@ type PosixSpawnFn = unsafe extern "C" fn(
     *const *mut libc::c_char,
 ) -> libc::c_int;
 
+type PosixSpawnFileActionsInitFn =
+    unsafe extern "C" fn(*mut libc::posix_spawn_file_actions_t) -> libc::c_int;
+
 type ExecveFn = unsafe extern "C" fn(
     *const libc::c_char,
     *const *const libc::c_char,
@@ -88,7 +91,11 @@ impl SpawnFileActions {
             });
         }
 
-        let mut descriptors = super::control::inheritable_descriptors();
+        let mut descriptors = if file_actions.is_null() {
+            super::control::inheritable_descriptors()
+        } else {
+            Vec::new()
+        };
         descriptors.extend(super::filesystem::inheritable_internal_descriptors());
         descriptors.sort_unstable();
         descriptors.dedup();
@@ -101,7 +108,10 @@ impl SpawnFileActions {
 
         let mut prepared = if file_actions.is_null() {
             let mut owned = std::ptr::null_mut();
-            let result = unsafe { libc::posix_spawn_file_actions_init(&mut owned) };
+            let Some(original) = original_posix_spawn_file_actions_init() else {
+                return Err(libc::ENOSYS);
+            };
+            let result = unsafe { original(&mut owned) };
             if result != 0 {
                 return Err(result);
             }
@@ -137,6 +147,27 @@ impl SpawnFileActions {
             .as_mut()
             .map_or(self.borrowed.cast_mut(), |owned| owned as *mut _)
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_posix_spawn_file_actions_init(
+    actions: *mut libc::posix_spawn_file_actions_t,
+) -> libc::c_int {
+    let Some(original) = original_posix_spawn_file_actions_init() else {
+        return libc::ENOSYS;
+    };
+    let result = unsafe { original(actions) };
+    if result != 0 || !super::initialized() {
+        return result;
+    }
+    for descriptor in super::control::inheritable_descriptors() {
+        let result = unsafe { posix_spawn_file_actions_addinherit_np(actions, descriptor) };
+        if result != 0 {
+            unsafe { libc::posix_spawn_file_actions_destroy(actions) };
+            return result;
+        }
+    }
+    0
 }
 
 impl Drop for SpawnFileActions {
@@ -1014,6 +1045,10 @@ fn original_posix_spawn() -> Option<PosixSpawnFn> {
     function_from_interpose(&INTERPOSE_POSIX_SPAWN)
 }
 
+fn original_posix_spawn_file_actions_init() -> Option<PosixSpawnFileActionsInitFn> {
+    function_from_interpose(&INTERPOSE_POSIX_SPAWN_FILE_ACTIONS_INIT)
+}
+
 fn original_execve() -> Option<ExecveFn> {
     function_from_interpose(&INTERPOSE_EXECVE)
 }
@@ -1027,6 +1062,11 @@ dyld_interpose!(
     INTERPOSE_POSIX_SPAWNP,
     agora_sandbox_posix_spawnp,
     libc::posix_spawnp
+);
+dyld_interpose!(
+    INTERPOSE_POSIX_SPAWN_FILE_ACTIONS_INIT,
+    agora_sandbox_posix_spawn_file_actions_init,
+    libc::posix_spawn_file_actions_init
 );
 dyld_interpose!(INTERPOSE_EXECVE, agora_sandbox_execve, libc::execve);
 dyld_interpose!(INTERPOSE_EXECV, agora_sandbox_execv, libc::execv);

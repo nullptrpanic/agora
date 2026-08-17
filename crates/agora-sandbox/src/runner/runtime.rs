@@ -15,6 +15,7 @@ impl ProtectedEnvironment {
                 REMOTE_TOKEN.into(),
                 REMOTE_ROOTS.into(),
                 REMOTE_CURRENT_DIRECTORY.into(),
+                NATIVE_PASSTHROUGH_ROOTS.into(),
                 LOCAL_FILESYSTEM_CONTROL.into(),
                 LOCAL_FILESYSTEM_TOKEN.into(),
                 INHERITED_LOCAL_DESCRIPTORS.into(),
@@ -117,6 +118,9 @@ impl SandboxRuntime {
         C: Callback,
     {
         config.validate()?;
+        let native_passthrough_roots =
+            serde_json::to_string(&config.effective_native_passthrough_roots()?)
+                .context("failed to encode native passthrough roots")?;
         let callback = std::sync::Arc::new(callback);
         let filesystem_workdir = config.workdir.clone();
         let filesystem_mode = config.filesystem_mode;
@@ -343,6 +347,7 @@ impl SandboxRuntime {
         environment.insert(AUDIT_TOKEN, audit_runtime.token());
         environment.insert(HOOK_LIBRARIES, injected_libraries.clone());
         environment.insert(FILESYSTEM_ROOT, filesystem.root());
+        environment.insert(NATIVE_PASSTHROUGH_ROOTS, native_passthrough_roots);
         environment.insert(
             FILESYSTEM_MODE,
             match config.filesystem_mode {

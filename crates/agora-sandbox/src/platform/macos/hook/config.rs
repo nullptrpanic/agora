@@ -21,6 +21,7 @@ pub(super) const REMOTE_CONTROL_DESCRIPTOR: &str = "AGORA_SANDBOX_REMOTE_FD";
 const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
 const FILESYSTEM_ROOT: &str = "AGORA_SANDBOX_FILESYSTEM_ROOT";
 const FILESYSTEM_MODE: &str = "AGORA_SANDBOX_FILESYSTEM_MODE";
+const NATIVE_PASSTHROUGH_ROOTS: &str = "AGORA_SANDBOX_NATIVE_PASSTHROUGH_ROOTS";
 const FILESYSTEM_CIPHER_KEY: &str = "AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY";
 const LOCAL_FILESYSTEM_CONTROL: &str = "AGORA_SANDBOX_LOCAL_FILESYSTEM_CONTROL";
 const LOCAL_FILESYSTEM_TOKEN: &str = "AGORA_SANDBOX_LOCAL_FILESYSTEM_TOKEN";
@@ -40,7 +41,7 @@ const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
     "GIT_SSL_CAINFO",
 ];
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 31] = [
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 32] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
@@ -56,6 +57,7 @@ pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 31] = [
     HOOK_LIBRARIES,
     FILESYSTEM_ROOT,
     FILESYSTEM_MODE,
+    NATIVE_PASSTHROUGH_ROOTS,
     FILESYSTEM_CIPHER_KEY,
     LOCAL_FILESYSTEM_CONTROL,
     LOCAL_FILESYSTEM_TOKEN,
@@ -88,6 +90,7 @@ pub(super) struct HookConfig {
     filesystem_mode: String,
     filesystem_cipher_key: Option<String>,
     filesystem_cipher: Option<crate::filesystem::FileCipher>,
+    native_passthrough_roots: Vec<PathBuf>,
     local_filesystem: Option<(String, String)>,
     inherited_local_descriptors: Option<String>,
     remote_filesystem: Option<RemoteHookConfig>,
@@ -158,6 +161,29 @@ impl HookConfig {
         }
         let filesystem_cipher =
             Self::decode_filesystem_cipher(&filesystem_mode, filesystem_cipher_key.as_deref())?;
+        let mut native_passthrough_roots = get(NATIVE_PASSTHROUGH_ROOTS)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                serde_json::from_str::<Vec<PathBuf>>(&value)
+                    .map_err(|error| format!("invalid {NATIVE_PASSTHROUGH_ROOTS}: {error}"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        native_passthrough_roots.push(PathBuf::from("/dev"));
+        native_passthrough_roots = native_passthrough_roots
+            .into_iter()
+            .map(|root| {
+                if !root.is_absolute() {
+                    return Err(format!(
+                        "native passthrough root must be absolute: {}",
+                        root.display()
+                    ));
+                }
+                crate::filesystem::normalize_path(&root).map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        native_passthrough_roots.sort();
+        native_passthrough_roots.dedup();
         let local_control = get(LOCAL_FILESYSTEM_CONTROL).filter(|value| !value.is_empty());
         let local_token = get(LOCAL_FILESYSTEM_TOKEN).filter(|value| !value.is_empty());
         let local_filesystem = match (local_control, local_token) {
@@ -250,6 +276,7 @@ impl HookConfig {
             filesystem_mode,
             filesystem_cipher_key,
             filesystem_cipher,
+            native_passthrough_roots,
             local_filesystem,
             inherited_local_descriptors,
             remote_filesystem,
@@ -299,6 +326,10 @@ impl HookConfig {
 
     pub(super) fn filesystem_cipher(&self) -> Option<crate::filesystem::FileCipher> {
         self.filesystem_cipher.clone()
+    }
+
+    pub(super) fn native_passthrough_roots(&self) -> &[PathBuf] {
+        &self.native_passthrough_roots
     }
 
     pub(super) fn local_filesystem(&self) -> Option<(&str, &str)> {
@@ -378,6 +409,11 @@ impl HookConfig {
             (HOOK_LIBRARIES, self.hook_libraries.clone()),
             (FILESYSTEM_ROOT, self.filesystem_root.clone()),
             (FILESYSTEM_MODE, self.filesystem_mode.clone()),
+            (
+                NATIVE_PASSTHROUGH_ROOTS,
+                serde_json::to_string(&self.native_passthrough_roots)
+                    .expect("validated native passthrough roots must be serializable"),
+            ),
             (TRACE_ID_ENVIRONMENT, trace.encode()),
         ];
         if let Some(key) = &self.filesystem_cipher_key {
@@ -447,6 +483,7 @@ pub(super) fn initialize() -> Result<(), String> {
         for key in [
             FILESYSTEM_ROOT,
             FILESYSTEM_MODE,
+            NATIVE_PASSTHROUGH_ROOTS,
             FILESYSTEM_CIPHER_KEY,
             LOCAL_FILESYSTEM_CONTROL,
             LOCAL_FILESYSTEM_TOKEN,

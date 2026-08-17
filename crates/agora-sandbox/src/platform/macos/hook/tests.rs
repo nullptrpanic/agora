@@ -3,7 +3,7 @@ use super::network::{ProcessContext, RawSocketAddress, socket_addr_from_raw};
 use crate::filesystem::FileCipher;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn prepared_process_executable_identity_uses_the_logical_path() {
@@ -107,6 +107,10 @@ fn hook_configuration_requires_all_runtime_values() {
         ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
         ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs"),
         ("AGORA_SANDBOX_FILESYSTEM_MODE", "plain"),
+        (
+            "AGORA_SANDBOX_NATIVE_PASSTHROUGH_ROOTS",
+            r#"["/dev","/opt/agora-tools"]"#,
+        ),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root"),
     ]);
     let config = HookConfig::from_getter(|key| values.get(key).map(ToString::to_string)).unwrap();
@@ -222,6 +226,10 @@ fn hook_configuration_exposes_local_broker_and_runtime_accessors() {
         ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
         ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs"),
         ("AGORA_SANDBOX_FILESYSTEM_MODE", "plain"),
+        (
+            "AGORA_SANDBOX_NATIVE_PASSTHROUGH_ROOTS",
+            r#"["/dev","/opt/agora-tools"]"#,
+        ),
         ("AGORA_SANDBOX_LOCAL_FILESYSTEM_CONTROL", "/tmp/local.sock"),
         ("AGORA_SANDBOX_LOCAL_FILESYSTEM_TOKEN", "local-token"),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root"),
@@ -238,6 +246,10 @@ fn hook_configuration_exposes_local_broker_and_runtime_accessors() {
     assert_eq!(config.hook_libraries(), "/tmp/hook.dylib");
     assert_eq!(config.filesystem_root(), "/tmp/agora-fs");
     assert_eq!(
+        config.native_passthrough_roots(),
+        [PathBuf::from("/dev"), PathBuf::from("/opt/agora-tools")]
+    );
+    assert_eq!(
         config.local_filesystem(),
         Some(("/tmp/local.sock", "local-token"))
     );
@@ -248,6 +260,10 @@ fn hook_configuration_exposes_local_broker_and_runtime_accessors() {
     for (key, value) in [
         ("AGORA_SANDBOX_LOCAL_FILESYSTEM_CONTROL", "/tmp/local.sock"),
         ("AGORA_SANDBOX_LOCAL_FILESYSTEM_TOKEN", "local-token"),
+        (
+            "AGORA_SANDBOX_NATIVE_PASSTHROUGH_ROOTS",
+            r#"["/dev","/opt/agora-tools"]"#,
+        ),
     ] {
         assert!(
             config
@@ -255,6 +271,19 @@ fn hook_configuration_exposes_local_broker_and_runtime_accessors() {
                 .contains(&(key, value.to_string()))
         );
     }
+
+    let relative = HookConfig::from_getter(|key| {
+        if key == "AGORA_SANDBOX_NATIVE_PASSTHROUGH_ROOTS" {
+            Some(r#"["relative/tools"]"#.to_string())
+        } else {
+            values.get(key).map(ToString::to_string)
+        }
+    });
+    assert!(
+        relative
+            .unwrap_err()
+            .contains("native passthrough root must be absolute")
+    );
 }
 
 #[test]

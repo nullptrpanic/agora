@@ -1616,7 +1616,11 @@ fn nfs_directory_rename_retargets_open_descendants() {
 
 #[test]
 fn native_passthrough_roots_are_normalized_and_component_safe() {
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
+    fixture
+        .runtime
+        .native_passthrough_roots
+        .push(PathBuf::from("/opt/agora-tools"));
     assert_eq!(
         fixture
             .runtime
@@ -1635,6 +1639,27 @@ fn native_passthrough_roots_are_normalized_and_component_safe() {
         fixture
             .runtime
             .native_passthrough_path(Path::new("/developer"))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .native_passthrough_path(Path::new("/opt/agora-tools/bin/go"))
+            .unwrap(),
+        Some(PathBuf::from("/opt/agora-tools/bin/go"))
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .native_passthrough_path(Path::new("/opt/agora-tools/../private/file"))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .native_passthrough_path(Path::new("/opt/agora-toolsmith"))
             .unwrap(),
         None
     );
