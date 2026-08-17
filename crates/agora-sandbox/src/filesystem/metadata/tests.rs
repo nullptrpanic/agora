@@ -2,6 +2,8 @@ use super::{
     DirectoryMetadata, EntryState, FileAttributes, METADATA_VERSION, Materializer, MetadataStore,
 };
 use crate::filesystem::FileCipher;
+use std::ffi::OsStr;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -16,6 +18,79 @@ fn metadata_store_creates_and_validates_directory_markers() {
     assert!(root.join("Users/bytedance/.metadata").is_file());
     assert!(store.has_marker(Path::new("/Users/bytedance")).unwrap());
 
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_store_recovers_a_closed_generation_descriptor() {
+    let root = tempfile();
+    let generation = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(super::namespace::VFS_LOCK_FILE))
+        .unwrap();
+    let descriptor = generation.as_raw_fd();
+    let store = MetadataStore::with_generation(&root, generation, None).unwrap();
+    let expected = store.current_generation().unwrap();
+
+    assert_eq!(unsafe { libc::close(descriptor) }, 0);
+
+    let actual = store.current_generation();
+    if actual.is_err() {
+        // Avoid dropping a File whose descriptor was deliberately closed by
+        // this regression test. The broken implementation would otherwise
+        // abort under Rust's I/O-safety checks before reporting the assertion.
+        std::mem::forget(store);
+    } else {
+        drop(store);
+    }
+    assert_eq!(actual.unwrap(), expected);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_store_does_not_close_a_reused_append_descriptor() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    store.set_whiteout(Path::new("/first"), false).unwrap();
+    assert!(
+        store
+            .append_new_whiteout(Path::new("/"), OsStr::new("second"), false)
+            .unwrap()
+    );
+    let descriptor = store
+        .append_file
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .file
+        .as_raw_fd();
+    let replacement_path = root.join("application-owned-fd");
+    let replacement = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&replacement_path)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::dup2(replacement.as_raw_fd(), descriptor) },
+        descriptor
+    );
+
+    assert!(
+        store
+            .append_new_whiteout(Path::new("/"), OsStr::new("third"), false)
+            .unwrap()
+    );
+    assert_ne!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+
+    assert_eq!(unsafe { libc::close(descriptor) }, 0);
+    drop(store);
+    drop(replacement);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -800,7 +875,14 @@ fn metadata_rejects_invalid_serialization_generation_and_legacy_aliases() {
         vec![(std::ffi::OsString::from("cat"), EntryState::Cow)]
     );
 
-    store.generation.set_len(0).unwrap();
+    store
+        .generation
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .set_len(0)
+        .unwrap();
     assert!(
         store
             .state(Path::new("/missing"))

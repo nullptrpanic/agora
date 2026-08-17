@@ -1,6 +1,7 @@
 use super::{OverlayStore, SourceIdentity, StagedWrite, WriteReservation};
 use crate::filesystem::{EntryState, FileAttributes, FileCipher, Materializer};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
@@ -238,6 +239,50 @@ fn sequential_overlay_transactions_reuse_the_lock_descriptor() {
     assert_eq!(fixture.store.state(&fixture.lower).unwrap(), None);
 
     assert_eq!(fixture.store.lock_open_count(), initial_opens);
+}
+
+#[test]
+fn overlay_lock_recovers_when_application_replaces_cached_descriptor() {
+    let fixture = Fixture::new();
+    let lock_descriptor = fixture
+        .store
+        .lock_pool
+        .lock()
+        .unwrap()
+        .files
+        .last()
+        .unwrap()
+        .as_raw_fd();
+    let mut sockets = [-1; 2];
+    assert_eq!(
+        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sockets.as_mut_ptr()) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::dup2(sockets[0], lock_descriptor) },
+        lock_descriptor
+    );
+
+    let result = fixture.store.state(&fixture.lower);
+    let marker = b"x";
+    assert_eq!(
+        unsafe { libc::write(lock_descriptor, marker.as_ptr().cast(), marker.len()) },
+        marker.len() as isize
+    );
+    let mut received = [0_u8; 1];
+    assert_eq!(
+        unsafe { libc::read(sockets[1], received.as_mut_ptr().cast(), received.len()) },
+        received.len() as isize
+    );
+    assert_eq!(received, *marker);
+
+    drop(fixture);
+    unsafe {
+        libc::close(lock_descriptor);
+        libc::close(sockets[0]);
+        libc::close(sockets[1]);
+    }
+    assert_eq!(result.unwrap(), None);
 }
 
 #[test]
@@ -2202,7 +2247,7 @@ fn executable_cache_rebuilds_when_the_recorded_checksum_is_wrong() {
                 materializer,
                 source: Some(source_identity),
                 variant: Some(format!(
-                    "{}/{}/prepare-v1",
+                    "{}/{}/prepare-v2",
                     std::env::consts::OS,
                     std::env::consts::ARCH
                 )),

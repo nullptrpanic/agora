@@ -108,7 +108,7 @@ fn executable_store_prepares_and_caches_a_native_copy() {
         variant.as_deref(),
         Some(
             format!(
-                "{}/{}/prepare-v1",
+                "{}/{}/prepare-v2",
                 std::env::consts::OS,
                 std::env::consts::ARCH
             )
@@ -147,7 +147,7 @@ fn executable_store_prepares_and_caches_a_native_copy() {
     assert_eq!(
         metadata["entries"]["sh"]["entry"]["variant"],
         format!(
-            "{}/{}/prepare-v1",
+            "{}/{}/prepare-v2",
             std::env::consts::OS,
             std::env::consts::ARCH
         )
@@ -323,7 +323,7 @@ fn executable_store_preserves_entitlements_when_resigning() {
 }
 
 #[test]
-fn executable_store_rejects_identity_bound_entitlements_before_caching() {
+fn executable_store_strips_identity_bound_entitlements_before_caching() {
     let root = TestDirectory::new();
     let source = root.path().join("identity-bound-sh");
     let entitlements = root.path().join("entitlements.plist");
@@ -356,27 +356,36 @@ fn executable_store_rejects_identity_bound_entitlements_before_caching() {
         .status()
         .unwrap();
     assert!(status.success());
+    let source = source.canonicalize().unwrap();
     let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
-    let destination = store.destination(&source).unwrap();
+    let prepared = store.prepare(&source).unwrap();
 
-    let error = store.prepare(&source).unwrap_err();
-
-    assert_eq!(
-        error
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
-            .and_then(std::io::Error::raw_os_error),
-        Some(libc::ENOTSUP)
+    let output = Command::new("/usr/bin/codesign")
+        .args(["--display", "--verbose=4", "--entitlements", ":-", "--xml"])
+        .arg(&prepared)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let entitlements = String::from_utf8_lossy(&output.stdout);
+    assert!(!entitlements.contains("com.apple.application-identifier"));
+    assert!(entitlements.contains("com.apple.security.cs.allow-jit"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line == "Identifier=com.example.agora-fixture")
     );
-    let message = error.to_string();
-    assert!(message.contains(&source.display().to_string()));
-    assert!(message.contains("com.apple.application-identifier"));
-    assert!(!destination.exists());
-    assert_eq!(store.overlay.state(&source).unwrap(), None);
+    assert!(prepared.exists());
+    assert!(matches!(
+        store.overlay.state(&source).unwrap(),
+        Some(EntryState::Cached {
+            materializer: Materializer::Executable,
+            ..
+        })
+    ));
 }
 
 #[test]
-fn executable_store_does_not_reuse_an_identity_bound_cached_copy() {
+fn executable_store_reuses_a_sanitized_identity_bound_copy() {
     let root = TestDirectory::new();
     let source = root.path().join("identity-bound-sh");
     let entitlements = root.path().join("entitlements.plist");
@@ -405,28 +414,23 @@ fn executable_store_does_not_reuse_an_identity_bound_cached_copy() {
         .status()
         .unwrap();
     assert!(status.success());
+    let source = source.canonicalize().unwrap();
     let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
-    let cached = store
-        .overlay
-        .prepare_executable(&source, |temporary| {
-            fs::copy(&source, temporary)?;
-            Ok(())
-        })
+    let prepared = store.prepare(&source).unwrap();
+    let inode = prepared.metadata().unwrap().ino();
+    let reused = store.prepare(&source).unwrap();
+
+    assert_eq!(reused, prepared);
+    assert_eq!(reused.metadata().unwrap().ino(), inode);
+    let output = Command::new("/usr/bin/codesign")
+        .args(["--display", "--entitlements", ":-", "--xml"])
+        .arg(reused)
+        .output()
         .unwrap();
-    assert!(cached.exists());
-
-    let error = store.prepare(&source).unwrap_err();
-
-    assert_eq!(
-        error
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
-            .and_then(std::io::Error::raw_os_error),
-        Some(libc::ENOTSUP)
+    assert!(output.status.success());
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("com.apple.developer.team-identifier")
     );
-    let message = error.to_string();
-    assert!(message.contains(&source.display().to_string()));
-    assert!(message.contains("com.apple.developer.team-identifier"));
 }
 
 #[test]
@@ -465,6 +469,14 @@ fn identity_bound_entitlement_policy_is_generic() {
             "expected {entitlement} to remain eligible for ad-hoc preparation"
         );
     }
+}
+
+#[test]
+fn plutil_key_paths_escape_entitlement_dots_and_backslashes() {
+    assert_eq!(
+        ExecutableStore::escape_plutil_key_path("com.apple.private.test\\value"),
+        "com\\.apple\\.private\\.test\\\\value"
+    );
 }
 
 #[test]

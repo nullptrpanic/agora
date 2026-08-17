@@ -48,6 +48,7 @@ struct ExecutableIdentity {
 struct CodeSignature {
     flags: u32,
     entitlement_keys: Vec<String>,
+    entitlements_plist: Vec<u8>,
 }
 
 impl ExecutableIdentity {
@@ -131,18 +132,22 @@ impl ExecutableStore {
             if !Self::requires_copy(&source, &metadata)? {
                 return Ok(source);
             }
-            Self::validate_ad_hoc_resigning(&source, requested, &metadata)?;
             bundle::prepare_dependencies(self, &source, Self::native_architecture())?;
             self.prepare_copy(&source, &metadata)
         } else {
-            Self::validate_ad_hoc_resigning(&source, requested, &metadata)?;
+            let signature =
+                Self::cached_code_signature(&metadata, || Self::inspect_code_signature(&source))?;
             if matches!(
                 self.overlay.state(&source)?,
                 Some(EntryState::Cached {
                     materializer: Materializer::Executable,
                     ..
                 })
-            ) {
+            ) && !signature
+                .entitlement_keys
+                .iter()
+                .any(|key| Self::requires_original_signing_identity(key))
+            {
                 Ok(source)
             } else {
                 let source = self.prepare_internal_copy(&source, &metadata)?;
@@ -222,6 +227,7 @@ impl ExecutableStore {
         Ok(CodeSignature {
             flags,
             entitlement_keys,
+            entitlements_plist: output.stdout,
         })
     }
 
@@ -257,30 +263,6 @@ impl ExecutableStore {
         let entitlements: BTreeMap<String, serde_json::Value> = serde_json::from_str(&json)
             .context("executable entitlements are not a property-list dictionary")?;
         Ok(entitlements.into_keys().collect())
-    }
-
-    fn validate_ad_hoc_resigning(
-        source: &Path,
-        requested: &Path,
-        metadata: &Metadata,
-    ) -> Result<()> {
-        let signature =
-            Self::cached_code_signature(metadata, || Self::inspect_code_signature(source))?;
-        let unsupported = signature
-            .entitlement_keys
-            .into_iter()
-            .filter(|entitlement| Self::requires_original_signing_identity(entitlement))
-            .collect::<Vec<_>>();
-        if unsupported.is_empty() {
-            return Ok(());
-        }
-        Err(io::Error::from_raw_os_error(libc::ENOTSUP)).with_context(|| {
-            format!(
-                "sandbox cannot prepare executable {} because ad-hoc signing cannot preserve its original signing identity for entitlements: {}",
-                requested.display(),
-                unsupported.join(", ")
-            )
-        })
     }
 
     fn requires_original_signing_identity(entitlement: &str) -> bool {
@@ -387,20 +369,70 @@ impl ExecutableStore {
         if selected.rewrite_arm64e {
             Self::rewrite_arm64e_subtype(temporary)?;
         }
-        Self::run_tool(
-            "/usr/bin/codesign",
-            [
-                OsStr::new("--force"),
-                OsStr::new("--sign"),
-                OsStr::new("-"),
-                OsStr::new("--timestamp=none"),
-                OsStr::new("--preserve-metadata=identifier,entitlements"),
-                temporary.as_os_str(),
-            ],
-            "failed to ad-hoc sign executable copy",
-        )?;
+        let signature =
+            Self::cached_code_signature(metadata, || Self::inspect_code_signature(source))?;
+        Self::sign_executable_copy(temporary, &signature)?;
         fs::set_permissions(temporary, fs::Permissions::from_mode(source_mode))?;
         Ok(())
+    }
+
+    fn sign_executable_copy(temporary: &Path, signature: &CodeSignature) -> Result<()> {
+        let identity_bound = signature
+            .entitlement_keys
+            .iter()
+            .filter(|key| Self::requires_original_signing_identity(key))
+            .collect::<Vec<_>>();
+        if identity_bound.is_empty() {
+            return Self::run_tool(
+                "/usr/bin/codesign",
+                [
+                    OsStr::new("--force"),
+                    OsStr::new("--sign"),
+                    OsStr::new("-"),
+                    OsStr::new("--timestamp=none"),
+                    OsStr::new("--preserve-metadata=identifier,entitlements"),
+                    temporary.as_os_str(),
+                ],
+                "failed to ad-hoc sign executable copy",
+            );
+        }
+
+        let mut plist = tempfile::NamedTempFile::new()
+            .context("failed to stage filtered executable entitlements")?;
+        plist
+            .write_all(&signature.entitlements_plist)
+            .context("failed to stage filtered executable entitlements")?;
+        plist
+            .flush()
+            .context("failed to flush filtered executable entitlements")?;
+        for key in &identity_bound {
+            let key_path = Self::escape_plutil_key_path(key);
+            let output = Command::new("/usr/bin/plutil")
+                .args(["-remove", &key_path])
+                .arg(plist.path())
+                .output()
+                .context("failed to run plutil while filtering executable entitlements")?;
+            Self::check_output(output, "failed to filter executable entitlements")?;
+        }
+
+        let mut command = Command::new("/usr/bin/codesign");
+        command.args([
+            "--force",
+            "--sign",
+            "-",
+            "--timestamp=none",
+            "--preserve-metadata=identifier",
+        ]);
+        command.arg("--entitlements").arg(plist.path());
+        let output = command
+            .arg(temporary)
+            .output()
+            .context("failed to ad-hoc sign executable copy")?;
+        Self::check_output(output, "failed to ad-hoc sign executable copy").map(|_| ())
+    }
+
+    fn escape_plutil_key_path(key: &str) -> String {
+        key.replace('\\', "\\\\").replace('.', "\\.")
     }
 
     #[cfg(test)]

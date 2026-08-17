@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use uuid::Uuid;
 const LOCK_DESCRIPTOR_POOL_CAPACITY: usize = 16;
 // Increment when executable or loader preparation can produce different bytes
 // for the same source and target platform.
-const PREPARED_FILE_CACHE_VERSION: u32 = 1;
+const PREPARED_FILE_CACHE_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BackingIdentity {
@@ -2515,7 +2515,13 @@ impl OverlayStore {
             pool.files.clear();
         }
         if let Some(lock) = pool.files.pop() {
-            return Ok(lock);
+            if self.lock_descriptor_is_current(&lock) {
+                return Ok(lock);
+            }
+            // The application may have replaced this descriptor with dup2
+            // while it was idle in the pool. Relinquish the stale numeric
+            // descriptor without closing the application's replacement.
+            let _ = lock.into_raw_fd();
         }
         drop(pool);
         let lock = OpenOptions::new()
@@ -2529,6 +2535,10 @@ impl OverlayStore {
     }
 
     fn return_lock_descriptor(&self, lock: File) {
+        if !self.lock_descriptor_is_current(&lock) {
+            let _ = lock.into_raw_fd();
+            return;
+        }
         let pid = unsafe { libc::getpid() };
         let mut pool = self
             .lock_pool
@@ -2541,6 +2551,14 @@ impl OverlayStore {
         if pool.files.len() < LOCK_DESCRIPTOR_POOL_CAPACITY {
             pool.files.push(lock);
         }
+    }
+
+    fn lock_descriptor_is_current(&self, lock: &File) -> bool {
+        lock.metadata()
+            .and_then(|open| self.lock_path.metadata().map(|expected| (open, expected)))
+            .is_ok_and(|(open, expected)| {
+                BackingIdentity::from_metadata(&open) == BackingIdentity::from_metadata(&expected)
+            })
     }
 
     fn flock(file: &File, operation: libc::c_int) -> std::io::Result<()> {

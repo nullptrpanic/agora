@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::fd::IntoRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -215,7 +216,7 @@ impl Default for DirectoryMetadata {
 
 pub(super) struct MetadataStore {
     root: PathBuf,
-    generation: File,
+    generation: Mutex<Option<File>>,
     cipher: Option<super::FileCipher>,
     cache: Mutex<MetadataCache>,
     append_file: Mutex<Option<AppendFile>>,
@@ -290,7 +291,7 @@ impl MetadataStore {
         Self::initialize_generation(&generation)?;
         let store = Self {
             root: root.to_path_buf(),
-            generation,
+            generation: Mutex::new(Some(generation)),
             cipher,
             cache: Mutex::new(MetadataCache {
                 generation: None,
@@ -871,8 +872,7 @@ impl MetadataStore {
         #[cfg(test)]
         self.publication_count.fetch_add(1, Ordering::Relaxed);
         let next_generation = generation.wrapping_add(1);
-        self.generation
-            .write_all_at(&next_generation.to_be_bytes(), 0)?;
+        self.write_generation(next_generation)?;
         let mut cache = self.cache();
         if cache.generation != Some(generation) {
             cache.directories.clear();
@@ -915,6 +915,13 @@ impl MetadataStore {
                 })
         });
         if !reusable {
+            if let Some(cached) = append.take()
+                && !Self::descriptor_matches_path(&cached.file, &cached.path)
+            {
+                // The application may have closed and reused this cached
+                // descriptor. Do not close the descriptor's new owner.
+                let _ = cached.file.into_raw_fd();
+            }
             let file = match OpenOptions::new().read(true).write(true).open(path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -980,7 +987,7 @@ impl MetadataStore {
     ) -> Result<()> {
         let previous = self.current_generation()?;
         let generation = previous.wrapping_add(1);
-        self.generation.write_all_at(&generation.to_be_bytes(), 0)?;
+        self.write_generation(generation)?;
         let mut cache = self.cache();
         if cache.generation != Some(previous) {
             cache.directories.clear();
@@ -1222,12 +1229,14 @@ impl MetadataStore {
     }
 
     pub(super) fn current_generation(&self) -> Result<u64> {
+        self.with_generation_file(Self::read_generation)
+    }
+
+    fn read_generation(generation: &File) -> Result<u64> {
         let mut bytes = [0_u8; 8];
         let mut offset = 0;
         while offset < bytes.len() {
-            let read = self
-                .generation
-                .read_at(&mut bytes[offset..], offset as u64)?;
+            let read = generation.read_at(&mut bytes[offset..], offset as u64)?;
             if read == 0 {
                 bail!("filesystem metadata generation is incomplete");
             }
@@ -1238,11 +1247,61 @@ impl MetadataStore {
 
     fn advance_generation(&self) -> Result<()> {
         let generation = self.current_generation()?.wrapping_add(1);
-        self.generation.write_all_at(&generation.to_be_bytes(), 0)?;
+        self.write_generation(generation)?;
         let mut cache = self.cache();
         cache.generation = Some(generation);
         cache.directories.clear();
         Ok(())
+    }
+
+    fn write_generation(&self, generation: u64) -> Result<()> {
+        self.with_generation_file(|file| {
+            file.write_all_at(&generation.to_be_bytes(), 0)?;
+            Ok(())
+        })
+    }
+
+    fn with_generation_file<T>(&self, operation: impl FnOnce(&File) -> Result<T>) -> Result<T> {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let current = generation
+            .as_ref()
+            .is_some_and(|file| self.generation_descriptor_is_current(file));
+        if !current {
+            if let Some(stale) = generation.take() {
+                // The application may have closed and reused this descriptor.
+                // Relinquish the numeric descriptor without closing its new owner.
+                let _ = stale.into_raw_fd();
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(self.root.join(namespace::VFS_LOCK_FILE))?;
+            Self::initialize_generation(&file)?;
+            *generation = Some(file);
+        }
+        operation(
+            generation
+                .as_ref()
+                .context("filesystem metadata generation file is missing")?,
+        )
+    }
+
+    fn generation_descriptor_is_current(&self, generation: &File) -> bool {
+        Self::descriptor_matches_path(generation, &self.root.join(namespace::VFS_LOCK_FILE))
+    }
+
+    fn descriptor_matches_path(file: &File, path: &Path) -> bool {
+        file.metadata()
+            .and_then(|open| path.metadata().map(|expected| (open, expected)))
+            .is_ok_and(|(open, expected)| {
+                open.dev() == expected.dev() && open.ino() == expected.ino()
+            })
     }
 
     fn path(&self, directory: &Path) -> Result<PathBuf> {
