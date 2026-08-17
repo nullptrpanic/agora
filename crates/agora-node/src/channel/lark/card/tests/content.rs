@@ -431,6 +431,10 @@ fn lark_card_preserves_output_and_marks_the_run_as_stopped() {
 
     let card = content.build_card();
     let rendered = serde_json::to_string(&card).unwrap();
+    let elements = card
+        .pointer("/body/elements")
+        .and_then(serde_json::Value::as_array)
+        .unwrap();
 
     assert_eq!(
         card.pointer("/header/text_tag_list/0/text/content")
@@ -449,6 +453,19 @@ fn lark_card_preserves_output_and_marks_the_run_as_stopped() {
     assert!(rendered.contains("已按请求停止任务，已有输出已保留。"));
     assert!(rendered.contains("<font color='blue'>▌</font> **部分回答**"));
     assert!(rendered.contains("Work completed before the stop."));
+    assert!(
+        elements[0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("**任务已停止**"))
+    );
+    assert_eq!(elements[1]["tag"], "hr");
+    assert!(
+        elements[2]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("**部分回答**"))
+    );
+    assert_eq!(elements[3]["tag"], "hr");
+    assert_eq!(elements[4]["tag"], "collapsible_panel");
 }
 
 #[test]
@@ -522,6 +539,18 @@ fn lark_card_groups_process_and_keeps_final_answer_separate() {
         Some("已完成")
     );
     let rendered = serde_json::to_string(&card).unwrap();
+    let elements = card
+        .pointer("/body/elements")
+        .and_then(serde_json::Value::as_array)
+        .unwrap();
+    assert!(
+        elements[0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("**最终回答**"))
+    );
+    assert_eq!(elements[1]["tag"], "hr");
+    assert_eq!(elements[2]["tag"], "collapsible_panel");
+    assert_eq!(elements[2]["expanded"], false);
     assert!(rendered.contains("**任务过程**"));
     assert!(rendered.contains("<font color='blue'>**01**</font>  **思考过程**"));
     assert!(rendered.contains("<font color='blue'>✦</font> Inspecting the channel"));

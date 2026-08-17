@@ -452,15 +452,16 @@ impl LarkCardContent {
             LarkRunState::Queued { .. } | LarkRunState::Running
         );
         let mut elements = Vec::new();
-
-        if !self.process.is_empty() {
+        let mut process_element = if self.process.is_empty() {
+            None
+        } else {
             let summary = self.progress_summary();
             let status = if summary.is_empty() {
                 String::new()
             } else {
                 format!(" · {summary}")
             };
-            elements.push(Self::collapsible_panel_elements(
+            Some(Self::collapsible_panel_elements(
                 format!(
                     "**{}**  <font color='grey'>· {}</font>{status}",
                     i18n::PROCESS_TITLE,
@@ -468,7 +469,10 @@ impl LarkCardContent {
                 ),
                 !finished,
                 self.process_elements(),
-            ));
+            ))
+        };
+        if !finished && let Some(process) = process_element.take() {
+            elements.push(process);
         }
 
         if let Some((category, summary)) = failure_view {
@@ -541,6 +545,13 @@ impl LarkCardContent {
                     Self::truncate_answer(&self.answer)
                 )
             }));
+        }
+
+        if finished && let Some(process) = process_element {
+            if !elements.is_empty() {
+                elements.push(json!({ "tag": "hr" }));
+            }
+            elements.push(process);
         }
 
         if finished && let Some(usage) = self.usage {

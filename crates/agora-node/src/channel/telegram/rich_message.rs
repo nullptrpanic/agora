@@ -530,10 +530,8 @@ impl TelegramRichContent {
 
     fn render_sections(&self, draft: bool) -> Vec<String> {
         let mut sections = Vec::new();
-        if (!draft || self.is_terminal())
-            && let Some(section) = self.process_section()
-        {
-            sections.push(section);
+        if !draft || self.is_terminal() {
+            sections.push(self.header_section());
         }
         if let Some(section) = self.terminal_state_section() {
             sections.push(section);
@@ -542,16 +540,20 @@ impl TelegramRichContent {
             sections.push(section);
         }
 
-        if !self.answer.is_empty() {
-            if self.has_partial_answer() {
-                sections.push(format!(
-                    "**{}**\n\n{}",
-                    i18n::PARTIAL_ANSWER_TITLE,
-                    self.answer
-                ));
-            } else {
-                sections.push(self.answer.clone());
-            }
+        if self.is_terminal()
+            && let Some(section) = self.answer_section()
+        {
+            sections.push(section);
+        }
+        if (!draft || self.is_terminal())
+            && let Some(section) = self.process_section()
+        {
+            sections.push(section);
+        }
+        if !self.is_terminal()
+            && let Some(section) = self.answer_section()
+        {
+            sections.push(section);
         }
         if self.is_terminal()
             && let Some(usage) = self.usage
@@ -561,15 +563,46 @@ impl TelegramRichContent {
         sections
     }
 
+    fn header_section(&self) -> String {
+        let status = match self.state {
+            TelegramRunState::Queued { .. } => RunStatus::Queued,
+            TelegramRunState::Running => RunStatus::Running,
+            TelegramRunState::Completed => RunStatus::Completed,
+            TelegramRunState::Failed(_) => RunStatus::Failed,
+            TelegramRunState::Stopped => RunStatus::Stopped,
+            TelegramRunState::Interrupted => RunStatus::Interrupted,
+        };
+        format!(
+            "## {}\n\n> **{}**",
+            Self::escape_structural_text(&self.agent_name),
+            i18n::run_status(status)
+        )
+    }
+
+    fn answer_section(&self) -> Option<String> {
+        if self.answer.is_empty() {
+            return None;
+        }
+        let title = if self.has_partial_answer() {
+            Some(i18n::PARTIAL_ANSWER_TITLE)
+        } else if matches!(self.state, TelegramRunState::Completed) {
+            Some(i18n::FINAL_ANSWER_TITLE)
+        } else {
+            None
+        };
+        Some(title.map_or_else(
+            || self.answer.clone(),
+            |title| format!("### {title}\n\n{}", self.answer),
+        ))
+    }
+
     fn split_sections(sections: Vec<String>) -> Vec<String> {
         let mut messages = Vec::new();
         let mut current = String::new();
         for section in sections {
             if !Self::within_limits(&section) {
-                if !current.is_empty() {
-                    messages.push(std::mem::take(&mut current));
-                }
-                messages.extend(Self::safe_section_chunks(&section));
+                let prefix = (!current.is_empty()).then(|| std::mem::take(&mut current));
+                messages.extend(Self::safe_section_chunks(&section, prefix));
                 continue;
             }
 
@@ -590,14 +623,27 @@ impl TelegramRichContent {
         messages
     }
 
-    fn safe_section_chunks(section: &str) -> Vec<String> {
+    fn safe_section_chunks(section: &str, mut first_prefix: Option<String>) -> Vec<String> {
         const OPENING: &str = "<pre>";
         const CLOSING: &str = "</pre>";
 
-        let character_budget = TELEGRAM_RICH_MESSAGE_MAX_CHARS
+        let prefix_character_cost = first_prefix
+            .as_ref()
+            .map_or(0, |prefix| prefix.chars().count().saturating_add(2));
+        let mut character_budget = TELEGRAM_RICH_MESSAGE_MAX_CHARS
+            .saturating_sub(prefix_character_cost)
             .saturating_sub(OPENING.chars().count())
             .saturating_sub(CLOSING.chars().count());
-        let line_budget = TELEGRAM_RICH_MESSAGE_MAX_STRUCTURE_POINTS.saturating_sub(2);
+        let prefix_structure_cost = first_prefix.as_ref().map_or(0, |prefix| {
+            prefix
+                .lines()
+                .count()
+                .saturating_add(prefix.matches('<').count())
+                .saturating_add(1)
+        });
+        let mut line_budget = TELEGRAM_RICH_MESSAGE_MAX_STRUCTURE_POINTS
+            .saturating_sub(prefix_structure_cost)
+            .saturating_sub(2);
         let mut chunks = Vec::new();
         let mut escaped = String::new();
         let mut character_count = 0_usize;
@@ -617,7 +663,11 @@ impl TelegramRichContent {
                 && (character_count.saturating_add(width) > character_budget
                     || line_count.saturating_add(lines) > line_budget)
             {
-                chunks.push(format!("{OPENING}{escaped}{CLOSING}"));
+                Self::push_safe_chunk(&mut chunks, &mut first_prefix, &escaped);
+                character_budget = TELEGRAM_RICH_MESSAGE_MAX_CHARS
+                    .saturating_sub(OPENING.chars().count())
+                    .saturating_sub(CLOSING.chars().count());
+                line_budget = TELEGRAM_RICH_MESSAGE_MAX_STRUCTURE_POINTS.saturating_sub(2);
                 escaped.clear();
                 character_count = 0;
                 line_count = 1;
@@ -627,9 +677,18 @@ impl TelegramRichContent {
             line_count += lines;
         }
         if !escaped.is_empty() {
-            chunks.push(format!("{OPENING}{escaped}{CLOSING}"));
+            Self::push_safe_chunk(&mut chunks, &mut first_prefix, &escaped);
         }
         chunks
+    }
+
+    fn push_safe_chunk(chunks: &mut Vec<String>, first_prefix: &mut Option<String>, escaped: &str) {
+        let chunk = format!("<pre>{escaped}</pre>");
+        if let Some(prefix) = first_prefix.take() {
+            chunks.push(format!("{prefix}\n\n{chunk}"));
+        } else {
+            chunks.push(chunk);
+        }
     }
 
     fn within_limits(rendered: &str) -> bool {
@@ -644,13 +703,17 @@ impl TelegramRichContent {
     }
 
     fn render_truncated(&self, draft: bool) -> String {
-        let mut sections = vec![format!("> {}", i18n::OUTPUT_TRUNCATED.trim())];
+        let mut sections = Vec::new();
+        if !draft || self.is_terminal() {
+            sections.push(self.header_section());
+        }
         if let Some(section) = self.active_state_section(draft) {
             sections.push(section);
         }
         if let Some(section) = self.terminal_state_section() {
             sections.push(section);
         }
+        sections.push(format!("> {}", i18n::OUTPUT_TRUNCATED.trim()));
         let usage = if self.is_terminal() {
             self.usage.map(Self::usage_section)
         } else {
@@ -665,7 +728,9 @@ impl TelegramRichContent {
         }
 
         let answer_heading = if self.has_partial_answer() {
-            format!("**{}**\n\n", i18n::PARTIAL_ANSWER_TITLE)
+            format!("### {}\n\n", i18n::PARTIAL_ANSWER_TITLE)
+        } else if matches!(self.state, TelegramRunState::Completed) {
+            format!("### {}\n\n", i18n::FINAL_ANSWER_TITLE)
         } else {
             String::new()
         };
@@ -693,14 +758,10 @@ impl TelegramRichContent {
                     None
                 } else {
                     Some(format!(
-                        "> **{}** · {}",
-                        Self::escape_structural_text(&self.agent_name),
+                        "> {}",
                         Self::escape_structural_text(i18n::WAITING_FOR_AGENT)
                     ))
                 }
-            }
-            TelegramRunState::Completed if self.answer.is_empty() => {
-                Some(format!("**{}**", i18n::run_status(RunStatus::Completed)))
             }
             TelegramRunState::Completed
             | TelegramRunState::Failed(_)
@@ -892,7 +953,7 @@ impl TelegramRichContent {
             "<details open>"
         };
         let mut summary = format!(
-            "✦ {} · {}",
+            "{} · {}",
             i18n::PROCESS_TITLE,
             i18n::phase_count(self.process.len())
         );
@@ -1023,7 +1084,7 @@ impl TelegramRichContent {
     fn usage_section(usage: TokenUsage) -> String {
         let total = usage.input_tokens.saturating_add(usage.output_tokens);
         format!(
-            "> **◈ TOKEN USAGE** · {} {} · {} {} · {} · {} {} · {} {}",
+            "*{} {} · {} {} · {} · {} {} · {} {}*",
             Self::format_tokens(total),
             i18n::TOKENS,
             i18n::INPUT,

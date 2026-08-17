@@ -752,7 +752,10 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
     let active: serde_json::Value = serde_json::from_str(&active.body).unwrap();
     assert_eq!(
         active["rich_message"]["markdown"],
-        format!("> **codex** · {}", crate::i18n::WAITING_FOR_AGENT)
+        format!(
+            "## codex\n\n> **运行中**\n\n> {}",
+            crate::i18n::WAITING_FOR_AGENT
+        )
     );
     assert!(
         !active["rich_message"]["markdown"]
