@@ -3,6 +3,8 @@ use super::super::protocol::{
 };
 use super::{AUDIT_CONNECTION_MAX_IDLE, AuditClient, AuditConnection, AuditError, CONNECTIONS, io};
 use crate::callback::{FileAccessMode, FileContext, FileOpenMode, ProcessContext};
+#[cfg(target_os = "macos")]
+use crate::ipc::{InheritedControlLock, InheritedControlStream};
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -83,6 +85,22 @@ fn audit_error_maps_io_failures_to_stable_errno_values() {
 
     let error = AuditError::from_io(io::Error::from_raw_os_error(libc::ECONNRESET));
     assert_eq!(error.errno(), libc::ECONNRESET);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn authenticated_inherited_transport_is_preferred_immediately() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let inherited = TcpStream::connect(address).unwrap();
+    let (_peer, _) = listener.accept().unwrap();
+    let shared =
+        InheritedControlStream::new(inherited, InheritedControlLock::anonymous().unwrap(), 0)
+            .unwrap();
+
+    let client = AuditClient::with_shared(address, "token", shared);
+
+    assert!(client.prefer_shared.load(Ordering::Acquire));
 }
 
 #[test]

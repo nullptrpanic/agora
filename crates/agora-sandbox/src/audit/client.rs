@@ -100,6 +100,7 @@ impl AuditClient {
     ) -> Self {
         let mut client = Self::new(control, token);
         client.shared = Some(shared);
+        client.prefer_shared.store(true, Ordering::Release);
         client
     }
 
