@@ -310,6 +310,26 @@ fn overlay_transaction_batches_queries_under_one_lock_entry() {
 }
 
 #[test]
+fn overlay_transaction_reads_the_shared_generation_once() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("generation-file");
+    std::fs::write(&logical, b"lower").unwrap();
+    let before = fixture.store.generation_read_count_for_test();
+
+    fixture
+        .store
+        .transaction(|transaction| {
+            assert!(transaction.visible_exists(&logical)?);
+            assert_eq!(transaction.resolve_final(&logical, false)?, logical);
+            assert_eq!(transaction.attributes(&logical)?, None);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(fixture.store.generation_read_count_for_test() - before, 1);
+}
+
+#[test]
 fn overlay_transaction_records_treat_the_logical_root_as_unmodified() {
     let fixture = Fixture::new();
 

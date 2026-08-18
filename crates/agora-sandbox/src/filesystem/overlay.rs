@@ -496,6 +496,11 @@ impl OverlayStore {
     }
 
     #[cfg(test)]
+    fn generation_read_count_for_test(&self) -> usize {
+        self.metadata.generation_read_count_for_test()
+    }
+
+    #[cfg(test)]
     pub(super) fn resolution_count_for_test(&self) -> usize {
         self.resolution_count.load(Ordering::Relaxed)
     }
@@ -2487,7 +2492,17 @@ impl OverlayStore {
             self.return_lock_descriptor(lock);
             return Err(error.into());
         }
+        let metadata_transaction = match self.metadata.transaction() {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                if Self::flock(&lock, libc::LOCK_UN).is_ok() {
+                    self.return_lock_descriptor(lock);
+                }
+                return Err(error);
+            }
+        };
         let result = operation();
+        drop(metadata_transaction);
         let unlock = Self::flock(&lock, libc::LOCK_UN);
         if unlock.is_ok() {
             self.return_lock_descriptor(lock);

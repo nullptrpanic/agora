@@ -6,10 +6,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::marker::PhantomData;
 use std::os::fd::IntoRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -217,6 +219,7 @@ impl Default for DirectoryMetadata {
 pub(super) struct MetadataStore {
     root: PathBuf,
     generation: Mutex<Option<File>>,
+    transaction_generation: Mutex<TransactionGeneration>,
     cipher: Option<super::FileCipher>,
     cache: Mutex<MetadataCache>,
     append_file: Mutex<Option<AppendFile>>,
@@ -226,6 +229,8 @@ pub(super) struct MetadataStore {
     probe_count: AtomicUsize,
     #[cfg(test)]
     publication_count: AtomicUsize,
+    #[cfg(test)]
+    generation_read_count: AtomicUsize,
 }
 
 pub(super) struct FilenameMigrationPlan {
@@ -237,6 +242,17 @@ pub(super) struct FilenameMigrationPlan {
 struct MetadataCache {
     generation: Option<u64>,
     directories: HashMap<PathBuf, CachedDirectoryMetadata>,
+}
+
+#[derive(Default)]
+struct TransactionGeneration {
+    owner: Option<usize>,
+    generation: Option<u64>,
+}
+
+pub(super) struct MetadataTransaction<'a> {
+    store: &'a MetadataStore,
+    _thread_bound: PhantomData<Rc<()>>,
 }
 
 struct AppendFile {
@@ -292,6 +308,7 @@ impl MetadataStore {
         let store = Self {
             root: root.to_path_buf(),
             generation: Mutex::new(Some(generation)),
+            transaction_generation: Mutex::new(TransactionGeneration::default()),
             cipher,
             cache: Mutex::new(MetadataCache {
                 generation: None,
@@ -304,6 +321,8 @@ impl MetadataStore {
             probe_count: AtomicUsize::new(0),
             #[cfg(test)]
             publication_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            generation_read_count: AtomicUsize::new(0),
         };
         store.ensure_marker(Path::new("/"))?;
         Ok(store)
@@ -1229,7 +1248,49 @@ impl MetadataStore {
     }
 
     pub(super) fn current_generation(&self) -> Result<u64> {
+        let thread = current_thread_token();
+        if let Some(generation) = {
+            let transaction = self
+                .transaction_generation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (transaction.owner.as_ref() == Some(&thread))
+                .then_some(transaction.generation)
+                .flatten()
+        } {
+            return Ok(generation);
+        }
+        let generation = self.read_current_generation()?;
+        let mut transaction = self
+            .transaction_generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if transaction.owner.as_ref() == Some(&thread) {
+            transaction.generation = Some(generation);
+        }
+        Ok(generation)
+    }
+
+    fn read_current_generation(&self) -> Result<u64> {
+        #[cfg(test)]
+        self.generation_read_count.fetch_add(1, Ordering::Relaxed);
         self.with_generation_file(Self::read_generation)
+    }
+
+    pub(super) fn transaction(&self) -> Result<MetadataTransaction<'_>> {
+        let mut transaction = self
+            .transaction_generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if transaction.owner.is_some() {
+            bail!("nested filesystem metadata transaction");
+        }
+        transaction.owner = Some(current_thread_token());
+        transaction.generation = None;
+        Ok(MetadataTransaction {
+            store: self,
+            _thread_bound: PhantomData,
+        })
     }
 
     fn read_generation(generation: &File) -> Result<u64> {
@@ -1248,6 +1309,15 @@ impl MetadataStore {
     fn advance_generation(&self) -> Result<()> {
         let generation = self.current_generation()?.wrapping_add(1);
         self.write_generation(generation)?;
+        let thread = current_thread_token();
+        let mut transaction = self
+            .transaction_generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if transaction.owner.as_ref() == Some(&thread) {
+            transaction.generation = Some(generation);
+        }
+        drop(transaction);
         let mut cache = self.cache();
         cache.generation = Some(generation);
         cache.directories.clear();
@@ -1382,6 +1452,30 @@ impl MetadataStore {
     #[cfg(test)]
     pub(super) fn publication_count_for_test(&self) -> usize {
         self.publication_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn generation_read_count_for_test(&self) -> usize {
+        self.generation_read_count.load(Ordering::Relaxed)
+    }
+}
+
+fn current_thread_token() -> usize {
+    // `std::thread::current()` depends on Rust TLS, which has already been
+    // destroyed when an injected image's atexit callback flushes open files.
+    // pthread_self remains valid for the lifetime of the native thread.
+    unsafe { libc::pthread_self() as usize }
+}
+
+impl Drop for MetadataTransaction<'_> {
+    fn drop(&mut self) {
+        let mut transaction = self
+            .store
+            .transaction_generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        transaction.owner = None;
+        transaction.generation = None;
     }
 }
 
