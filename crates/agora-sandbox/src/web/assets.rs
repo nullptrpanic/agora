@@ -8,6 +8,7 @@ const APP_CSS: &str = include_str!("assets/app.css");
 const APP_JS: &str = include_str!("assets/app.js");
 const TIMELINE_FOLLOW_JS: &str = include_str!("assets/timeline-follow.js");
 const TRACE_BATCH_JS: &str = include_str!("assets/trace-batch.js");
+const TERMINAL_INPUT_JS: &str = include_str!("assets/terminal-input.js");
 const XTERM_JS: &str = include_str!("assets/vendor/xterm/xterm.js");
 const XTERM_CSS: &str = include_str!("assets/vendor/xterm/xterm.css");
 const FIT_JS: &str = include_str!("assets/vendor/xterm-addon-fit/addon-fit.js");
@@ -38,6 +39,10 @@ where
         .route(
             "/trace-batch.js",
             get(|| async { asset(TRACE_BATCH_JS, "text/javascript; charset=utf-8") }),
+        )
+        .route(
+            "/terminal-input.js",
+            get(|| async { asset(TERMINAL_INPUT_JS, "text/javascript; charset=utf-8") }),
         )
         .route(
             "/vendor/xterm.js",
@@ -96,6 +101,7 @@ mod tests {
             ("/app.js", "text/javascript"),
             ("/timeline-follow.js", "text/javascript"),
             ("/trace-batch.js", "text/javascript"),
+            ("/terminal-input.js", "text/javascript"),
             ("/vendor/xterm.js", "text/javascript"),
             ("/vendor/xterm.css", "text/css"),
             ("/vendor/addon-fit.js", "text/javascript"),
@@ -143,6 +149,7 @@ mod tests {
             include_str!("assets/index.html"),
             include_str!("assets/timeline-follow.js"),
             include_str!("assets/trace-batch.js"),
+            include_str!("assets/terminal-input.js"),
             include_str!("assets/app.js")
         );
         assert!(!application.contains("http://"));
@@ -164,13 +171,16 @@ mod tests {
         let index = include_str!("assets/index.html");
         let follow_helper = r#"<script defer src="/timeline-follow.js"></script>"#;
         let batch_helper = r#"<script defer src="/trace-batch.js"></script>"#;
+        let input_helper = r#"<script defer src="/terminal-input.js"></script>"#;
         let application = r#"<script defer src="/app.js"></script>"#;
         assert!(index.find(follow_helper).unwrap() < index.find(batch_helper).unwrap());
-        assert!(index.find(batch_helper).unwrap() < index.find(application).unwrap());
+        assert!(index.find(batch_helper).unwrap() < index.find(input_helper).unwrap());
+        assert!(index.find(input_helper).unwrap() < index.find(application).unwrap());
 
         let app = include_str!("assets/app.js");
         assert!(app.contains("timelineFollowing: true"));
         assert!(app.contains("timelineFollow.isAtBottom(elements.timeline)"));
         assert!(app.contains("timelineFollow.restoreAfterRender("));
+        assert!(app.contains("terminalInput.canForward("));
     }
 }

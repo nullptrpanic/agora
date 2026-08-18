@@ -30,6 +30,7 @@
     closeDetail: document.querySelector("#close-detail"),
   };
   const timelineFollow = window.AgoraTimelineFollow;
+  const terminalInput = window.AgoraTerminalInput;
 
   const fragment = new URLSearchParams(window.location.hash.slice(1));
   const fragmentToken = fragment.get("token");
@@ -84,9 +85,12 @@
   const state = {
     socket: null,
     authenticated: false,
+    focusAfterReplay: false,
     reconnectAttempt: 0,
     reconnectTimer: null,
-    replaying: false,
+    resizeFrame: null,
+    lastTerminalCols: null,
+    lastTerminalRows: null,
     diagnostics: [],
     activeRootTraceId: null,
     status: "idle",
@@ -96,12 +100,20 @@
     selectedKey: null,
     filters: new Set(["exec", "file", "network"]),
     timelineFollowing: true,
+    timelineNeedsFullRender: true,
+    timelineRows: new Map(),
     startedAt: null,
   };
+  const replayBarrier = terminalInput.createReplayBarrier(() => {
+    scheduleTerminalFit();
+    if (state.focusAfterReplay) terminal.focus();
+  });
   const traceBatch = window.AgoraTraceBatch.create({
     keyOf: eventKey,
     onFlush: () => {
-      renderTimeline();
+      const changes = traceBatch.takeChanges();
+      if (state.timelineNeedsFullRender) renderTimeline();
+      else appendTimeline(changes);
       renderHeader();
       renderTruncationNotice();
     },
@@ -126,7 +138,9 @@
   function sendControl(control) {
     if (state.socket?.readyState === WebSocket.OPEN && state.authenticated) {
       state.socket.send(JSON.stringify(control));
+      return true;
     }
+    return false;
   }
 
   function connect() {
@@ -143,6 +157,8 @@
     socket.binaryType = "arraybuffer";
     state.socket = socket;
     state.authenticated = false;
+    state.lastTerminalCols = null;
+    state.lastTerminalRows = null;
 
     socket.addEventListener("open", () => {
       setConnection("", "Authenticating", "");
@@ -153,7 +169,12 @@
       if (typeof event.data === "string") {
         handleControl(event.data);
       } else {
-        terminal.write(new Uint8Array(event.data));
+        const bytes = new Uint8Array(event.data);
+        if (replayBarrier.active) {
+          replayBarrier.write((done) => terminal.write(bytes, done));
+        } else {
+          terminal.write(bytes);
+        }
       }
     });
 
@@ -190,21 +211,21 @@
 
     switch (message.type) {
       case "replay_start":
+        state.focusAfterReplay = !state.authenticated;
         state.authenticated = true;
         state.reconnectAttempt = 0;
-        state.replaying = true;
+        replayBarrier.start();
         state.terminalTruncated = Boolean(message.truncated);
         terminal.reset();
         setConnection("connected", "Connected", "");
         elements.terminalLoading.classList.add("hidden");
         break;
       case "replay_end":
-        state.replaying = false;
-        fitTerminal();
-        terminal.focus();
+        replayBarrier.end();
         break;
       case "snapshot":
         traceBatch.replace(Array.isArray(message.traces) ? message.traces : []);
+        state.timelineNeedsFullRender = true;
         state.diagnostics = Array.isArray(message.diagnostics) ? message.diagnostics : [];
         state.activeRootTraceId = message.active_root_trace_id || null;
         state.traceTruncated = Boolean(message.trace_truncated);
@@ -212,8 +233,10 @@
         setSessionStatus(message.status, message.exit_code, message.message);
         renderAll();
         break;
-      case "trace":
-        if (message.event) appendTrace(message.event);
+      case "trace_batch":
+        if (Array.isArray(message.events)) {
+          for (const event of message.events) appendTrace(event);
+        }
         break;
       case "status":
         setSessionStatus(message.status, message.exit_code, message.message);
@@ -228,6 +251,7 @@
         break;
       case "trace_cleared":
         traceBatch.clear();
+        state.timelineNeedsFullRender = true;
         state.diagnostics = [];
         state.activeRootTraceId = null;
         state.traceTruncated = false;
@@ -246,7 +270,8 @@
       state.startedAt = Date.now();
       state.activeRootTraceId = null;
       renderHeader();
-      if (!state.replaying) terminal.reset();
+      refreshRootDividers();
+      if (!replayBarrier.active) terminal.reset();
     } else if (state.status === "running" && !state.startedAt) {
       state.startedAt = Date.now();
     }
@@ -304,28 +329,27 @@
   }
 
   function visibleEvents() {
+    return traceBatch.values().filter(eventIsVisible);
+  }
+
+  function eventIsVisible(event) {
+    const category = event.kind === "network" ? "network" : event.kind === "exec" ? "exec" : "file";
+    if (!state.filters.has(category)) return false;
+    if (event.kind === "file_close" && !elements.showCloses.checked) return false;
     const query = elements.traceSearch.value.trim().toLocaleLowerCase();
-    return traceBatch.values().filter((event) => {
-      const category = event.kind === "network" ? "network" : event.kind === "exec" ? "exec" : "file";
-      if (!state.filters.has(category)) return false;
-      if (event.kind === "file_close" && !elements.showCloses.checked) return false;
-      if (!query) return true;
-      return `${event.title} ${event.root_trace_id} ${JSON.stringify(event.detail)}`
-        .toLocaleLowerCase()
-        .includes(query);
-    });
+    if (!query) return true;
+    return `${event.title} ${event.root_trace_id} ${JSON.stringify(event.detail)}`
+      .toLocaleLowerCase()
+      .includes(query);
   }
 
   function renderTimeline() {
     const previousScrollTop = elements.timeline.scrollTop;
     const events = visibleEvents();
     const fragmentNode = document.createDocumentFragment();
+    state.timelineRows.clear();
     if (events.length === 0) {
-      const hasSourceEvents = traceBatch.size > 0;
-      elements.emptyState.querySelector("strong").textContent = hasSourceEvents ? "No events match these filters" : "Waiting for runtime activity";
-      elements.emptyState.querySelector("p").textContent = hasSourceEvents
-        ? "Adjust the event types, search text, or close-event toggle to reveal more activity."
-        : "Run a command in the terminal. Process execution, opened files, and network destinations will appear here.";
+      configureEmptyState();
       fragmentNode.append(elements.emptyState);
     } else {
       let previousRoot = null;
@@ -334,16 +358,87 @@
           fragmentNode.append(createRootDivider(event.root_trace_id));
           previousRoot = event.root_trace_id;
         }
-        fragmentNode.append(createEventRow(event));
+        const row = createEventRow(event);
+        state.timelineRows.set(eventKey(event), row);
+        fragmentNode.append(row);
       }
     }
     elements.timeline.replaceChildren(fragmentNode);
+    state.timelineNeedsFullRender = false;
     timelineFollow.restoreAfterRender(elements.timeline, state.timelineFollowing, previousScrollTop);
+  }
+
+  function appendTimeline({ appended, evictedKeys }) {
+    const previousScrollTop = elements.timeline.scrollTop;
+    for (const key of evictedKeys) {
+      state.timelineRows.get(key)?.remove();
+      state.timelineRows.delete(key);
+    }
+    removeEmptyRootDividers();
+
+    const fragmentNode = document.createDocumentFragment();
+    const lastRow = elements.timeline.lastElementChild;
+    let previousRoot = lastRow?.classList.contains("timeline-event")
+      ? lastRow.dataset.rootTraceId
+      : null;
+    for (const event of appended) {
+      if (!eventIsVisible(event)) continue;
+      const key = eventKey(event);
+      const existing = state.timelineRows.get(key);
+      const row = createEventRow(event);
+      state.timelineRows.set(key, row);
+      if (existing?.isConnected) {
+        existing.replaceWith(row);
+        continue;
+      }
+      if (event.root_trace_id !== previousRoot) {
+        fragmentNode.append(createRootDivider(event.root_trace_id));
+        previousRoot = event.root_trace_id;
+      }
+      fragmentNode.append(row);
+    }
+
+    if (fragmentNode.childNodes.length > 0) {
+      if (elements.emptyState.isConnected) elements.timeline.replaceChildren();
+      elements.timeline.append(fragmentNode);
+    }
+    removeEmptyRootDividers();
+    if (state.timelineRows.size === 0) {
+      configureEmptyState();
+      elements.timeline.replaceChildren(elements.emptyState);
+    }
+    refreshRootDividers();
+    timelineFollow.restoreAfterRender(elements.timeline, state.timelineFollowing, previousScrollTop);
+  }
+
+  function configureEmptyState() {
+    const hasSourceEvents = traceBatch.size > 0;
+    elements.emptyState.querySelector("strong").textContent = hasSourceEvents ? "No events match these filters" : "Waiting for runtime activity";
+    elements.emptyState.querySelector("p").textContent = hasSourceEvents
+      ? "Adjust the event types, search text, or close-event toggle to reveal more activity."
+      : "Run a command in the terminal. Process execution, opened files, and network destinations will appear here.";
+  }
+
+  function removeEmptyRootDividers() {
+    for (const divider of elements.timeline.querySelectorAll(".root-divider")) {
+      const next = divider.nextElementSibling;
+      if (!next || next.classList.contains("root-divider")) divider.remove();
+    }
+  }
+
+  function refreshRootDividers() {
+    for (const divider of elements.timeline.querySelectorAll(".root-divider")) {
+      const rootTraceId = divider.dataset.rootTraceId;
+      const active = rootTraceId === state.activeRootTraceId;
+      divider.classList.toggle("active-root", active);
+      divider.textContent = active ? `Active · ${rootTraceId}` : `Trace · ${rootTraceId}`;
+    }
   }
 
   function createRootDivider(rootTraceId) {
     const divider = document.createElement("div");
     divider.className = "root-divider";
+    divider.dataset.rootTraceId = rootTraceId;
     if (rootTraceId === state.activeRootTraceId) divider.classList.add("active-root");
     divider.textContent = rootTraceId === state.activeRootTraceId ? `Active · ${rootTraceId}` : `Trace · ${rootTraceId}`;
     divider.title = rootTraceId;
@@ -355,6 +450,7 @@
     row.type = "button";
     row.className = "timeline-event";
     row.dataset.eventKey = eventKey(event);
+    row.dataset.rootTraceId = event.root_trace_id;
     if (row.dataset.eventKey === state.selectedKey) row.classList.add("selected");
 
     const badge = document.createElement("span");
@@ -435,7 +531,7 @@
       elements.detailFields.append(term, definition);
     }
     elements.detailRaw.textContent = JSON.stringify(event.detail, null, 2);
-    traceBatch.flush();
+    updateTimelineSelection();
   }
 
   function displayValue(value) {
@@ -447,7 +543,13 @@
   function closeDetail() {
     state.selectedKey = null;
     elements.detailPanel.classList.add("hidden");
-    traceBatch.flush();
+    updateTimelineSelection();
+  }
+
+  function updateTimelineSelection() {
+    for (const [key, row] of state.timelineRows) {
+      row.classList.toggle("selected", key === state.selectedKey);
+    }
   }
 
   function fitTerminal() {
@@ -456,26 +558,46 @@
       const cols = Math.max(2, Math.min(500, terminal.cols));
       const rows = Math.max(2, Math.min(500, terminal.rows));
       elements.terminalSize.textContent = `${cols} × ${rows}`;
-      sendControl({ type: "resize", cols, rows });
+      if (cols === state.lastTerminalCols && rows === state.lastTerminalRows) return;
+      if (sendControl({ type: "resize", cols, rows })) {
+        state.lastTerminalCols = cols;
+        state.lastTerminalRows = rows;
+      }
     } catch (_error) {
       // The fit addon can run before the panel receives dimensions during page startup.
     }
   }
 
+  function scheduleTerminalFit() {
+    if (state.resizeFrame !== null) return;
+    state.resizeFrame = window.requestAnimationFrame(() => {
+      state.resizeFrame = null;
+      fitTerminal();
+    });
+  }
+
   terminal.onData((data) => {
-    if (state.socket?.readyState === WebSocket.OPEN && state.authenticated) {
+    if (terminalInput.canForward(
+      state.authenticated,
+      replayBarrier.active,
+      state.socket?.readyState === WebSocket.OPEN,
+    )) {
       state.socket.send(textEncoder.encode(data));
     }
   });
 
   terminal.onBinary((data) => {
-    if (state.socket?.readyState !== WebSocket.OPEN || !state.authenticated) return;
+    if (!terminalInput.canForward(
+      state.authenticated,
+      replayBarrier.active,
+      state.socket?.readyState === WebSocket.OPEN,
+    )) return;
     const bytes = new Uint8Array(data.length);
     for (let index = 0; index < data.length; index += 1) bytes[index] = data.charCodeAt(index) & 255;
     state.socket.send(bytes);
   });
 
-  const resizeObserver = new ResizeObserver(() => window.requestAnimationFrame(fitTerminal));
+  const resizeObserver = new ResizeObserver(scheduleTerminalFit);
   resizeObserver.observe(elements.terminalHost);
 
   elements.timeline.addEventListener("scroll", () => {
@@ -488,12 +610,19 @@
       if (state.filters.has(filter)) state.filters.delete(filter);
       else state.filters.add(filter);
       button.classList.toggle("active", state.filters.has(filter));
+      state.timelineNeedsFullRender = true;
       traceBatch.flush();
     });
   });
 
-  elements.traceSearch.addEventListener("input", () => traceBatch.flush());
-  elements.showCloses.addEventListener("change", () => traceBatch.flush());
+  elements.traceSearch.addEventListener("input", () => {
+    state.timelineNeedsFullRender = true;
+    traceBatch.flush();
+  });
+  elements.showCloses.addEventListener("change", () => {
+    state.timelineNeedsFullRender = true;
+    traceBatch.flush();
+  });
   elements.closeDetail.addEventListener("click", closeDetail);
   elements.stopSession.addEventListener("click", () => sendControl({ type: "stop" }));
   elements.startSession.addEventListener("click", () => sendControl({ type: "start" }));

@@ -55,8 +55,8 @@ pub(super) enum ServerControl {
         exit_code: Option<i32>,
         message: Option<String>,
     },
-    Trace {
-        event: TraceEvent,
+    TraceBatch {
+        events: Vec<TraceEvent>,
     },
     Snapshot {
         traces: Vec<TraceEvent>,
@@ -214,6 +214,7 @@ mod tests {
             occurred_at: "now".to_string(),
             title: "/bin/echo hello".to_string(),
             detail: json!({ "pid": 42 }),
+            source_bytes: 1,
         };
         let messages = [
             ServerControl::Status {
@@ -221,8 +222,8 @@ mod tests {
                 exit_code: None,
                 message: None,
             },
-            ServerControl::Trace {
-                event: event.clone(),
+            ServerControl::TraceBatch {
+                events: vec![event.clone()],
             },
             ServerControl::Snapshot {
                 traces: vec![event],

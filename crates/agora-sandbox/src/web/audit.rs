@@ -9,6 +9,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 const MAX_LINE_BYTES: usize = 256 * 1024;
+const MAX_POLL_BYTES: usize = 1024 * 1024;
 const MARKER_BYTES: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -28,6 +29,8 @@ pub(super) struct TraceEvent {
     pub(super) occurred_at: String,
     pub(super) title: String,
     pub(super) detail: Value,
+    #[serde(skip)]
+    pub(super) source_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -126,6 +129,7 @@ pub(super) fn normalize_line(id: u64, line: &[u8]) -> Result<Option<TraceEvent>,
         occurred_at,
         title,
         detail,
+        source_bytes: line.len(),
     }))
 }
 
@@ -227,7 +231,9 @@ impl LogCursor {
 
         file.seek(SeekFrom::Start(self.offset))?;
         let mut appended = Vec::new();
-        file.read_to_end(&mut appended)?;
+        file.by_ref()
+            .take(MAX_POLL_BYTES as u64)
+            .read_to_end(&mut appended)?;
         self.offset += appended.len() as u64;
         self.marker = read_marker(&mut file, self.offset)?;
         self.consume(appended)
@@ -437,5 +443,29 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn cursor_reads_large_backlogs_in_bounded_chunks() {
+        const EXPECTED_MAX_POLL_BYTES: usize = 1024 * 1024;
+
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("sandbox.log");
+        let line = b"{\"message\":\"non-audit log record\"}\n";
+        let repeats = EXPECTED_MAX_POLL_BYTES / line.len() + 2_000;
+        let mut bytes = Vec::with_capacity(repeats * line.len());
+        for _ in 0..repeats {
+            bytes.extend_from_slice(line);
+        }
+        fs::write(&log, &bytes).unwrap();
+        let mut cursor = LogCursor::from_start(log);
+
+        assert!(cursor.poll().unwrap().is_empty());
+        let first_offset = cursor.offset;
+        assert!(first_offset <= EXPECTED_MAX_POLL_BYTES as u64);
+        assert!(first_offset < bytes.len() as u64);
+
+        assert!(cursor.poll().unwrap().is_empty());
+        assert!(cursor.offset > first_offset);
     }
 }

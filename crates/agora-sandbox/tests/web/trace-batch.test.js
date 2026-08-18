@@ -118,3 +118,22 @@ test("replace clear and immediate flush cancel stale scheduled work", () => {
   assert.deepEqual(batch.values(), []);
   assert.equal(flushes(), 1);
 });
+
+test("pending changes coalesce replacements and report bounded evictions", () => {
+  const timers = fakeTimers();
+  const { batch } = createBatch(timers, { maxEvents: 2 });
+
+  batch.append({ id: "one", value: 1 });
+  batch.append({ id: "two", value: 2 });
+  batch.append({ id: "two", value: 20 });
+  batch.append({ id: "three", value: 3 });
+
+  assert.deepEqual(batch.takeChanges(), {
+    appended: [
+      { id: "two", value: 20 },
+      { id: "three", value: 3 },
+    ],
+    evictedKeys: ["one"],
+  });
+  assert.deepEqual(batch.takeChanges(), { appended: [], evictedKeys: [] });
+});

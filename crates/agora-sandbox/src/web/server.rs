@@ -24,6 +24,7 @@ use tokio::sync::broadcast;
 
 const TERMINAL_REPLAY_LIMIT: usize = 1024 * 1024;
 const TRACE_LIMIT: usize = 5_000;
+const TRACE_BYTES_LIMIT: usize = 8 * 1024 * 1024;
 const DIAGNOSTIC_LIMIT: usize = 100;
 const HUB_CHANNEL_CAPACITY: usize = 256;
 const TAIL_INTERVAL: Duration = Duration::from_millis(100);
@@ -33,7 +34,7 @@ const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug)]
 pub(super) enum HubEvent {
     Terminal(Vec<u8>),
-    Trace(TraceEvent),
+    TraceBatch(Vec<TraceEvent>),
     Status {
         status: SessionStatus,
         exit_code: Option<i32>,
@@ -66,6 +67,7 @@ struct EventHubInner {
     sender: broadcast::Sender<HubEvent>,
     terminal_limit: usize,
     trace_limit: usize,
+    trace_bytes_limit: usize,
     diagnostic_limit: usize,
 }
 
@@ -73,6 +75,7 @@ struct HubState {
     terminal_replay: VecDeque<u8>,
     terminal_truncated: bool,
     traces: VecDeque<TraceEvent>,
+    trace_bytes: usize,
     trace_truncated: bool,
     diagnostics: VecDeque<String>,
     active_root_trace_id: Option<String>,
@@ -95,6 +98,7 @@ impl EventHub {
                     terminal_replay: VecDeque::new(),
                     terminal_truncated: false,
                     traces: VecDeque::new(),
+                    trace_bytes: 0,
                     trace_truncated: false,
                     diagnostics: VecDeque::new(),
                     active_root_trace_id: None,
@@ -106,6 +110,7 @@ impl EventHub {
                 sender,
                 terminal_limit,
                 trace_limit,
+                trace_bytes_limit: TRACE_BYTES_LIMIT,
                 diagnostic_limit,
             }),
         }
@@ -136,19 +141,47 @@ impl EventHub {
         let _ = self.inner.sender.send(HubEvent::Terminal(bytes.to_vec()));
     }
 
-    pub(super) fn push_trace(&self, mut event: TraceEvent) {
-        let mut state = self.lock_state();
-        event.id = state.next_trace_id;
-        state.next_trace_id = state.next_trace_id.saturating_add(1);
-        if state.active_root_trace_id.is_none() {
-            state.active_root_trace_id = Some(event.root_trace_id.clone());
+    pub(super) fn push_traces(&self, mut events: Vec<TraceEvent>) {
+        if events.is_empty() {
+            return;
         }
-        state.traces.push_back(event.clone());
-        while state.traces.len() > self.inner.trace_limit {
-            state.traces.pop_front();
+        let mut state = self.lock_state();
+        if state.active_root_trace_id.is_none() {
+            state.active_root_trace_id = Some(events[0].root_trace_id.clone());
+        }
+        let first_id = state.next_trace_id;
+        state.next_trace_id = state
+            .next_trace_id
+            .saturating_add(u64::try_from(events.len()).unwrap_or(u64::MAX));
+        let mut retained_bytes = events.iter().map(|event| event.source_bytes).sum::<usize>();
+        let mut dropped = 0;
+        while events.len().saturating_sub(dropped) > self.inner.trace_limit
+            || retained_bytes > self.inner.trace_bytes_limit
+        {
+            retained_bytes = retained_bytes.saturating_sub(events[dropped].source_bytes);
+            dropped += 1;
+        }
+        if dropped != 0 {
+            events.drain(..dropped);
             state.trace_truncated = true;
         }
-        let _ = self.inner.sender.send(HubEvent::Trace(event));
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = first_id
+                .saturating_add(u64::try_from(dropped.saturating_add(index)).unwrap_or(u64::MAX));
+            state.trace_bytes = state.trace_bytes.saturating_add(event.source_bytes);
+            state.traces.push_back(event.clone());
+        }
+        while state.traces.len() > self.inner.trace_limit
+            || state.trace_bytes > self.inner.trace_bytes_limit
+        {
+            if let Some(event) = state.traces.pop_front() {
+                state.trace_bytes = state.trace_bytes.saturating_sub(event.source_bytes);
+            }
+            state.trace_truncated = true;
+        }
+        if !events.is_empty() {
+            let _ = self.inner.sender.send(HubEvent::TraceBatch(events));
+        }
     }
 
     pub(super) fn push_diagnostic(&self, message: String) {
@@ -180,6 +213,7 @@ impl EventHub {
     pub(super) fn clear_trace(&self) {
         let mut state = self.lock_state();
         state.traces.clear();
+        state.trace_bytes = 0;
         state.trace_truncated = false;
         state.diagnostics.clear();
         state.active_root_trace_id = None;
@@ -235,12 +269,14 @@ impl TailWorker {
                 while !worker_stop.load(Ordering::Acquire) {
                     match cursor.poll() {
                         Ok(items) => {
+                            let mut events = Vec::new();
                             for item in items {
                                 match item {
-                                    CursorItem::Event(event) => hub.push_trace(event),
+                                    CursorItem::Event(event) => events.push(event),
                                     CursorItem::Diagnostic(message) => hub.push_diagnostic(message),
                                 }
                             }
+                            hub.push_traces(events);
                         }
                         Err(error) => {
                             hub.push_diagnostic(format!("audit log tail failed: {error}"))
@@ -557,7 +593,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if send_replay_sink(&mut sender, &state.hub.snapshot()).await.is_err() {
+                        let snapshot = recover_subscription(&state.hub, &mut events);
+                        if send_replay_sink(&mut sender, &snapshot).await.is_err() {
                             break;
                         }
                     }
@@ -573,6 +610,15 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             }
         }
     }
+}
+
+fn recover_subscription(
+    hub: &EventHub,
+    receiver: &mut broadcast::Receiver<HubEvent>,
+) -> HubSnapshot {
+    let (replacement, snapshot) = hub.subscribe_with_snapshot();
+    *receiver = replacement;
+    snapshot
 }
 
 fn handle_control(
@@ -630,7 +676,9 @@ async fn send_hub_event(sender: &mut SocketSink, event: HubEvent) -> Result<()> 
             .send(Message::Binary(bytes.into()))
             .await
             .context("failed to send terminal output"),
-        HubEvent::Trace(event) => send_control(sender, ServerControl::Trace { event }).await,
+        HubEvent::TraceBatch(events) => {
+            send_control(sender, ServerControl::TraceBatch { events }).await
+        }
         HubEvent::Status {
             status,
             exit_code,
@@ -772,10 +820,10 @@ mod access_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::super::audit::{TraceEvent, TraceKind};
+    use super::super::audit::{TraceEvent, TraceKind, normalize_line};
     use super::super::protocol::SessionStatus;
     use super::super::terminal::{TerminalSize, TerminalSpec};
-    use super::{EventHub, SessionManager};
+    use super::{EventHub, HUB_CHANNEL_CAPACITY, HubEvent, SessionManager, recover_subscription};
     use serde_json::json;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
@@ -790,6 +838,7 @@ mod tests {
             occurred_at: format!("t{id}"),
             title: title.to_string(),
             detail: json!({ "id": id }),
+            source_bytes: 1,
         }
     }
 
@@ -798,9 +847,11 @@ mod tests {
         let hub = EventHub::with_limits(5, 2, 2);
         hub.push_terminal(b"abc");
         hub.push_terminal(b"def");
-        hub.push_trace(event(1, "root-a", "one"));
-        hub.push_trace(event(2, "root-b", "two"));
-        hub.push_trace(event(3, "root-c", "three"));
+        hub.push_traces(vec![
+            event(1, "root-a", "one"),
+            event(2, "root-b", "two"),
+            event(3, "root-c", "three"),
+        ]);
         hub.push_diagnostic("first".to_string());
         hub.push_diagnostic("second".to_string());
         hub.push_diagnostic("third".to_string());
@@ -826,7 +877,7 @@ mod tests {
     fn clear_trace_does_not_clear_terminal_replay_or_status() {
         let hub = EventHub::with_limits(64, 4, 4);
         hub.push_terminal(b"terminal");
-        hub.push_trace(event(1, "root", "one"));
+        hub.push_traces(vec![event(1, "root", "one")]);
         hub.set_status(SessionStatus::Running, None, None);
 
         hub.clear_trace();
@@ -841,9 +892,9 @@ mod tests {
     #[test]
     fn hub_assigns_stable_event_ids_across_restarted_log_cursors() {
         let hub = EventHub::with_limits(64, 10, 4);
-        hub.push_trace(event(1, "first-root", "one"));
+        hub.push_traces(vec![event(1, "first-root", "one")]);
         hub.begin_session();
-        hub.push_trace(event(1, "second-root", "two"));
+        hub.push_traces(vec![event(1, "second-root", "two")]);
 
         assert_eq!(
             hub.snapshot()
@@ -853,6 +904,121 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2]
         );
+    }
+
+    #[test]
+    fn hub_publishes_trace_bursts_as_one_batch() {
+        let hub = EventHub::with_limits(64, 10, 4);
+        let (mut receiver, _) = hub.subscribe_with_snapshot();
+
+        hub.push_traces(vec![
+            event(1, "root", "one"),
+            event(2, "root", "two"),
+            event(3, "root", "three"),
+        ]);
+
+        let HubEvent::TraceBatch(events) = receiver.try_recv().unwrap() else {
+            panic!("trace burst was not published as one batch");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.id, event.title.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "one"), (2, "two"), (3, "three")]
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn hub_bounds_the_live_trace_batch_to_its_retained_limit() {
+        let hub = EventHub::with_limits(64, 2, 4);
+        let (mut receiver, _) = hub.subscribe_with_snapshot();
+
+        hub.push_traces(vec![
+            event(1, "root", "one"),
+            event(2, "root", "two"),
+            event(3, "root", "three"),
+        ]);
+
+        let HubEvent::TraceBatch(events) = receiver.try_recv().unwrap() else {
+            panic!("trace burst was not published as one batch");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.id, event.title.as_str()))
+                .collect::<Vec<_>>(),
+            [(2, "two"), (3, "three")]
+        );
+        assert!(hub.snapshot().trace_truncated);
+    }
+
+    #[test]
+    fn hub_bounds_retained_traces_by_source_bytes() {
+        const EXPECTED_TRACE_BYTES_LIMIT: usize = 8 * 1024 * 1024;
+
+        let argument = "x".repeat(220 * 1024);
+        let mut events = Vec::new();
+        for id in 1..=40 {
+            let line = serde_json::to_vec(&json!({
+                "audit": {
+                    "type": "process",
+                    "access_time": format!("t{id}"),
+                    "trace_id": "root",
+                    "pid": 1,
+                    "ppid": 0,
+                    "process_executable": "/bin/bash",
+                    "executable": "/bin/echo",
+                    "arguments": ["/bin/echo", argument],
+                    "current_dir": "/workspace",
+                    "operation": "execve"
+                }
+            }))
+            .unwrap();
+            events.push(normalize_line(id, &line).unwrap().unwrap());
+        }
+        let hub = EventHub::new();
+
+        hub.push_traces(events);
+        let snapshot = hub.snapshot();
+        let retained_bytes = snapshot
+            .traces
+            .iter()
+            .map(|event| serde_json::to_vec(&event.detail).unwrap().len())
+            .sum::<usize>();
+
+        assert!(retained_bytes <= EXPECTED_TRACE_BYTES_LIMIT);
+        assert!(snapshot.trace_truncated);
+    }
+
+    #[tokio::test]
+    async fn lag_recovery_discards_the_stale_receiver_backlog() {
+        let hub = EventHub::with_limits(HUB_CHANNEL_CAPACITY * 2, 10, 4);
+        let (mut receiver, _) = hub.subscribe_with_snapshot();
+        for byte in 0..=HUB_CHANNEL_CAPACITY {
+            hub.push_terminal(&[(byte & 0xff) as u8]);
+        }
+        assert!(matches!(
+            receiver.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+        ));
+
+        let snapshot = recover_subscription(&hub, &mut receiver);
+        assert_eq!(snapshot.terminal_replay.len(), HUB_CHANNEL_CAPACITY + 1);
+        hub.push_terminal(b"fresh");
+
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            HubEvent::Terminal(bytes) if bytes == b"fresh"
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     fn fake_sandbox(path: &std::path::Path) {
