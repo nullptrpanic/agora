@@ -1052,6 +1052,95 @@ fn tls_trust_bundles_are_stable_per_ca_and_isolated_between_cas() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn java_trust_store_contains_the_interception_ca_and_native_roots() {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    use std::os::unix::fs::PermissionsExt;
+
+    let root =
+        std::env::temp_dir().join(format!("agora-java-trust-store-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let certificate = root.join("ca.crt");
+    let private_key = root.join("ca.key");
+    crate::network::generate_tls_ca(&certificate, &private_key).unwrap();
+    let certificate_pem = std::fs::read(&certificate).unwrap();
+    let interception_ca = CertificateDer::pem_slice_iter(&certificate_pem)
+        .next()
+        .unwrap()
+        .unwrap();
+    let config = SandboxConfig::new(root.join("hook.dylib")).with_workdir(&root);
+
+    let store = config
+        .write_java_trust_store(&root, &certificate_pem)
+        .unwrap();
+    let certificates = read_jks_trusted_certificates(&store, "changeit");
+
+    assert_eq!(certificates.first().unwrap(), interception_ca.as_ref());
+    assert!(certificates.len() > 1);
+    assert_eq!(
+        store.metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+fn read_jks_trusted_certificates(path: &Path, password: &str) -> Vec<Vec<u8>> {
+    use std::io::{Cursor, Read};
+
+    fn read_u16(cursor: &mut Cursor<&[u8]>) -> u16 {
+        let mut bytes = [0_u8; 2];
+        cursor.read_exact(&mut bytes).unwrap();
+        u16::from_be_bytes(bytes)
+    }
+
+    fn read_u32(cursor: &mut Cursor<&[u8]>) -> u32 {
+        let mut bytes = [0_u8; 4];
+        cursor.read_exact(&mut bytes).unwrap();
+        u32::from_be_bytes(bytes)
+    }
+
+    fn read_i64(cursor: &mut Cursor<&[u8]>) -> i64 {
+        let mut bytes = [0_u8; 8];
+        cursor.read_exact(&mut bytes).unwrap();
+        i64::from_be_bytes(bytes)
+    }
+
+    fn read_utf(cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
+        let mut value = vec![0_u8; usize::from(read_u16(cursor))];
+        cursor.read_exact(&mut value).unwrap();
+        value
+    }
+
+    let encoded = std::fs::read(path).unwrap();
+    let (body, checksum) = encoded.split_at(encoded.len() - 20);
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+    for character in password.encode_utf16() {
+        digest.update(&character.to_be_bytes());
+    }
+    digest.update(b"Mighty Aphrodite");
+    digest.update(body);
+    assert_eq!(checksum, digest.finish().as_ref());
+
+    let mut cursor = Cursor::new(body);
+    assert_eq!(read_u32(&mut cursor), 0xfeed_feed);
+    assert_eq!(read_u32(&mut cursor), 2);
+    let entries = read_u32(&mut cursor);
+    let mut certificates = Vec::new();
+    for _ in 0..entries {
+        assert_eq!(read_u32(&mut cursor), 2);
+        assert!(!read_utf(&mut cursor).is_empty());
+        let _created_at = read_i64(&mut cursor);
+        assert_eq!(read_utf(&mut cursor), b"X.509");
+        let mut certificate = vec![0_u8; read_u32(&mut cursor) as usize];
+        cursor.read_exact(&mut certificate).unwrap();
+        certificates.push(certificate);
+    }
+    assert_eq!(cursor.position() as usize, body.len());
+    certificates
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn tls_trust_bundle_reports_directory_and_write_failures() {
     use std::os::unix::fs::PermissionsExt;
 

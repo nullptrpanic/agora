@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+pub(crate) mod client_trust;
 mod config;
 mod http_proxy;
 mod inspection;

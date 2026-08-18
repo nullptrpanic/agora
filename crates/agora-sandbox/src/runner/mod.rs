@@ -16,6 +16,11 @@ pub use crate::filesystem::FilesystemMode;
 use crate::filesystem::{
     EncryptedWorkspace, FilesystemWorkspace, KeyMigrationStage, broker::LocalController,
 };
+#[cfg(target_os = "macos")]
+use crate::network::client_trust::{
+    JAVA_TOOL_OPTIONS_ENVIRONMENT, JAVA_TRUST_STORE_ENVIRONMENT, encode_java_trust_store,
+    merged_java_tool_options,
+};
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
 pub use crate::nfs::SmbRemoteConfig;
 #[cfg(all(target_os = "macos", feature = "remote-smb"))]
@@ -36,6 +41,8 @@ use std::fmt;
 use std::fs::OpenOptions;
 #[cfg(target_os = "macos")]
 use std::io::Write;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "macos")]
@@ -95,10 +102,11 @@ const DEFAULT_NATIVE_PASSTHROUGH_ROOT: &str = "/dev";
 #[cfg(target_os = "macos")]
 const TLS_TRUST_BUNDLE_DIRECTORY: &str = "ca";
 #[cfg(target_os = "macos")]
-const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
+const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 6] = [
     "SSL_CERT_FILE",
     "CURL_CA_BUNDLE",
     "REQUESTS_CA_BUNDLE",
+    "PIP_CERT",
     "NODE_EXTRA_CA_CERTS",
     "GIT_SSL_CAINFO",
 ];
@@ -443,44 +451,93 @@ impl SandboxConfig {
             bundle.extend_from_slice(b"-----END CERTIFICATE-----\n");
         }
 
-        let mut fingerprint = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d_u128;
-        for byte in ca_certificate {
-            fingerprint ^= u128::from(*byte);
-            fingerprint = fingerprint.wrapping_mul(309_485_009_821_345_068_724_781_371);
-        }
-        let path = runtime_directory
-            .join(TLS_TRUST_BUNDLE_DIRECTORY)
-            .join(format!("trust-bundle-{fingerprint:032x}.crt"));
-        let parent = path
-            .parent()
-            .context("TLS client trust bundle path has no parent")?;
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create TLS client trust bundle directory {}",
-                parent.display()
-            )
-        })?;
-        let temporary = parent.join(format!(".trust-bundle-{}.tmp", Uuid::new_v4().simple()));
-        let written = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temporary)?;
-            file.write_all(&bundle)?;
-            file.flush()?;
-            std::fs::rename(&temporary, &path)?;
-            Ok::<_, std::io::Error>(())
-        })();
-        if let Err(error) = written {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error).with_context(|| {
-                format!("failed to write TLS client trust bundle {}", path.display())
-            });
-        }
-        path.canonicalize()
-            .context("failed to resolve TLS client trust bundle")
+        write_tls_trust_artifact(
+            runtime_directory,
+            "trust-bundle",
+            "crt",
+            ca_certificate,
+            &bundle,
+            "TLS client trust bundle",
+        )
     }
+
+    #[cfg(target_os = "macos")]
+    fn write_java_trust_store(
+        &self,
+        runtime_directory: &Path,
+        ca_certificate: &[u8],
+    ) -> Result<PathBuf> {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+
+        let mut certificates = CertificateDer::pem_slice_iter(ca_certificate)
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to parse TLS CA certificate for Java trust store")?;
+        if certificates.len() != 1 {
+            bail!("TLS CA certificate must contain exactly one certificate");
+        }
+        certificates.extend(
+            crate::network::native_root_certificates()
+                .context("failed to load native TLS roots for Java trust store")?,
+        );
+        let encoded =
+            encode_java_trust_store(certificates.iter().map(|certificate| certificate.as_ref()))?;
+
+        write_tls_trust_artifact(
+            runtime_directory,
+            "java-trust-store",
+            "jks",
+            ca_certificate,
+            &encoded,
+            "Java trust store",
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_tls_trust_artifact(
+    runtime_directory: &Path,
+    name: &str,
+    extension: &str,
+    ca_certificate: &[u8],
+    contents: &[u8],
+    description: &str,
+) -> Result<PathBuf> {
+    let mut fingerprint = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d_u128;
+    for byte in ca_certificate {
+        fingerprint ^= u128::from(*byte);
+        fingerprint = fingerprint.wrapping_mul(309_485_009_821_345_068_724_781_371);
+    }
+    let path = runtime_directory
+        .join(TLS_TRUST_BUNDLE_DIRECTORY)
+        .join(format!("{name}-{fingerprint:032x}.{extension}"));
+    let parent = path
+        .parent()
+        .with_context(|| format!("{description} path has no parent"))?;
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create {description} directory {}",
+            parent.display()
+        )
+    })?;
+    let temporary = parent.join(format!(".{name}-{}.tmp", Uuid::new_v4().simple()));
+    let written = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(contents)?;
+        file.flush()?;
+        std::fs::rename(&temporary, &path)?;
+        Ok::<_, std::io::Error>(())
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error)
+            .with_context(|| format!("failed to write {description} {}", path.display()));
+    }
+    path.canonicalize()
+        .with_context(|| format!("failed to resolve {description}"))
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {

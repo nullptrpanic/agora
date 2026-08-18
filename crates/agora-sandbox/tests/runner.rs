@@ -15,10 +15,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
-const TLS_TRUST_ENVIRONMENT: [&str; 5] = [
+const TLS_TRUST_ENVIRONMENT: [&str; 6] = [
     "SSL_CERT_FILE",
     "CURL_CA_BUNDLE",
     "REQUESTS_CA_BUNDLE",
+    "PIP_CERT",
     "NODE_EXTRA_CA_CERTS",
     "GIT_SSL_CAINFO",
 ];
@@ -2128,7 +2129,7 @@ fn records_tls_trust_environment() {
         .collect::<Vec<_>>();
     assert!(values.iter().all(|path| path == &values[0]));
     assert!(values[0].is_file());
-    assert!(!values[0].starts_with(private_workdir));
+    assert!(!values[0].starts_with(&private_workdir));
     assert!(
         values[0]
             .file_name()
@@ -2136,6 +2137,17 @@ fn records_tls_trust_environment() {
             .to_string_lossy()
             .starts_with("trust-bundle-")
     );
+    let java_options = std::env::var("JAVA_TOOL_OPTIONS").unwrap();
+    assert!(java_options.contains("-Xmx256m"));
+    let java_store = java_options
+        .split_ascii_whitespace()
+        .find_map(|option| option.strip_prefix("-Djavax.net.ssl.trustStore="))
+        .map(PathBuf::from)
+        .unwrap();
+    assert!(java_store.is_file());
+    assert!(!java_store.starts_with(&private_workdir));
+    assert!(java_options.contains("-Djavax.net.ssl.trustStoreType=JKS"));
+    assert!(java_options.contains("-Djavax.net.ssl.trustStorePassword=changeit"));
 }
 
 #[cfg(target_os = "macos")]
@@ -4152,7 +4164,9 @@ async fn runner_injects_the_configured_tls_ca_path() {
         private_workdir.display(),
         std::env::current_exe().unwrap().display()
     );
-    let command = SandboxCommand::new("/bin/bash").args(["-c", &script]);
+    let command = SandboxCommand::new("/bin/bash")
+        .args(["-c", &script])
+        .env("JAVA_TOOL_OPTIONS", "-Xmx256m");
 
     let outcome = Sandbox::new(config, NoopCallback)
         .run(command)

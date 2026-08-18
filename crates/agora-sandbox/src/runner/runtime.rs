@@ -22,6 +22,7 @@ impl ProtectedEnvironment {
                 FILESYSTEM_CIPHER_KEY.into(),
                 TLS_TRUST_ANCHOR_DER.into(),
                 TLS_TRUST_BUNDLE.into(),
+                JAVA_TRUST_STORE_ENVIRONMENT.into(),
             ],
         }
     }
@@ -177,7 +178,9 @@ impl SandboxRuntime {
                 })?;
                 let trust_bundle =
                     config.write_tls_trust_bundle(runtime_directory.path(), &certificate)?;
-                Ok::<_, anyhow::Error>((certificate, private_key, trust_bundle))
+                let java_trust_store =
+                    config.write_java_trust_store(runtime_directory.path(), &certificate)?;
+                Ok::<_, anyhow::Error>((certificate, private_key, trust_bundle, java_trust_store))
             })
             .transpose()?;
         let injected_libraries = injected_libraries(&hook_library)?;
@@ -258,7 +261,7 @@ impl SandboxRuntime {
         let upstream_tls_roots = config.upstream_tls_roots.clone();
         #[cfg(test)]
         let network_result = match (tls_ca.as_ref(), upstream_tls_roots) {
-            (Some((certificate, private_key, _)), Some(roots)) => {
+            (Some((certificate, private_key, _, _)), Some(roots)) => {
                 NetworkController::start_with_tls_ca_and_roots(
                     config.network,
                     context,
@@ -270,7 +273,7 @@ impl SandboxRuntime {
                 .await
             }
             (tls_ca, None) => match tls_ca {
-                Some((certificate, private_key, _)) => {
+                Some((certificate, private_key, _, _)) => {
                     NetworkController::start_with_tls_ca(
                         config.network,
                         context,
@@ -288,7 +291,7 @@ impl SandboxRuntime {
         };
         #[cfg(not(test))]
         let network_result = match tls_ca.as_ref() {
-            Some((certificate, private_key, _)) => {
+            Some((certificate, private_key, _, _)) => {
                 NetworkController::start_with_tls_ca(
                     config.network,
                     context,
@@ -378,11 +381,12 @@ impl SandboxRuntime {
                 base64::engine::general_purpose::STANDARD.encode(anchor),
             );
         }
-        if let Some((_, _, trust_bundle)) = &tls_ca {
+        if let Some((_, _, trust_bundle, java_trust_store)) = &tls_ca {
             environment.insert(TLS_TRUST_BUNDLE, trust_bundle);
             for key in TLS_CLIENT_TRUST_ENVIRONMENT {
                 environment.insert(key, trust_bundle);
             }
+            environment.insert(JAVA_TRUST_STORE_ENVIRONMENT, java_trust_store);
         }
         Ok(Self {
             filesystem,
@@ -528,6 +532,8 @@ pub(crate) struct RunningSandboxCommand {
 impl RunningSandboxCommand {
     pub(crate) fn spawn(mut command: SandboxCommand, launch: &PreparedLaunch) -> Result<Self> {
         let inherited_libraries = command.effective_environment("DYLD_INSERT_LIBRARIES");
+        let inherited_java_options = command.effective_environment(JAVA_TOOL_OPTIONS_ENVIRONMENT);
+        let inherited_java_store = command.effective_environment(JAVA_TRUST_STORE_ENVIRONMENT);
         command.apply_prepared(launch);
         let mut child = command.into_command();
         child
@@ -536,6 +542,22 @@ impl RunningSandboxCommand {
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
         launch.environment.apply(&mut child);
+        if let Some(java_store) = launch
+            .environment
+            .additions()
+            .get(OsStr::new(JAVA_TRUST_STORE_ENVIRONMENT))
+        {
+            let options = merged_java_tool_options(
+                inherited_java_options
+                    .as_deref()
+                    .map(std::os::unix::ffi::OsStrExt::as_bytes),
+                inherited_java_store
+                    .as_deref()
+                    .map(std::os::unix::ffi::OsStrExt::as_bytes),
+                java_store.as_os_str().as_bytes(),
+            );
+            child.env(JAVA_TOOL_OPTIONS_ENVIRONMENT, OsString::from_vec(options));
+        }
         if let Some(inherited) = inherited_libraries {
             let base = launch
                 .environment

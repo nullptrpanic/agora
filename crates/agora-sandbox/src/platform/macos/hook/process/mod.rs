@@ -12,6 +12,7 @@ use crate::execution::{
     DEFAULT_EXECUTABLE_PATH, PrepareResponse, encode_prepare_request, resolve_shebang,
 };
 use crate::ipc::InheritedControlStream;
+use crate::network::client_trust::{JAVA_TOOL_OPTIONS_ENVIRONMENT, merged_java_tool_options};
 use crate::trace::TraceContext;
 use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -373,10 +374,21 @@ impl ChildEnvironment {
         remote_current_directory: Option<&Path>,
     ) -> Option<Self> {
         let mut values = Vec::new();
+        let mut java_tool_options = None;
         if !environment.is_null() {
             let mut current = environment;
             while !(unsafe { *current }).is_null() {
                 let value = unsafe { CStr::from_ptr(*current) }.to_bytes();
+                if config.java_trust_store().is_some()
+                    && Self::has_key(value, JAVA_TOOL_OPTIONS_ENVIRONMENT)
+                {
+                    java_tool_options = value
+                        .strip_prefix(JAVA_TOOL_OPTIONS_ENVIRONMENT.as_bytes())
+                        .and_then(|value| value.strip_prefix(b"="))
+                        .map(<[u8]>::to_vec);
+                    current = unsafe { current.add(1) };
+                    continue;
+                }
                 if !CHILD_RUNTIME_ENVIRONMENT
                     .iter()
                     .any(|key| Self::has_key(value, key))
@@ -392,6 +404,19 @@ impl ChildEnvironment {
             entry.extend_from_slice(key.as_bytes());
             entry.push(b'=');
             entry.extend_from_slice(value.as_bytes());
+            values.push(CString::new(entry).ok()?);
+        }
+        if let Some(java_store) = config.java_trust_store() {
+            let options = merged_java_tool_options(
+                java_tool_options.as_deref(),
+                Some(java_store.as_bytes()),
+                java_store.as_bytes(),
+            );
+            let mut entry =
+                Vec::with_capacity(JAVA_TOOL_OPTIONS_ENVIRONMENT.len() + 1 + options.len());
+            entry.extend_from_slice(JAVA_TOOL_OPTIONS_ENVIRONMENT.as_bytes());
+            entry.push(b'=');
+            entry.extend_from_slice(&options);
             values.push(CString::new(entry).ok()?);
         }
         for (key, value) in super::control::child_environment() {

@@ -1,3 +1,4 @@
+use crate::network::client_trust::JAVA_TRUST_STORE_ENVIRONMENT;
 use crate::trace::{TRACE_ID_ENVIRONMENT, TraceContext};
 use base64::Engine;
 use std::net::{IpAddr, SocketAddr};
@@ -33,15 +34,16 @@ pub(super) const REMOTE_CURRENT_DIRECTORY: &str = "AGORA_SANDBOX_REMOTE_CURRENT_
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
 const TLS_TRUST_BUNDLE: &str = "AGORA_SANDBOX_TLS_TRUST_BUNDLE";
 
-const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
+const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 6] = [
     "SSL_CERT_FILE",
     "CURL_CA_BUNDLE",
     "REQUESTS_CA_BUNDLE",
+    "PIP_CERT",
     "NODE_EXTRA_CA_CERTS",
     "GIT_SSL_CAINFO",
 ];
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 32] = [
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 34] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
@@ -68,12 +70,14 @@ pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 32] = [
     REMOTE_CURRENT_DIRECTORY,
     TLS_TRUST_ANCHOR_DER,
     TLS_TRUST_BUNDLE,
+    JAVA_TRUST_STORE_ENVIRONMENT,
     TRACE_ID_ENVIRONMENT,
     TLS_CLIENT_TRUST_ENVIRONMENT[0],
     TLS_CLIENT_TRUST_ENVIRONMENT[1],
     TLS_CLIENT_TRUST_ENVIRONMENT[2],
     TLS_CLIENT_TRUST_ENVIRONMENT[3],
     TLS_CLIENT_TRUST_ENVIRONMENT[4],
+    TLS_CLIENT_TRUST_ENVIRONMENT[5],
 ];
 
 #[derive(Clone, Debug)]
@@ -97,6 +101,7 @@ pub(super) struct HookConfig {
     remote_current_directory: Option<PathBuf>,
     tls_trust_anchor_der: Option<String>,
     tls_trust_bundle: Option<String>,
+    java_trust_store: Option<String>,
     trace: TraceContext,
     #[cfg(any(agora_sandbox_hook_build, test, coverage))]
     inherited_control_descriptors: InheritedControlDescriptors,
@@ -246,6 +251,7 @@ impl HookConfig {
         }
         let tls_trust_anchor_der = get(TLS_TRUST_ANCHOR_DER).filter(|value| !value.is_empty());
         let tls_trust_bundle = get(TLS_TRUST_BUNDLE).filter(|value| !value.is_empty());
+        let java_trust_store = get(JAVA_TRUST_STORE_ENVIRONMENT).filter(|value| !value.is_empty());
         let trace = TraceContext::parse(&Self::required(&mut get, TRACE_ID_ENVIRONMENT)?)
             .map_err(|error| format!("invalid {TRACE_ID_ENVIRONMENT}: {error}"))?;
         if !proxy_ipv4.ip().is_loopback() || !matches!(proxy_ipv4.ip(), IpAddr::V4(_)) {
@@ -283,6 +289,7 @@ impl HookConfig {
             remote_current_directory,
             tls_trust_anchor_der,
             tls_trust_bundle,
+            java_trust_store,
             trace,
             #[cfg(any(agora_sandbox_hook_build, test, coverage))]
             inherited_control_descriptors,
@@ -380,6 +387,10 @@ impl HookConfig {
         self.tls_trust_bundle.as_deref()
     }
 
+    pub(super) fn java_trust_store(&self) -> Option<&str> {
+        self.java_trust_store.as_deref()
+    }
+
     pub(super) fn trace(&self) -> &TraceContext {
         &self.trace
     }
@@ -442,6 +453,9 @@ impl HookConfig {
                     .into_iter()
                     .map(|key| (key, bundle.clone())),
             );
+        }
+        if let Some(store) = &self.java_trust_store {
+            environment.push((JAVA_TRUST_STORE_ENVIRONMENT, store.clone()));
         }
         environment
     }
