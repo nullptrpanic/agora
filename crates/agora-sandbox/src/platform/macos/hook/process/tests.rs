@@ -10,6 +10,7 @@ use crate::audit::AuditEventRequest;
 use crate::callback::ProcessOperation;
 use crate::execution::{EXECUTION_PROTOCOL_VERSION, decode_prepare_request};
 use crate::ipc::{InheritedControlLock, InheritedControlStream};
+use crate::network::client_trust::merged_java_tool_options;
 use crate::platform::hook::config::HookConfig;
 use crate::trace::TraceContext;
 use std::cell::Cell;
@@ -81,6 +82,10 @@ fn config_with_tls_bundle() -> HookConfig {
         (
             "AGORA_SANDBOX_TLS_TRUST_BUNDLE",
             "/tmp/agora-ca.pem".to_string(),
+        ),
+        (
+            "AGORA_SANDBOX_JAVA_TRUST_STORE",
+            "/tmp/agora-ca.jks".to_string(),
         ),
     ]);
     HookConfig::from_getter(|key| values.get(key).cloned()).unwrap()
@@ -393,8 +398,131 @@ fn child_environment_restores_tls_trust_after_the_caller_clears_it() {
     assert!(entries.contains(&"SSL_CERT_FILE=/tmp/agora-ca.pem"));
     assert!(entries.contains(&"CURL_CA_BUNDLE=/tmp/agora-ca.pem"));
     assert!(entries.contains(&"REQUESTS_CA_BUNDLE=/tmp/agora-ca.pem"));
+    assert!(entries.contains(&"PIP_CERT=/tmp/agora-ca.pem"));
     assert!(entries.contains(&"NODE_EXTRA_CA_CERTS=/tmp/agora-ca.pem"));
     assert!(entries.contains(&"GIT_SSL_CAINFO=/tmp/agora-ca.pem"));
+}
+
+#[test]
+fn child_environment_adds_java_trust_without_discarding_other_options() {
+    let options = CString::new("JAVA_TOOL_OPTIONS=-Xmx256m -Duser.language=en").unwrap();
+    let values = [options.as_ptr(), std::ptr::null()];
+
+    let environment = unsafe {
+        ChildEnvironment::new(
+            values.as_ptr(),
+            &config_with_tls_bundle(),
+            &child_trace(),
+            None,
+        )
+    }
+    .unwrap();
+    let entries = environment
+        .values
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert!(entries.contains(&concat!(
+        "JAVA_TOOL_OPTIONS=-Xmx256m -Duser.language=en ",
+        "-Djavax.net.ssl.trustStore=/tmp/agora-ca.jks ",
+        "-Djavax.net.ssl.trustStoreType=JKS ",
+        "-Djavax.net.ssl.trustStorePassword=changeit"
+    )));
+}
+
+#[test]
+fn child_environment_preserves_an_explicit_java_trust_store() {
+    let options = CString::new(concat!(
+        "JAVA_TOOL_OPTIONS=-Xmx256m ",
+        "-Djavax.net.ssl.trustStore=/tmp/application.jks"
+    ))
+    .unwrap();
+    let values = [options.as_ptr(), std::ptr::null()];
+
+    let environment = unsafe {
+        ChildEnvironment::new(
+            values.as_ptr(),
+            &config_with_tls_bundle(),
+            &child_trace(),
+            None,
+        )
+    }
+    .unwrap();
+    let entries = environment
+        .values
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert!(entries.contains(&concat!(
+        "JAVA_TOOL_OPTIONS=-Xmx256m ",
+        "-Djavax.net.ssl.trustStore=/tmp/application.jks"
+    )));
+    let java_options = entries
+        .iter()
+        .find(|entry| entry.starts_with("JAVA_TOOL_OPTIONS="))
+        .unwrap();
+    assert!(!java_options.contains("/tmp/agora-ca.jks"));
+}
+
+#[test]
+fn child_environment_preserves_a_quoted_explicit_java_trust_store() {
+    let options = CString::new(concat!(
+        "JAVA_TOOL_OPTIONS=-Xmx256m ",
+        "-Djavax.net.ssl.trustStore=\"/tmp/application trust.jks\""
+    ))
+    .unwrap();
+    let values = [options.as_ptr(), std::ptr::null()];
+
+    let environment = unsafe {
+        ChildEnvironment::new(
+            values.as_ptr(),
+            &config_with_tls_bundle(),
+            &child_trace(),
+            None,
+        )
+    }
+    .unwrap();
+    let java_options = environment
+        .values
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .find(|entry| entry.starts_with("JAVA_TOOL_OPTIONS="))
+        .unwrap();
+
+    assert_eq!(java_options, options.to_str().unwrap());
+    assert!(!java_options.contains("/tmp/agora-ca.jks"));
+}
+
+#[test]
+fn java_trust_merge_respects_the_last_effective_store() {
+    let options = concat!(
+        "-Djavax.net.ssl.trustStore=/tmp/old-agora.jks ",
+        "-Djavax.net.ssl.trustStore=/tmp/application.jks"
+    );
+
+    assert_eq!(
+        merged_java_tool_options(
+            Some(options.as_bytes()),
+            Some(b"/tmp/old-agora.jks"),
+            b"/tmp/new-agora.jks",
+        ),
+        options.as_bytes()
+    );
+}
+
+#[test]
+fn java_trust_merge_quotes_a_managed_store_with_spaces() {
+    assert_eq!(
+        merged_java_tool_options(None, None, b"/tmp/agora trust/store.jks"),
+        concat!(
+            "-Djavax.net.ssl.trustStore=\"/tmp/agora trust/store.jks\" ",
+            "-Djavax.net.ssl.trustStoreType=JKS ",
+            "-Djavax.net.ssl.trustStorePassword=changeit"
+        )
+        .as_bytes()
+    );
 }
 
 #[test]

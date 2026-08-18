@@ -92,14 +92,14 @@ impl SpawnFileActions {
             });
         }
 
-        let mut descriptors = if file_actions.is_null() {
-            super::control::inheritable_descriptors()
-        } else {
-            Vec::new()
-        };
-        descriptors.extend(super::filesystem::inheritable_internal_descriptors());
-        descriptors.sort_unstable();
-        descriptors.dedup();
+        // Caller-owned actions have already received Agora's inherit actions
+        // from the interposed initializer. Appending them here would place an
+        // inherit after a caller close/dup2 action and make native spawn fail
+        // with EBADF. Only actions allocated here can be populated safely.
+        let descriptors = file_actions
+            .is_null()
+            .then(inheritable_spawn_descriptors)
+            .unwrap_or_default();
         if descriptors.is_empty() {
             return Ok(Self {
                 borrowed: file_actions,
@@ -161,7 +161,10 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn_file_actions_init(
     if result != 0 || !super::initialized() {
         return result;
     }
-    for descriptor in super::control::inheritable_descriptors() {
+    // Prefix the hidden-descriptor actions before the caller appends close,
+    // dup2, or open actions. The caller can then deliberately replace one of
+    // those descriptors without a trailing addinherit_np resurrecting it.
+    for descriptor in inheritable_spawn_descriptors() {
         let result = unsafe { posix_spawn_file_actions_addinherit_np(actions, descriptor) };
         if result != 0 {
             unsafe { libc::posix_spawn_file_actions_destroy(actions) };
@@ -169,6 +172,14 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn_file_actions_init(
         }
     }
     0
+}
+
+fn inheritable_spawn_descriptors() -> Vec<libc::c_int> {
+    let mut descriptors = super::control::inheritable_descriptors();
+    descriptors.extend(super::filesystem::inheritable_internal_descriptors());
+    descriptors.sort_unstable();
+    descriptors.dedup();
+    descriptors
 }
 
 impl Drop for SpawnFileActions {
@@ -364,6 +375,7 @@ impl ChildArguments {
 struct ChildEnvironment {
     values: Vec<CString>,
     pointers: Vec<*mut libc::c_char>,
+    inherited_local_handles: Vec<String>,
 }
 
 impl ChildEnvironment {
@@ -422,8 +434,16 @@ impl ChildEnvironment {
         for (key, value) in super::control::child_environment() {
             values.push(CString::new(format!("{key}={value}")).ok()?);
         }
-        if let Some(descriptors) = super::filesystem::inherited_local_descriptors() {
-            values.push(CString::new(format!("{INHERITED_LOCAL_DESCRIPTORS}={descriptors}")).ok()?);
+        let mut inherited_local_handles = Vec::new();
+        if let Some(inherited) = super::filesystem::inherited_local_descriptors() {
+            inherited_local_handles = inherited.handles;
+            values.push(
+                CString::new(format!(
+                    "{INHERITED_LOCAL_DESCRIPTORS}={}",
+                    inherited.encoded
+                ))
+                .ok()?,
+            );
         }
         if let Some(directory) = remote_current_directory {
             let mut entry = Vec::with_capacity(
@@ -441,7 +461,11 @@ impl ChildEnvironment {
             .map(|value| value.as_ptr().cast_mut())
             .collect::<Vec<_>>();
         pointers.push(std::ptr::null_mut());
-        Some(Self { values, pointers })
+        Some(Self {
+            values,
+            pointers,
+            inherited_local_handles,
+        })
     }
 
     fn as_posix_ptr(&self) -> *const *mut libc::c_char {
@@ -837,8 +861,14 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
         Ok(file_actions) => file_actions,
         Err(error) => return error,
     };
+    let retained = match super::filesystem::retain_local_files_for_spawn(
+        environment.inherited_local_handles.clone(),
+    ) {
+        Ok(retained) => retained,
+        Err(error) => return PrepareError::from_anyhow(error, libc::EIO).errno,
+    };
     drop(guard);
-    unsafe {
+    let result = unsafe {
         original(
             pid,
             prepared.program.as_ptr(),
@@ -847,6 +877,14 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
             arguments.as_posix_ptr(),
             environment.as_posix_ptr(),
         )
+    };
+    if result == 0 {
+        retained.commit();
+        return 0;
+    }
+    match retained.rollback() {
+        Ok(()) => result,
+        Err(error) => PrepareError::from_anyhow(error, libc::EIO).errno,
     }
 }
 
@@ -902,8 +940,14 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
         Ok(file_actions) => file_actions,
         Err(error) => return error,
     };
+    let retained = match super::filesystem::retain_local_files_for_spawn(
+        environment.inherited_local_handles.clone(),
+    ) {
+        Ok(retained) => retained,
+        Err(error) => return PrepareError::from_anyhow(error, libc::EIO).errno,
+    };
     drop(guard);
-    unsafe {
+    let result = unsafe {
         original(
             pid,
             prepared.program.as_ptr(),
@@ -912,6 +956,14 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
             arguments.as_posix_ptr(),
             environment.as_posix_ptr(),
         )
+    };
+    if result == 0 {
+        retained.commit();
+        return 0;
+    }
+    match retained.rollback() {
+        Ok(()) => result,
+        Err(error) => PrepareError::from_anyhow(error, libc::EIO).errno,
     }
 }
 

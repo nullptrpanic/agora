@@ -581,8 +581,14 @@ fn close_transition_keeps_managed_mmap_on_the_coordinated_path() {
     let path = Fixture::c_path(&logical);
 
     with_test_runtime(&fixture.runtime, || unsafe {
-        let descriptor = agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
-        assert!(descriptor >= 0);
+        let opened = agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(opened >= 0);
+        // A concurrently running test can otherwise reuse a just-closed low
+        // descriptor before native mmap observes it, changing EBADF to EINVAL.
+        let descriptor =
+            super::super::agora_sandbox_fcntl_shim(opened, libc::F_DUPFD_CLOEXEC, 60_000);
+        assert!(descriptor >= 60_000);
+        assert_eq!(agora_sandbox_close(opened), 0);
         fixture
             .runtime
             .memory_index

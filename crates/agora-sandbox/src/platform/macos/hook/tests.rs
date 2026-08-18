@@ -157,12 +157,14 @@ fn hook_configuration_propagates_an_optional_tls_trust_anchor() {
         ("AGORA_SANDBOX_TRACE_ID", "trace-root"),
         ("AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER", "Y2VydGlmaWNhdGU="),
         ("AGORA_SANDBOX_TLS_TRUST_BUNDLE", "/tmp/agora-ca.pem"),
+        ("AGORA_SANDBOX_JAVA_TRUST_STORE", "/tmp/agora-ca.jks"),
     ]);
 
     let config = HookConfig::from_getter(|key| values.get(key).map(ToString::to_string)).unwrap();
 
     assert_eq!(config.tls_trust_anchor_der(), Some("Y2VydGlmaWNhdGU="));
     assert_eq!(config.tls_trust_bundle(), Some("/tmp/agora-ca.pem"));
+    assert_eq!(config.java_trust_store(), Some("/tmp/agora-ca.jks"));
     assert!(config.child_environment().contains(&(
         "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER",
         "Y2VydGlmaWNhdGU=".to_string()
@@ -171,6 +173,7 @@ fn hook_configuration_propagates_an_optional_tls_trust_anchor() {
         "SSL_CERT_FILE",
         "CURL_CA_BUNDLE",
         "REQUESTS_CA_BUNDLE",
+        "PIP_CERT",
         "NODE_EXTRA_CA_CERTS",
         "GIT_SSL_CAINFO",
     ] {

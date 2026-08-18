@@ -117,6 +117,37 @@ async fn broker_runtime(directory: &Path) -> (FilesystemHookRuntime, LocalContro
     (runtime, controller)
 }
 
+unsafe fn duplicate_inherited_local_descriptors(encoded: &str) -> InheritedLocalDescriptors {
+    let mut inherited = serde_json::from_str::<InheritedLocalDescriptors>(encoded).unwrap();
+    let mut state_descriptors = HashMap::new();
+    let mut lock_descriptors = HashMap::new();
+    for inherited in &mut inherited.descriptors {
+        inherited.descriptor = unsafe { libc::fcntl(inherited.descriptor, libc::F_DUPFD, 0) };
+        assert!(inherited.descriptor >= 0);
+        inherited.state_descriptor = *state_descriptors
+            .entry(inherited.state_descriptor)
+            .or_insert_with(|| unsafe {
+                libc::fcntl(inherited.state_descriptor, libc::F_DUPFD, 0)
+            });
+        inherited.lock_descriptor = *lock_descriptors
+            .entry(inherited.lock_descriptor)
+            .or_insert_with(|| unsafe { libc::fcntl(inherited.lock_descriptor, libc::F_DUPFD, 0) });
+        assert!(inherited.state_descriptor >= 0);
+        assert!(inherited.lock_descriptor >= 0);
+    }
+    inherited
+}
+
+fn descriptor_is_open(descriptor: libc::c_int) -> bool {
+    unsafe { libc::fcntl(descriptor, libc::F_GETFD) >= 0 }
+}
+
+fn close_if_open(descriptor: libc::c_int) {
+    if descriptor_is_open(descriptor) {
+        unsafe { libc::close(descriptor) };
+    }
+}
+
 #[test]
 fn lazy_read_ranges_apply_bounded_readahead_and_conservative_sendfile_fallbacks() {
     assert_eq!(read_materialization_length(1), 16 * 1024);
@@ -1334,7 +1365,8 @@ async fn inherited_local_descriptors_restore_aliases_and_shared_offsets() {
         set_descriptor_close_on_exec(alias, false).unwrap();
         let open = runtime.tracked_open(descriptor).unwrap();
         runtime.refresh_local_state_inheritance(&open);
-        let encoded = runtime.encode_inherited_local_descriptors().unwrap();
+        let inherited = runtime.encode_inherited_local_descriptors().unwrap();
+        let encoded = inherited.encoded;
         assert_eq!(
             serde_json::from_str::<InheritedLocalDescriptors>(&encoded)
                 .unwrap()
@@ -1347,23 +1379,7 @@ async fn inherited_local_descriptors_restore_aliases_and_shared_offsets() {
 
     let retained = runtime.retain_local_files_before_fork().unwrap();
     assert_eq!(retained.len(), 1);
-    let mut inherited = serde_json::from_str::<InheritedLocalDescriptors>(&encoded).unwrap();
-    let mut state_descriptors = HashMap::new();
-    let mut lock_descriptors = HashMap::new();
-    for inherited in &mut inherited.descriptors {
-        inherited.descriptor = unsafe { libc::fcntl(inherited.descriptor, libc::F_DUPFD, 0) };
-        assert!(inherited.descriptor >= 0);
-        inherited.state_descriptor = *state_descriptors
-            .entry(inherited.state_descriptor)
-            .or_insert_with(|| unsafe {
-                libc::fcntl(inherited.state_descriptor, libc::F_DUPFD, 0)
-            });
-        inherited.lock_descriptor = *lock_descriptors
-            .entry(inherited.lock_descriptor)
-            .or_insert_with(|| unsafe { libc::fcntl(inherited.lock_descriptor, libc::F_DUPFD, 0) });
-        assert!(inherited.state_descriptor >= 0);
-        assert!(inherited.lock_descriptor >= 0);
-    }
+    let inherited = unsafe { duplicate_inherited_local_descriptors(&encoded) };
     let restored_descriptors = inherited
         .descriptors
         .iter()
@@ -1378,13 +1394,18 @@ async fn inherited_local_descriptors_restore_aliases_and_shared_offsets() {
     )
     .unwrap();
     restored.local = runtime.local.clone();
-    restored.restore_inherited_local_descriptors(None);
-    restored.restore_inherited_local_descriptors(Some("not-json"));
+    restored.restore_inherited_local_descriptors(None).unwrap();
+    restored
+        .restore_inherited_local_descriptors(Some("not-json"))
+        .unwrap();
     let mut wrong_version = serde_json::from_str::<InheritedLocalDescriptors>(&inherited).unwrap();
     wrong_version.version = INHERITED_LOCAL_DESCRIPTOR_VERSION + 1;
     restored
-        .restore_inherited_local_descriptors(Some(&serde_json::to_string(&wrong_version).unwrap()));
-    restored.restore_inherited_local_descriptors(Some(&inherited));
+        .restore_inherited_local_descriptors(Some(&serde_json::to_string(&wrong_version).unwrap()))
+        .unwrap();
+    restored
+        .restore_inherited_local_descriptors(Some(&inherited))
+        .unwrap();
     assert_eq!(lock(&restored.open_files).len(), 2);
     assert!(Arc::ptr_eq(
         &restored.tracked_open(restored_descriptors[0]).unwrap(),
@@ -1427,4 +1448,216 @@ async fn inherited_local_descriptors_restore_aliases_and_shared_offsets() {
     });
 
     controller.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inherited_local_descriptors_release_handles_when_file_actions_close_all_aliases() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    let logical = directory.path().join("spawn-closed.txt");
+    let path = c_path(&logical);
+
+    let (descriptor, inherited) = with_test_runtime(&runtime, || unsafe {
+        let descriptor = super::super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(descriptor >= 0);
+        set_descriptor_close_on_exec(descriptor, false).unwrap();
+        let open = runtime.tracked_open(descriptor).unwrap();
+        runtime.refresh_local_state_inheritance(&open);
+        let inherited = runtime.encode_inherited_local_descriptors().unwrap();
+        (descriptor, inherited)
+    });
+    let retained = runtime.retain_local_files_before_fork().unwrap();
+    assert_eq!(retained, inherited.handles);
+
+    let child = unsafe { duplicate_inherited_local_descriptors(&inherited.encoded) };
+    let state_descriptor = child.descriptors[0].state_descriptor;
+    let lock_descriptor = child.descriptors[0].lock_descriptor;
+    for inherited in &child.descriptors {
+        close_if_open(inherited.descriptor);
+    }
+
+    let mut restored = FilesystemHookRuntime::new_encrypted(
+        directory.path().join("workdir/fs"),
+        b"broker-hook-test-key",
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    restored.local = runtime.local.clone();
+    restored
+        .restore_inherited_local_descriptors(Some(&serde_json::to_string(&child).unwrap()))
+        .unwrap();
+
+    let state_closed = !descriptor_is_open(state_descriptor);
+    let lock_closed = !descriptor_is_open(lock_descriptor);
+    close_if_open(state_descriptor);
+    close_if_open(lock_descriptor);
+    with_test_runtime(&runtime, || unsafe {
+        assert_eq!(super::super::agora_sandbox_close(descriptor), 0);
+    });
+    let released = runtime
+        .local
+        .as_ref()
+        .unwrap()
+        .release_retained(retained)
+        .is_err();
+    controller.shutdown().await.unwrap();
+
+    assert!(state_closed, "inherited state descriptor was leaked");
+    assert!(lock_closed, "inherited lock descriptor was leaked");
+    assert!(released, "unrestored Broker retain was leaked");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inherited_local_descriptors_close_valid_content_when_auxiliary_fd_was_replaced() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    let logical = directory.path().join("spawn-replaced.txt");
+    let path = c_path(&logical);
+
+    let (descriptor, inherited) = with_test_runtime(&runtime, || unsafe {
+        let descriptor = super::super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(descriptor >= 0);
+        set_descriptor_close_on_exec(descriptor, false).unwrap();
+        let open = runtime.tracked_open(descriptor).unwrap();
+        runtime.refresh_local_state_inheritance(&open);
+        let inherited = runtime.encode_inherited_local_descriptors().unwrap();
+        (descriptor, inherited)
+    });
+    let retained = runtime.retain_local_files_before_fork().unwrap();
+    assert_eq!(retained, inherited.handles);
+
+    let child = unsafe { duplicate_inherited_local_descriptors(&inherited.encoded) };
+    let content_descriptor = child.descriptors[0].descriptor;
+    let state_descriptor = child.descriptors[0].state_descriptor;
+    let lock_descriptor = child.descriptors[0].lock_descriptor;
+    let replacement = std::fs::File::open("/dev/null").unwrap();
+    assert_eq!(
+        unsafe { libc::dup2(replacement.as_raw_fd(), state_descriptor) },
+        state_descriptor
+    );
+
+    let mut restored = FilesystemHookRuntime::new_encrypted(
+        directory.path().join("workdir/fs"),
+        b"broker-hook-test-key",
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    restored.local = runtime.local.clone();
+    restored
+        .restore_inherited_local_descriptors(Some(&serde_json::to_string(&child).unwrap()))
+        .unwrap();
+
+    let content_closed = !descriptor_is_open(content_descriptor);
+    let replacement_preserved = descriptor_is_open(state_descriptor);
+    let lock_closed = !descriptor_is_open(lock_descriptor);
+    close_if_open(content_descriptor);
+    close_if_open(state_descriptor);
+    close_if_open(lock_descriptor);
+    with_test_runtime(&runtime, || unsafe {
+        assert_eq!(super::super::agora_sandbox_close(descriptor), 0);
+    });
+    let released = runtime
+        .local
+        .as_ref()
+        .unwrap()
+        .release_retained(retained)
+        .is_err();
+    controller.shutdown().await.unwrap();
+
+    assert!(
+        content_closed,
+        "untracked plaintext descriptor remained open"
+    );
+    assert!(
+        replacement_preserved,
+        "unrelated replacement descriptor was closed"
+    );
+    assert!(
+        lock_closed,
+        "validated inherited lock descriptor was leaked"
+    );
+    assert!(released, "unrestored Broker retain was leaked");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inherited_local_descriptors_close_plaintext_moved_into_an_auxiliary_fd() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    let logical = directory.path().join("spawn-role-change.txt");
+    let path = c_path(&logical);
+
+    let (descriptor, inherited) = with_test_runtime(&runtime, || unsafe {
+        let descriptor = super::super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(descriptor >= 0);
+        set_descriptor_close_on_exec(descriptor, false).unwrap();
+        let open = runtime.tracked_open(descriptor).unwrap();
+        runtime.refresh_local_state_inheritance(&open);
+        let inherited = runtime.encode_inherited_local_descriptors().unwrap();
+        (descriptor, inherited)
+    });
+    let retained = runtime.retain_local_files_before_fork().unwrap();
+    assert_eq!(retained, inherited.handles);
+
+    let child = unsafe { duplicate_inherited_local_descriptors(&inherited.encoded) };
+    let content_descriptor = child.descriptors[0].descriptor;
+    let state_descriptor = child.descriptors[0].state_descriptor;
+    let lock_descriptor = child.descriptors[0].lock_descriptor;
+    assert_eq!(
+        unsafe { libc::dup2(content_descriptor, state_descriptor) },
+        state_descriptor
+    );
+
+    let mut restored = FilesystemHookRuntime::new_encrypted(
+        directory.path().join("workdir/fs"),
+        b"broker-hook-test-key",
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    restored.local = runtime.local.clone();
+    restored
+        .restore_inherited_local_descriptors(Some(&serde_json::to_string(&child).unwrap()))
+        .unwrap();
+
+    let content_closed = !descriptor_is_open(content_descriptor);
+    let moved_plaintext_closed = !descriptor_is_open(state_descriptor);
+    let lock_closed = !descriptor_is_open(lock_descriptor);
+    close_if_open(content_descriptor);
+    close_if_open(state_descriptor);
+    close_if_open(lock_descriptor);
+    with_test_runtime(&runtime, || unsafe {
+        assert_eq!(super::super::agora_sandbox_close(descriptor), 0);
+    });
+    let released = runtime
+        .local
+        .as_ref()
+        .unwrap()
+        .release_retained(retained)
+        .is_err();
+    controller.shutdown().await.unwrap();
+
+    assert!(
+        content_closed,
+        "unrestored content descriptor remained open"
+    );
+    assert!(
+        moved_plaintext_closed,
+        "plaintext moved into an auxiliary descriptor remained open"
+    );
+    assert!(
+        lock_closed,
+        "validated inherited lock descriptor was leaked"
+    );
+    assert!(released, "unrestored Broker retain was leaked");
 }

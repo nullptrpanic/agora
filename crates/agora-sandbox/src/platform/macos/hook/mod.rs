@@ -54,7 +54,13 @@ fn current_process_executable() -> String {
 
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
 extern "C" fn flush_filesystem_at_exit() {
-    filesystem::flush_at_exit();
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(filesystem::flush_at_exit)).is_err() {
+        const MESSAGE: &[u8] = b"agora-sandbox: filesystem exit flush panicked\n";
+        unsafe {
+            libc::write(libc::STDERR_FILENO, MESSAGE.as_ptr().cast(), MESSAGE.len());
+            libc::abort();
+        }
+    }
 }
 
 #[cfg(all(coverage, not(agora_sandbox_hook_build), not(test)))]
