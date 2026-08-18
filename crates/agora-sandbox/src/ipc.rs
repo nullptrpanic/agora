@@ -10,6 +10,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -17,6 +19,10 @@ use serde::de::DeserializeOwned;
 pub(crate) const MAX_FRAME_SIZE: usize = 1024 * 1024;
 const MAX_DESCRIPTORS: usize = 8;
 const FRAME_MARKER: u8 = 0;
+#[cfg(target_os = "macos")]
+const INHERITED_CONTROL_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
+const INHERITED_CONTROL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 #[cfg(target_os = "macos")]
 pub(crate) struct InheritedControlLock {
@@ -54,9 +60,20 @@ impl InheritedControlLock {
         self.descriptor.as_raw_fd()
     }
 
-    fn lock(&self, slot: i64) -> io::Result<InheritedControlLockGuard<'_>> {
-        set_record_lock(self.descriptor(), slot, libc::F_WRLCK, libc::F_SETLKW)?;
-        Ok(InheritedControlLockGuard { lock: self, slot })
+    fn lock_until(
+        &self,
+        slot: i64,
+        deadline: Instant,
+    ) -> io::Result<InheritedControlLockGuard<'_>> {
+        loop {
+            match set_record_lock(self.descriptor(), slot, libc::F_WRLCK, libc::F_SETLK) {
+                Ok(()) => return Ok(InheritedControlLockGuard { lock: self, slot }),
+                Err(error) if is_record_lock_contention(&error) => {
+                    wait_for_inherited_control_lock(deadline)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
@@ -116,9 +133,18 @@ where
     }
 
     pub(crate) fn transact<T>(&self, operation: impl FnOnce(&mut S) -> T) -> io::Result<T> {
+        self.transact_for(INHERITED_CONTROL_LOCK_TIMEOUT, operation)
+    }
+
+    fn transact_for<T>(
+        &self,
+        timeout: Duration,
+        operation: impl FnOnce(&mut S) -> T,
+    ) -> io::Result<T> {
         let _signals = crate::platform::hook::SignalMaskGuard::block()?;
-        let _mutex = RawMutexGuard::lock(self.mutex.get())?;
-        let _process = self.lock.lock(self.slot)?;
+        let deadline = Instant::now() + timeout;
+        let _mutex = RawMutexGuard::lock_until(self.mutex.get(), deadline)?;
+        let _process = self.lock.lock_until(self.slot, deadline)?;
         Ok(operation(unsafe { &mut *self.stream.get() }))
     }
 
@@ -160,12 +186,14 @@ struct RawMutexGuard {
 
 #[cfg(target_os = "macos")]
 impl RawMutexGuard {
-    fn lock(mutex: *mut libc::pthread_mutex_t) -> io::Result<Self> {
-        let result = unsafe { libc::pthread_mutex_lock(mutex) };
-        if result == 0 {
-            Ok(Self { mutex })
-        } else {
-            Err(io::Error::from_raw_os_error(result))
+    fn lock_until(mutex: *mut libc::pthread_mutex_t, deadline: Instant) -> io::Result<Self> {
+        loop {
+            let result = unsafe { libc::pthread_mutex_trylock(mutex) };
+            match result {
+                0 => return Ok(Self { mutex }),
+                libc::EBUSY => wait_for_inherited_control_lock(deadline)?,
+                error => return Err(io::Error::from_raw_os_error(error)),
+            }
         }
     }
 }
@@ -213,6 +241,21 @@ fn set_record_lock(
             return Err(error);
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn is_record_lock_contention(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EACCES | libc::EAGAIN))
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_inherited_control_lock(deadline: Instant) -> io::Result<()> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
+    }
+    std::thread::sleep(INHERITED_CONTROL_LOCK_RETRY_DELAY.min(deadline - now));
+    Ok(())
 }
 
 pub(crate) fn send<T: Serialize>(

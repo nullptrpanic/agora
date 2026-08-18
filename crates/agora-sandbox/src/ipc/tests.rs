@@ -111,6 +111,40 @@ fn inherited_control_transaction_blocks_catchable_signals_while_locked() {
     assert!(!signal.is_blocked());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn inherited_control_transaction_mutex_wait_is_bounded() {
+    let lock = InheritedControlLock::anonymous().unwrap();
+    let (stream, _peer) = UnixStream::pair().unwrap();
+    let shared = InheritedControlStream::new(stream, lock, 0).unwrap();
+    let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+    let holder = {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            shared
+                .transact(|_| {
+                    entered.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap();
+        })
+    };
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let error = shared
+        .transact_for(std::time::Duration::from_millis(20), |_| ())
+        .unwrap_err();
+
+    assert_eq!(error.raw_os_error(), Some(libc::ETIMEDOUT));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    release.send(()).unwrap();
+    holder.join().unwrap();
+}
+
 #[test]
 fn framed_transport_passes_one_close_on_exec_descriptor() {
     let root = tempfile::tempdir().unwrap();
