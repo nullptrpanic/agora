@@ -277,19 +277,16 @@ impl MetadataStore {
     }
 
     fn with_cipher(root: &Path, cipher: Option<super::FileCipher>) -> Result<Self> {
-        fs::create_dir_all(root).with_context(|| {
-            format!(
-                "failed to create sandbox filesystem root {}",
-                root.display()
-            )
-        })?;
-        let generation = OpenOptions::new()
+        crate::managed_fs::prepare_owned_directory(root, "sandbox filesystem root")?;
+        let path = root.join(namespace::VFS_LOCK_FILE);
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .mode(0o600)
-            .open(root.join(namespace::VFS_LOCK_FILE))?;
+            .mode(0o600);
+        let generation = crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600))?;
         Self::with_generation(root, generation, cipher)
     }
 
@@ -683,7 +680,10 @@ impl MetadataStore {
         }
         #[cfg(test)]
         self.probe_count.fetch_add(1, Ordering::Relaxed);
-        let mut file = match File::open(&path) {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let mut file = match crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600))
+        {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut cache = self.cache();
@@ -783,12 +783,9 @@ impl MetadataStore {
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
         let contents = self.serialize_metadata(metadata)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true).mode(0o600);
+        let mut file = crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600))
             .with_context(|| format!("failed to create filesystem metadata {}", path.display()))?;
         file.write_all(&contents)
             .with_context(|| format!("failed to write filesystem metadata {}", path.display()))?;
@@ -941,7 +938,10 @@ impl MetadataStore {
                 // descriptor. Do not close the descriptor's new owner.
                 let _ = cached.file.into_raw_fd();
             }
-            let file = match OpenOptions::new().read(true).write(true).open(path) {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true);
+            let file = match crate::managed_fs::open_owned_regular(&mut options, path, Some(0o600))
+            {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error.into()),
@@ -1345,13 +1345,15 @@ impl MetadataStore {
                 // Relinquish the numeric descriptor without closing its new owner.
                 let _ = stale.into_raw_fd();
             }
-            let file = OpenOptions::new()
+            let path = self.root.join(namespace::VFS_LOCK_FILE);
+            let mut options = OpenOptions::new();
+            options
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .mode(0o600)
-                .open(self.root.join(namespace::VFS_LOCK_FILE))?;
+                .mode(0o600);
+            let file = crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600))?;
             Self::initialize_generation(&file)?;
             *generation = Some(file);
         }
@@ -1368,9 +1370,9 @@ impl MetadataStore {
 
     fn descriptor_matches_path(file: &File, path: &Path) -> bool {
         file.metadata()
-            .and_then(|open| path.metadata().map(|expected| (open, expected)))
+            .and_then(|open| path.symlink_metadata().map(|expected| (open, expected)))
             .is_ok_and(|(open, expected)| {
-                open.dev() == expected.dev() && open.ino() == expected.ino()
+                expected.is_file() && open.dev() == expected.dev() && open.ino() == expected.ino()
             })
     }
 

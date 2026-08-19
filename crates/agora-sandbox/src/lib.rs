@@ -7,6 +7,7 @@ mod filesystem;
 #[cfg(not(agora_sandbox_hook_build))]
 pub mod hook_library;
 pub(crate) mod ipc;
+mod managed_fs;
 pub mod network;
 pub mod nfs;
 mod platform;

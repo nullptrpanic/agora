@@ -1035,6 +1035,33 @@ fn default_tls_ca_reuses_a_complete_pair_and_replaces_a_partial_pair() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn default_tls_ca_rejects_symlinked_managed_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().join("workdir");
+    let external = directory.path().join("external");
+    std::fs::create_dir_all(workdir.join("ca")).unwrap();
+    let external_certificate = external.join("ca.crt");
+    let external_key = external.join("ca.key");
+    crate::network::generate_tls_ca(&external_certificate, &external_key).unwrap();
+    let certificate = std::fs::read(&external_certificate).unwrap();
+    let private_key = std::fs::read(&external_key).unwrap();
+    std::os::unix::fs::symlink(&external_certificate, workdir.join("ca/ca.crt")).unwrap();
+    std::os::unix::fs::symlink(&external_key, workdir.join("ca/ca.key")).unwrap();
+    let hook = workdir.join("hook.dylib");
+    let mut config = SandboxConfig::new(&hook)
+        .with_workdir(&workdir)
+        .with_encrypted_workspace("test-key");
+    config.network.tls = TlsMode::Auto;
+
+    let accepted = config.tls_ca_for_workdir().is_ok();
+
+    assert!(!accepted, "symbolic-link managed CA files were accepted");
+    assert_eq!(std::fs::read(external_certificate).unwrap(), certificate);
+    assert_eq!(std::fs::read(external_key).unwrap(), private_key);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn tls_trust_bundles_are_stable_per_ca_and_isolated_between_cas() {
     let root = std::env::temp_dir().join(format!("agora-trust-bundle-{}", uuid::Uuid::new_v4()));
     let config = SandboxConfig::new(root.join("hook.dylib")).with_workdir(&root);
@@ -1048,6 +1075,30 @@ fn tls_trust_bundles_are_stable_per_ca_and_isolated_between_cas() {
     assert!(first.is_file());
     assert!(second.is_file());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn tls_trust_artifacts_reject_a_symlinked_managed_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = directory.path().join("runtime");
+    let external = directory.path().join("external");
+    std::fs::create_dir(&runtime).unwrap();
+    std::fs::create_dir(&external).unwrap();
+    std::os::unix::fs::symlink(&external, runtime.join("ca")).unwrap();
+
+    let accepted = super::write_tls_trust_artifact(
+        &runtime,
+        "trust-bundle",
+        "crt",
+        b"certificate",
+        b"bundle",
+        "TLS client trust bundle",
+    )
+    .is_ok();
+
+    assert!(!accepted, "a symbolic-link trust directory was accepted");
+    assert_eq!(std::fs::read_dir(external).unwrap().count(), 0);
 }
 
 #[cfg(target_os = "macos")]

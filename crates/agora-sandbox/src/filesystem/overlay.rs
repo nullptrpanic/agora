@@ -314,11 +314,13 @@ impl Drop for StagedWrite {
         let Some(reservation) = self.reservation.take() else {
             return;
         };
-        let Ok(lock) = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&reservation.lock_path)
-        else {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        let Ok(lock) = crate::managed_fs::open_owned_regular(
+            &mut options,
+            &reservation.lock_path,
+            Some(0o600),
+        ) else {
             return;
         };
         if OverlayStore::flock(&lock, libc::LOCK_EX).is_err() {
@@ -415,19 +417,19 @@ impl OverlayStore {
 
     fn with_cipher(root: impl Into<PathBuf>, cipher: Option<FileCipher>) -> Result<Self> {
         let root = root.into();
-        fs::create_dir_all(&root)
-            .with_context(|| format!("failed to create filesystem root {}", root.display()))?;
+        crate::managed_fs::prepare_owned_directory(&root, "filesystem root")?;
         let canonical_root = root
             .canonicalize()
             .with_context(|| format!("failed to resolve filesystem root {}", root.display()))?;
         let lock_path = canonical_root.join(namespace::VFS_LOCK_FILE);
-        let lock = OpenOptions::new()
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .mode(0o600)
-            .open(&lock_path)
+            .mode(0o600);
+        let lock = crate::managed_fs::open_owned_regular(&mut options, &lock_path, Some(0o600))
             .with_context(|| format!("failed to open overlay lock {}", lock_path.display()))?;
         Self::flock(&lock, libc::LOCK_EX)?;
         let root_marker_present = match canonical_root
@@ -715,11 +717,16 @@ impl OverlayStore {
             if !self.is_internal(&destination) {
                 return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
             }
-            let current_lease = match File::open(Self::write_lease_path(&destination)?) {
-                Ok(current) => current,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error.into()),
-            };
+            let lease_path = Self::write_lease_path(&destination)?;
+            let mut options = OpenOptions::new();
+            options.read(true);
+            let current_lease =
+                match crate::managed_fs::open_owned_regular(&mut options, &lease_path, Some(0o600))
+                {
+                    Ok(current) => current,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => return Err(error.into()),
+                };
             let held_identity = lease
                 .metadata()
                 .map(|metadata| (metadata.dev(), metadata.ino()))?;
@@ -750,11 +757,16 @@ impl OverlayStore {
             if !self.is_internal(&destination) {
                 return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
             }
-            let current_lease = match File::open(Self::write_lease_path(&destination)?) {
-                Ok(current) => current,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error.into()),
-            };
+            let lease_path = Self::write_lease_path(&destination)?;
+            let mut options = OpenOptions::new();
+            options.read(true);
+            let current_lease =
+                match crate::managed_fs::open_owned_regular(&mut options, &lease_path, Some(0o600))
+                {
+                    Ok(current) => current,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => return Err(error.into()),
+                };
             let held_identity = lease
                 .metadata()
                 .map(|metadata| (metadata.dev(), metadata.ino()))?;
@@ -2173,7 +2185,9 @@ impl OverlayStore {
 
     fn write_lease_is_active(&self, destination: &Path) -> Result<bool> {
         let path = Self::write_lease_path(destination)?;
-        let lease = match OpenOptions::new().read(true).write(true).open(path) {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        let lease = match crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600)) {
             Ok(lease) => lease,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
@@ -2284,13 +2298,16 @@ impl OverlayStore {
         }
         let from_lease = Self::write_lease_path(from)?;
         let to_lease = Self::write_lease_path(to)?;
-        let lease = match OpenOptions::new().read(true).write(true).open(&from_lease) {
-            Ok(lease) => lease,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Self::remove_existing(&to_lease);
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        let lease =
+            match crate::managed_fs::open_owned_regular(&mut options, &from_lease, Some(0o600)) {
+                Ok(lease) => lease,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Self::remove_existing(&to_lease);
+                }
+                Err(error) => return Err(error.into()),
+            };
         Self::write_write_lease_destination(&lease, to)?;
         drop(lease);
         fs::rename(&from_lease, &to_lease)?;
@@ -2421,13 +2438,14 @@ impl OverlayStore {
             return Ok(None);
         }
         let path = Self::write_lease_path(destination)?;
-        let lease = OpenOptions::new()
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .mode(0o600)
-            .open(&path)
+            .mode(0o600);
+        let lease = crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600))
             .with_context(|| format!("failed to open write lease {}", path.display()))?;
         if let Err(error) = Self::flock(&lease, operation) {
             if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
@@ -2468,10 +2486,11 @@ impl OverlayStore {
                 {
                     continue;
                 }
-                let lease = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(entry.path())?;
+                let path = entry.path();
+                let mut options = OpenOptions::new();
+                options.read(true).write(true);
+                let lease =
+                    crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600))?;
                 if let Err(error) = Self::flock(&lease, libc::LOCK_EX | libc::LOCK_NB) {
                     if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
                         return Err(std::io::Error::from_raw_os_error(libc::EBUSY).into());
@@ -2539,11 +2558,13 @@ impl OverlayStore {
             let _ = lock.into_raw_fd();
         }
         drop(pool);
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.lock_path)
-            .with_context(|| format!("failed to open overlay lock {}", self.lock_path.display()))?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        let lock =
+            crate::managed_fs::open_owned_regular(&mut options, &self.lock_path, Some(0o600))
+                .with_context(|| {
+                    format!("failed to open overlay lock {}", self.lock_path.display())
+                })?;
         #[cfg(test)]
         self.lock_open_count.fetch_add(1, Ordering::Relaxed);
         Ok(lock)
@@ -2570,9 +2591,15 @@ impl OverlayStore {
 
     fn lock_descriptor_is_current(&self, lock: &File) -> bool {
         lock.metadata()
-            .and_then(|open| self.lock_path.metadata().map(|expected| (open, expected)))
+            .and_then(|open| {
+                self.lock_path
+                    .symlink_metadata()
+                    .map(|expected| (open, expected))
+            })
             .is_ok_and(|(open, expected)| {
-                BackingIdentity::from_metadata(&open) == BackingIdentity::from_metadata(&expected)
+                expected.is_file()
+                    && BackingIdentity::from_metadata(&open)
+                        == BackingIdentity::from_metadata(&expected)
             })
     }
 

@@ -12,7 +12,7 @@ use agora_sandbox::{hook_library, runner::SandboxCommand};
 use anyhow::{Context, Result};
 use clap::{ColorChoice, Parser, Subcommand};
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 #[cfg(target_os = "macos")]
@@ -98,13 +98,29 @@ fn open_log(path: &Path) -> Result<File> {
     {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create log directory {}", parent.display()))?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(parent)
+            .with_context(|| format!("failed to open log directory {}", parent.display()))?;
+        if !directory.metadata()?.is_dir() {
+            anyhow::bail!("log path is not a directory: {}", parent.display());
+        }
     }
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .with_context(|| format!("failed to open log file {}", path.display()))
+        .with_context(|| format!("failed to open log file {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect log file {}", path.display()))?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        anyhow::bail!("invalid managed log file: {}", path.display());
+    }
+    Ok(file)
 }
 
 async fn async_main(arguments: Arguments) -> Result<u8> {

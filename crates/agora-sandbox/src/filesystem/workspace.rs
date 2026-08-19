@@ -2,9 +2,9 @@ use super::{EncryptedWorkspace, FilesystemMode};
 #[cfg(not(agora_sandbox_hook_build))]
 use super::{FileCipher, OverlayStore};
 use anyhow::{Context, Result, bail};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const ROOT_DIRECTORY: &str = "fs";
@@ -88,24 +88,19 @@ impl PlainWorkspace {
     }
 
     fn prepare_directory(directory: &Path, description: &str) -> Result<()> {
-        fs::create_dir_all(directory)
-            .with_context(|| format!("failed to create {description} {}", directory.display()))?;
-        if !directory.is_dir() {
-            bail!("{description} is not a directory: {}", directory.display());
-        }
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to secure {description} {}", directory.display()))
+        crate::managed_fs::prepare_owned_directory(directory, description).map(drop)
     }
 
     fn lock(directory: &Path) -> Result<File> {
         let path = directory.join(LOCK_FILE);
-        let lock = OpenOptions::new()
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .mode(0o600)
-            .open(&path)
+            .mode(0o600);
+        let lock = crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600))
             .with_context(|| format!("failed to open filesystem lock {}", path.display()))?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(std::io::Error::last_os_error())

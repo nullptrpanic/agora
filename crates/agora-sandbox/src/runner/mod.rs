@@ -37,7 +37,6 @@ use base64::Engine;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-#[cfg(target_os = "macos")]
 use std::fs::OpenOptions;
 #[cfg(target_os = "macos")]
 use std::io::Write;
@@ -405,23 +404,26 @@ impl SandboxConfig {
             certificate: self.workdir.join(DEFAULT_TLS_CA_CERTIFICATE),
             private_key: self.workdir.join(DEFAULT_TLS_CA_PRIVATE_KEY),
         });
-        let missing = !ca.certificate.is_file() || !ca.private_key.is_file();
-        let invalid_managed_pair = if managed && !missing {
-            let certificate = std::fs::read(&ca.certificate).with_context(|| {
-                format!(
-                    "failed to read TLS CA certificate {}",
-                    ca.certificate.display()
-                )
-            })?;
-            let private_key = std::fs::read(&ca.private_key).with_context(|| {
-                format!(
-                    "failed to read TLS CA private key {}",
-                    ca.private_key.display()
-                )
-            })?;
-            crate::network::validate_tls_ca(&certificate, &private_key).is_err()
+        let (missing, invalid_managed_pair) = if managed {
+            let directory = ca
+                .certificate
+                .parent()
+                .context("managed TLS CA certificate has no parent directory")?;
+            crate::managed_fs::prepare_owned_directory(directory, "managed TLS CA directory")?;
+            let certificate = read_managed_file(&ca.certificate, "TLS CA certificate")?;
+            let private_key = read_managed_file(&ca.private_key, "TLS CA private key")?;
+            match (certificate, private_key) {
+                (Some(certificate), Some(private_key)) => (
+                    false,
+                    crate::network::validate_tls_ca(&certificate, &private_key).is_err(),
+                ),
+                _ => (true, false),
+            }
         } else {
-            false
+            (
+                !ca.certificate.is_file() || !ca.private_key.is_file(),
+                false,
+            )
         };
         if missing || invalid_managed_pair {
             crate::network::generate_tls_ca(&ca.certificate, &ca.private_key)?;
@@ -493,6 +495,23 @@ impl SandboxConfig {
     }
 }
 
+fn read_managed_file(path: &Path, description: &str) -> Result<Option<Vec<u8>>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    let mut file = match crate::managed_fs::open_owned_regular(&mut options, path, Some(0o600)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to open {description} {}", path.display()));
+        }
+    };
+    let mut contents = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut contents)
+        .with_context(|| format!("failed to read {description} {}", path.display()))?;
+    Ok(Some(contents))
+}
+
 #[cfg(target_os = "macos")]
 fn write_tls_trust_artifact(
     runtime_directory: &Path,
@@ -513,12 +532,9 @@ fn write_tls_trust_artifact(
     let parent = path
         .parent()
         .with_context(|| format!("{description} path has no parent"))?;
-    std::fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "failed to create {description} directory {}",
-            parent.display()
-        )
-    })?;
+    let directory_description = format!("{description} directory");
+    let _directory =
+        crate::managed_fs::prepare_owned_directory_preserving_mode(parent, &directory_description)?;
     let temporary = parent.join(format!(".{name}-{}.tmp", Uuid::new_v4().simple()));
     let written = (|| {
         let mut file = OpenOptions::new()

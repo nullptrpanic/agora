@@ -265,6 +265,34 @@ fn open_log_preserves_existing_file_permissions() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn open_log_rejects_a_symlink_without_touching_its_target() {
+    let root = tempfile::tempdir().unwrap();
+    let external = root.path().join("external.jsonl");
+    let path = root.path().join("sandbox.jsonl");
+    std::fs::write(&external, b"external").unwrap();
+    std::os::unix::fs::symlink(&external, &path).unwrap();
+
+    let accepted = open_log(&path).is_ok();
+
+    assert!(!accepted, "a symbolic-link log file was accepted");
+    assert_eq!(std::fs::read(external).unwrap(), b"external");
+}
+
+#[test]
+fn open_log_rejects_a_symlinked_output_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let external = root.path().join("external");
+    let logs = root.path().join("logs");
+    std::fs::create_dir(&external).unwrap();
+    std::os::unix::fs::symlink(&external, &logs).unwrap();
+
+    let accepted = open_log(&logs.join("sandbox.jsonl")).is_ok();
+
+    assert!(!accepted, "a symbolic-link log directory was accepted");
+    assert_eq!(std::fs::read_dir(external).unwrap().count(), 0);
+}
+
 #[tokio::test]
 async fn exit_codes_and_shutdown_signals_are_stable() {
     let status = Command::new("/bin/sh")

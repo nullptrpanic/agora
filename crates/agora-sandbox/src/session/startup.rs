@@ -35,12 +35,10 @@ impl SessionPaths {
             .canonicalize()
             .with_context(|| format!("failed to resolve sandbox workdir {}", workdir.display()))?;
         let workspace_runtime = workdir.join("runtime");
-        std::fs::create_dir_all(&workspace_runtime).with_context(|| {
-            format!(
-                "failed to create sandbox runtime directory {}",
-                workspace_runtime.display()
-            )
-        })?;
+        crate::managed_fs::prepare_owned_directory(
+            &workspace_runtime,
+            "sandbox runtime directory",
+        )?;
         let socket_directory = session_socket_directory()?;
         let digest = ring::digest::digest(&SHA256, workdir.as_os_str().as_bytes());
         let socket = socket_directory.join(format!("{}.sock", hex(&digest.as_ref()[..16])));
@@ -63,21 +61,15 @@ pub(crate) struct StartupLock(File);
 
 impl StartupLock {
     pub(super) fn try_acquire(path: &Path) -> Result<Option<Self>> {
-        let file = OpenOptions::new()
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
+            .mode(0o600);
+        let file = crate::managed_fs::open_owned_regular(&mut options, path, Some(0o600))
             .with_context(|| format!("failed to open session startup lock {}", path.display()))?;
-        let metadata = file.metadata().with_context(|| {
-            format!("failed to inspect session startup lock {}", path.display())
-        })?;
-        if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
-            bail!("invalid sandbox session startup lock: {}", path.display());
-        }
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = std::io::Error::last_os_error();
             if error

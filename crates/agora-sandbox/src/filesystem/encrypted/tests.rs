@@ -7,6 +7,7 @@ use crate::filesystem::metadata::{EntryState, Materializer, MetadataStore};
 use crate::filesystem::{Credentials, OpenTarget, VirtualFilesystem};
 use base64::Engine;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
 
 fn temporary_directory(label: &str) -> PathBuf {
@@ -69,6 +70,85 @@ fn encrypted_workspace_lock_is_exclusive_and_drop_is_immediate() {
     let second = EncryptedWorkspace::start(&workdir, b"key").unwrap();
     drop(second);
     std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn encrypted_workspace_rejects_symlinked_key_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let seed_workdir = directory.path().join("seed");
+    let seed = EncryptedWorkspace::start(&seed_workdir, b"key").unwrap();
+    let key_metadata = std::fs::read(seed.root().join(".key.json")).unwrap();
+    drop(seed);
+
+    let external = directory.path().join("external-key.json");
+    std::fs::write(&external, &key_metadata).unwrap();
+    let workdir = directory.path().join("candidate");
+    std::fs::create_dir_all(workdir.join("fs")).unwrap();
+    symlink(&external, workdir.join("fs/.key.json")).unwrap();
+
+    let accepted = EncryptedWorkspace::start(&workdir, b"key").is_ok();
+
+    assert!(!accepted, "symbolic-link key metadata was accepted");
+    assert_eq!(std::fs::read(external).unwrap(), key_metadata);
+}
+
+#[test]
+fn encrypted_workspace_rejects_a_symlinked_root_without_touching_its_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().join("workdir");
+    let external = directory.path().join("external");
+    std::fs::create_dir(&workdir).unwrap();
+    std::fs::create_dir(&external).unwrap();
+    std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&external, workdir.join("fs")).unwrap();
+
+    let accepted = EncryptedWorkspace::start(&workdir, b"key").is_ok();
+
+    assert!(!accepted, "a symbolic-link encrypted root was accepted");
+    assert_eq!(
+        external.metadata().unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(std::fs::read_dir(external).unwrap().count(), 0);
+}
+
+#[test]
+fn key_migration_rejects_a_symlinked_root_without_touching_its_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let external_workdir = directory.path().join("external");
+    let external = EncryptedWorkspace::start(&external_workdir, b"old-key").unwrap();
+    let key_path = external.root().join(".key.json");
+    let original = std::fs::read(&key_path).unwrap();
+    drop(external);
+
+    let workdir = directory.path().join("workdir");
+    std::fs::create_dir(&workdir).unwrap();
+    symlink(external_workdir.join("fs"), workdir.join("fs")).unwrap();
+
+    let migrated = EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key").is_ok();
+
+    assert!(!migrated, "key migration accepted a symbolic-link root");
+    assert_eq!(std::fs::read(key_path).unwrap(), original);
+}
+
+#[test]
+fn encrypted_workspace_rejects_a_symlinked_rekey_journal() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    let external = directory.path().join("external-journal.json");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(&external, b"{}").unwrap();
+    symlink(&external, root.join(".rekey.json")).unwrap();
+
+    let error = EncryptedWorkspace::recover_migration(&root).unwrap_err();
+
+    assert!(error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            == Some(libc::ELOOP)
+    }));
+    assert_eq!(std::fs::read(external).unwrap(), b"{}");
 }
 
 #[test]

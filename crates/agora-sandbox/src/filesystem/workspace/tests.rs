@@ -1,5 +1,6 @@
 use super::{FilesystemMode, FilesystemWorkspace, PlainWorkspace};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 
 fn temporary_directory(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("agora-workspace-{name}-{}", uuid::Uuid::new_v4()))
@@ -91,4 +92,40 @@ fn plain_workspace_rejects_existing_encrypted_key_state() {
 
     assert!(error.to_string().contains("use encrypted filesystem mode"));
     std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn plain_workspace_rejects_a_symlinked_root_without_touching_its_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().join("workdir");
+    let external = directory.path().join("external");
+    std::fs::create_dir_all(&workdir).unwrap();
+    std::fs::create_dir(&external).unwrap();
+    std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&external, workdir.join("fs")).unwrap();
+
+    let accepted = PlainWorkspace::start(&workdir).is_ok();
+
+    assert!(!accepted, "a symbolic-link filesystem root was accepted");
+    assert_eq!(
+        external.metadata().unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(!external.join(".fs.lock").exists());
+}
+
+#[test]
+fn plain_workspace_rejects_a_symlinked_lock_without_touching_its_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().join("workdir");
+    let root = workdir.join("fs");
+    let external = directory.path().join("external-lock");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(&external, b"external").unwrap();
+    symlink(&external, root.join(".fs.lock")).unwrap();
+
+    let accepted = PlainWorkspace::start(&workdir).is_ok();
+
+    assert!(!accepted, "a symbolic-link filesystem lock was accepted");
+    assert_eq!(std::fs::read(external).unwrap(), b"external");
 }

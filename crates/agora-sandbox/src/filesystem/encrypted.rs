@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
@@ -378,35 +378,19 @@ impl EncryptedWorkspace {
     }
 
     fn prepare_directory(directory: &Path) -> Result<()> {
-        fs::create_dir_all(directory).with_context(|| {
-            format!(
-                "failed to create encrypted filesystem root {}",
-                directory.display()
-            )
-        })?;
-        if !directory.is_dir() {
-            bail!(
-                "encrypted filesystem root is not a directory: {}",
-                directory.display()
-            );
-        }
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).with_context(|| {
-            format!(
-                "failed to secure encrypted filesystem root {}",
-                directory.display()
-            )
-        })
+        crate::managed_fs::prepare_owned_directory(directory, "encrypted filesystem root").map(drop)
     }
 
     fn lock(root: &Path) -> Result<File> {
         let path = root.join(LOCK_FILE);
-        let lock = OpenOptions::new()
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .mode(0o600)
-            .open(&path)
+            .mode(0o600);
+        let lock = crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600))
             .with_context(|| format!("failed to open filesystem lock {}", path.display()))?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(std::io::Error::last_os_error())
@@ -451,12 +435,15 @@ impl EncryptedWorkspace {
 
     fn read_key_metadata(root: &Path) -> Result<KeyMetadata> {
         let path = root.join(KEY_FILE);
-        let mut file = File::open(&path).with_context(|| {
-            format!(
-                "failed to open encrypted filesystem key metadata {}",
-                path.display()
-            )
-        })?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let mut file = crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600))
+            .with_context(|| {
+                format!(
+                    "failed to open encrypted filesystem key metadata {}",
+                    path.display()
+                )
+            })?;
         if file.metadata()?.len() > MAX_KEY_METADATA_BYTES as u64 {
             bail!(
                 "encrypted filesystem key metadata exceeds {MAX_KEY_METADATA_BYTES} bytes: {}",
@@ -624,7 +611,10 @@ impl EncryptedWorkspace {
 
     fn recover_migration(root: &Path) -> Result<()> {
         let path = root.join(REKEY_JOURNAL_FILE);
-        let mut file = match File::open(&path) {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let mut file = match crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600))
+        {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error).context("failed to open key migration journal"),

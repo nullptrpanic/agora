@@ -115,6 +115,22 @@ fn encrypted_exclusive_reservation_is_removed_when_the_lease_cannot_open() {
 }
 
 #[test]
+fn encrypted_write_lease_rejects_a_symlink_without_touching_its_target() {
+    let (fixture, _) = Fixture::encrypted();
+    let logical = fixture.lower.join("symlinked-lease");
+    let destination = fixture.store.file_destination(&logical, true).unwrap();
+    let lease = OverlayStore::write_lease_path(&destination).unwrap();
+    let external = fixture.directory.join("external-lease");
+    std::fs::write(&external, b"external").unwrap();
+    symlink(&external, &lease).unwrap();
+
+    let result = fixture.store.stage_file_open(&logical, true, false);
+
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(external).unwrap(), b"external");
+}
+
+#[test]
 fn failed_symlink_creation_restores_absent_and_whiteout_metadata() {
     let fixture = Fixture::new();
     let invalid_target = Path::new(std::ffi::OsStr::from_bytes(b"invalid\0target"));
@@ -228,6 +244,21 @@ fn overlay_lock_serializes_threads() {
 
     drop(store);
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn overlay_rejects_a_symlinked_generation_lock_without_touching_its_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    let external = directory.path().join("external-lock");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(&external, b"external").unwrap();
+    symlink(&external, root.join(".vfs.lock")).unwrap();
+
+    let accepted = OverlayStore::new(&root).is_ok();
+
+    assert!(!accepted, "a symbolic-link overlay lock was accepted");
+    assert_eq!(std::fs::read(external).unwrap(), b"external");
 }
 
 #[test]

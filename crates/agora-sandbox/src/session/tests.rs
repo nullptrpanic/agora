@@ -186,6 +186,21 @@ fn session_paths_are_stable_short_and_owner_only() {
 }
 
 #[test]
+fn session_paths_reject_a_symlinked_workspace_runtime_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workspace");
+    let external = root.path().join("external-runtime");
+    std::fs::create_dir(&workdir).unwrap();
+    std::fs::create_dir(&external).unwrap();
+    std::os::unix::fs::symlink(&external, workdir.join("runtime")).unwrap();
+
+    let accepted = super::startup::SessionPaths::resolve(&workdir).is_ok();
+
+    assert!(!accepted, "a symbolic-link runtime directory was accepted");
+    assert_eq!(std::fs::read_dir(external).unwrap().count(), 0);
+}
+
+#[test]
 fn session_startup_lock_excludes_a_second_daemon_candidate() {
     let root = tempfile::tempdir().unwrap();
     let workdir = root.path().join("workspace");

@@ -79,6 +79,20 @@ fn ca_generation_failure_does_not_truncate_an_existing_certificate() {
 }
 
 #[test]
+fn ca_generation_rejects_a_symlinked_managed_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let external = directory.path().join("external");
+    let managed = directory.path().join("managed");
+    std::fs::create_dir(&external).unwrap();
+    std::os::unix::fs::symlink(&external, &managed).unwrap();
+
+    let accepted = generate_ca(&managed.join("ca.pem"), &managed.join("ca-key.pem")).is_ok();
+
+    assert!(!accepted, "a symbolic-link CA directory was accepted");
+    assert_eq!(std::fs::read_dir(external).unwrap().count(), 0);
+}
+
+#[test]
 fn authority_rejects_malformed_ca_material() {
     let error = TlsAuthority::from_pem(b"not a certificate", b"not a key", 4).unwrap_err();
 

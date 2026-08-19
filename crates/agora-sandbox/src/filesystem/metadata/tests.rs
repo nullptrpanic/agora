@@ -5,7 +5,7 @@ use crate::filesystem::FileCipher;
 use std::ffi::OsStr;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
 
 #[test]
@@ -18,6 +18,27 @@ fn metadata_store_creates_and_validates_directory_markers() {
     assert!(root.join("Users/bytedance/.metadata").is_file());
     assert!(store.has_marker(Path::new("/Users/bytedance")).unwrap());
 
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_store_rejects_a_symlinked_marker_without_touching_its_target() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let original = std::fs::read(root.join(".metadata")).unwrap();
+    let external = root
+        .parent()
+        .unwrap()
+        .join(format!("agora-external-metadata-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&external, &original).unwrap();
+    std::fs::create_dir(root.join("nested")).unwrap();
+    symlink(&external, root.join("nested/.metadata")).unwrap();
+
+    let result = store.set(Path::new("/nested/entry"), EntryState::Cow);
+
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&external).unwrap(), original);
+    std::fs::remove_file(external).unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 

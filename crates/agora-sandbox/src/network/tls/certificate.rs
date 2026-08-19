@@ -7,7 +7,7 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, pem::PemObject};
 use rustls::sign::CertifiedKey;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::IpAddr;
 #[cfg(unix)]
@@ -62,6 +62,14 @@ fn write_ca_file(path: &Path, contents: &[u8]) -> Result<()> {
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create TLS CA directory {}", parent.display()))?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(parent)
+        .with_context(|| format!("failed to open TLS CA directory {}", parent.display()))?;
+    if !directory.metadata()?.is_dir() {
+        bail!("TLS CA path is not a directory: {}", parent.display());
+    }
 
     let temporary = parent.join(format!(".agora-ca-{}.tmp", uuid::Uuid::new_v4().simple()));
     let result = (|| {
@@ -86,8 +94,8 @@ fn write_ca_file(path: &Path, contents: &[u8]) -> Result<()> {
         fs::rename(&temporary, path)
             .with_context(|| format!("failed to publish TLS CA file {}", path.display()))?;
         #[cfg(unix)]
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
+        directory
+            .sync_all()
             .with_context(|| format!("failed to sync TLS CA directory {}", parent.display()))?;
         Ok(())
     })();
