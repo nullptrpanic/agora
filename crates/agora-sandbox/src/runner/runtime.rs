@@ -525,7 +525,7 @@ fn record_shutdown(first: &mut Option<anyhow::Error>, result: Result<()>) {
 
 pub(crate) struct RunningSandboxCommand {
     child: tokio::process::Child,
-    process_group: libc::pid_t,
+    process_group: Option<libc::pid_t>,
     terminal: Option<ForegroundTerminal>,
 }
 
@@ -591,7 +591,7 @@ impl RunningSandboxCommand {
         }
         Ok(Self {
             child,
-            process_group,
+            process_group: Some(process_group),
             terminal,
         })
     }
@@ -613,7 +613,13 @@ impl RunningSandboxCommand {
             Completion::Child(status) => status.context("sandbox child wait failed"),
             Completion::Runtime(error) => Err(error),
         };
-        let termination = terminate_process_group(&mut self.child, self.process_group).await;
+        let process_group = self
+            .process_group
+            .context("running sandbox command has no process group")?;
+        let termination = terminate_process_group(&mut self.child, process_group).await;
+        if termination.is_ok() {
+            self.process_group = None;
+        }
         let terminal_restore = self
             .terminal
             .as_mut()
@@ -631,5 +637,63 @@ impl RunningSandboxCommand {
                 Err(error)
             }
         }
+    }
+}
+
+impl Drop for RunningSandboxCommand {
+    fn drop(&mut self) {
+        if let Some(process_group) = self.process_group.take() {
+            let _ = signal_process_group(process_group, libc::SIGKILL);
+        }
+        if let Some(terminal) = self.terminal.as_mut() {
+            let _ = terminal.restore();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[tokio::test]
+    async fn dropping_running_command_terminates_its_entire_process_group() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "trap '' TERM; sleep 30 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        command.as_std_mut().process_group(0);
+        let mut child = command.spawn().unwrap();
+        let process_group = child.id().unwrap() as libc::pid_t;
+        let stdout = child.stdout.take().unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            BufReader::new(stdout).read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let descendant = line.trim().parse::<libc::pid_t>().unwrap();
+        assert_eq!(unsafe { libc::getpgid(descendant) }, process_group);
+
+        drop(RunningSandboxCommand {
+            child,
+            process_group: Some(process_group),
+            terminal: None,
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while process_group_exists(process_group).unwrap() && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let survived = process_group_exists(process_group).unwrap();
+        if survived {
+            signal_process_group(process_group, libc::SIGKILL).unwrap();
+        }
+
+        assert!(!survived, "a descendant survived command cancellation");
     }
 }
