@@ -460,6 +460,7 @@ impl PreparedOpenFile {
                             handle,
                             metadata: Mutex::new(metadata),
                             snapshot: AtomicBool::new(false),
+                            operation: Mutex::new(()),
                         },
                         writable,
                     )),

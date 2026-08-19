@@ -139,6 +139,27 @@ fn small_read_only_open_remains_eager() {
 }
 
 #[test]
+fn open_state_preserves_synchronous_write_flags() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("sync-flags", b"plaintext");
+    let mut reply = fixture.broker.handle(
+        Request::Open {
+            path: BackingPath::from_path(&path),
+            flags: libc::O_RDWR | libc::O_SYNC | libc::O_DSYNC,
+        },
+        None,
+    );
+    assert!(matches!(reply.response, Response::Open { .. }));
+
+    let state = LocalOpenState::from_descriptor(reply.descriptors.remove(1).into()).unwrap();
+    let flags = state.lock().unwrap().flags().unwrap();
+    assert_eq!(
+        flags & (libc::O_SYNC | libc::O_DSYNC),
+        libc::O_SYNC | libc::O_DSYNC
+    );
+}
+
+#[test]
 fn lazy_read_reports_corruption_only_when_the_block_is_materialized() {
     let fixture = Fixture::new();
     let contents = vec![b'x'; 2 * 1024 * 1024];
@@ -674,8 +695,8 @@ fn syncing_one_handle_flushes_completed_writes_from_a_peer_handle() {
 }
 
 #[test]
-fn competing_begin_write_returns_busy_without_waiting_for_the_active_writer() {
-    let fixture = Arc::new(Fixture::new());
+fn ordinary_writes_can_overlap_without_becoming_append_or_materialization_races() {
+    let fixture = Fixture::new();
     let path = fixture.encrypted("busy-write", b"abcdefgh");
     let (active_handle, _active_file) = fixture.open(&path, true);
     let (waiting_handle, _waiting_file) = fixture.open(&path, true);
@@ -696,60 +717,33 @@ fn competing_begin_write_returns_busy_without_waiting_for_the_active_writer() {
         Response::Success
     );
 
-    let waiting_fixture = Arc::clone(&fixture);
-    let waiting_handle_for_request = waiting_handle.clone();
-    let (sent, received) = mpsc::channel();
-    let waiting = thread::spawn(move || {
-        let response = waiting_fixture
+    assert_eq!(
+        fixture
             .broker
             .handle(
                 Request::BeginWrite {
-                    handle: waiting_handle_for_request,
+                    handle: waiting_handle.clone(),
                     write_id: waiting_write_id.to_string(),
                     range: ByteRange::new(1, 2).unwrap(),
                 },
                 None,
             )
-            .response;
-        sent.send(response).unwrap();
-    });
-
-    let response = received.recv_timeout(Duration::from_millis(100));
-    if response.is_err() {
-        assert_eq!(
-            fixture
-                .broker
-                .handle(
-                    Request::CancelWrite {
-                        handle: active_handle,
-                        write_id: active_write_id.to_string(),
-                    },
-                    None,
-                )
-                .response,
-            Response::Success
-        );
-        let response = received.recv_timeout(Duration::from_secs(1)).unwrap();
-        if response == Response::Success {
-            assert_eq!(
-                fixture
-                    .broker
-                    .handle(
-                        Request::CancelWrite {
-                            handle: waiting_handle,
-                            write_id: waiting_write_id.to_string(),
-                        },
-                        None,
-                    )
-                    .response,
-                Response::Success
-            );
-        }
-        waiting.join().unwrap();
-        panic!("competing begin-write blocked while another write was active");
-    }
-
-    assert_error(response.unwrap(), libc::EAGAIN);
+            .response,
+        Response::Success
+    );
+    assert_error(
+        fixture
+            .broker
+            .handle(
+                Request::BeginAppend {
+                    handle: waiting_handle.clone(),
+                    write_id: "33333333333333333333333333333333".to_string(),
+                },
+                None,
+            )
+            .response,
+        libc::EAGAIN,
+    );
     assert_eq!(
         fixture
             .broker
@@ -763,7 +757,88 @@ fn competing_begin_write_returns_busy_without_waiting_for_the_active_writer() {
             .response,
         Response::Success
     );
-    waiting.join().unwrap();
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::CancelWrite {
+                    handle: waiting_handle,
+                    write_id: waiting_write_id.to_string(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+}
+
+#[test]
+fn explicit_sync_does_not_fail_only_because_an_ordinary_write_is_in_flight() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("concurrent-sync", b"abcdefgh");
+    let (writing_handle, writing_file) = fixture.open(&path, true);
+    let (syncing_handle, _syncing_file) = fixture.open(&path, true);
+    let write_id = "11111111111111111111111111111111";
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: writing_handle.clone(),
+                    write_id: write_id.to_string(),
+                    range: ByteRange::new(2, 6).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle: syncing_handle,
+                    ranges: Vec::new(),
+                    durable: true,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+
+    write_all_at(&writing_file, b"WXYZ", 2).unwrap();
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::FinishWrite {
+                    handle: writing_handle.clone(),
+                    write_id: write_id.to_string(),
+                    range: ByteRange::new(2, 6).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle: writing_handle,
+                    ranges: Vec::new(),
+                    durable: true,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(fixture.decrypt(&path), b"abWXYZgh");
 }
 
 #[test]
@@ -2007,7 +2082,11 @@ fn release_retain_marks_the_last_reference_closed_and_expiration_finishes_writes
     lock(&local).closed_at = Some(Instant::now() - CLOSED_HANDLE_TTL - Duration::from_secs(1));
     fixture.broker.expire_closed();
     assert!(!lock(&fixture.broker.handles).contains_key(&handle));
-    assert!(lock(&lock(&local).shared.mutations).active.is_none());
+    let shared = lock(&local).shared.clone();
+    let mutations = lock(&shared.mutations);
+    assert!(mutations.ordinary.is_empty());
+    assert!(mutations.append.is_none());
+    assert!(!mutations.exclusive);
 }
 
 #[test]

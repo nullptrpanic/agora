@@ -8,4 +8,4 @@ mod state;
 pub(crate) use crate::filesystem::ByteRangeSet;
 pub(crate) use client::{LocalClient, LocalClientError, LocalFileIdentity};
 pub(crate) use controller::LocalController;
-pub(crate) use state::LocalOpenState;
+pub(crate) use state::{LOCAL_STATUS_FLAGS_MASK, LocalOpenState};

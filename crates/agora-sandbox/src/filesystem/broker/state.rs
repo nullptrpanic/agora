@@ -10,6 +10,9 @@ const FLAGS_OFFSET: u64 = 12;
 const OFFSET_OFFSET: u64 = 16;
 const STATE_MAGIC: u32 = 0x4147_4f52;
 
+pub(crate) const LOCAL_STATUS_FLAGS_MASK: libc::c_int =
+    libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK | libc::O_SYNC | libc::O_DSYNC;
+
 pub(crate) struct LocalOpenState {
     file: File,
     process_lock: Mutex<()>,

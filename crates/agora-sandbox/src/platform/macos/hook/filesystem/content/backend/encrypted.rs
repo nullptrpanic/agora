@@ -6,7 +6,7 @@ use super::{
     WriteOperations,
 };
 use crate::filesystem::Writeback;
-use crate::filesystem::broker::{LocalFileIdentity, LocalOpenState};
+use crate::filesystem::broker::{LOCAL_STATUS_FLAGS_MASK, LocalFileIdentity, LocalOpenState};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -44,6 +44,10 @@ impl EagerEncryptedContent {
 }
 
 impl ContentBackend for EncryptedContent {
+    fn supports_async_write(&self) -> bool {
+        false
+    }
+
     fn read(
         &self,
         state: &ContentState,
@@ -156,13 +160,19 @@ impl ContentBackend for EncryptedContent {
                         true
                     }
                 });
-                if finish_failed {
-                    record_write(state, range);
-                }
                 if matches!(requested_offset, ContentIoOffset::Sequential) {
                     let end = libc::off_t::try_from(range.end)
                         .map_err(|_| errno_error(libc::EOVERFLOW))?;
                     open_state.set_offset(end)?;
+                }
+                if flags & (libc::O_SYNC | libc::O_DSYNC) != 0 {
+                    let ranges = finish_failed.then_some(range).into_iter().collect();
+                    if let Err(error) = local.sync(&self.handle, ranges, true) {
+                        state.record_write(range);
+                        return Err(error.into());
+                    }
+                } else if finish_failed {
+                    state.record_write(range);
                 }
             }
         } else if let Some(active) = &active {
@@ -248,7 +258,7 @@ impl ContentBackend for EncryptedContent {
                 }
             })
         {
-            record_write(state, range);
+            state.record_write(range);
         }
         Ok(result)
     }
@@ -359,23 +369,7 @@ impl ContentBackend for EncryptedContent {
         Ok(())
     }
 
-    fn prepare_native_snapshot(
-        &self,
-        _state: &ContentState,
-        _runtime: &FilesystemHookRuntime,
-    ) -> Result<()> {
-        Ok(())
-    }
-
     fn is_broker_managed(&self) -> bool {
-        true
-    }
-
-    fn serializes_operations(&self) -> bool {
-        true
-    }
-
-    fn tracks_dirty_ranges(&self) -> bool {
         true
     }
 
@@ -403,14 +397,11 @@ impl ContentBackend for EncryptedContent {
         native: libc::c_int,
     ) -> Result<libc::c_int> {
         let logical = self.state.lock()?.flags()?;
-        Ok(
-            (native & !(libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK))
-                | (logical & (libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK)),
-        )
+        Ok((native & !LOCAL_STATUS_FLAGS_MASK) | (logical & LOCAL_STATUS_FLAGS_MASK))
     }
 
     fn native_status_flags(&self, requested: libc::c_int) -> libc::c_int {
-        requested & !(libc::O_APPEND | libc::O_NONBLOCK)
+        requested & !(libc::O_APPEND | libc::O_NONBLOCK | libc::O_SYNC | libc::O_DSYNC)
     }
 
     fn commit_status_flags(&self, _state: &ContentState, requested: libc::c_int) -> Result<()> {
@@ -490,12 +481,4 @@ impl ContentBackend for EagerEncryptedContent {
     ) -> Result<()> {
         self.publish(runtime, descriptor)
     }
-}
-
-fn record_write(state: &ContentState, range: LocalByteRange) {
-    if !state.writable {
-        return;
-    }
-    lock(&state.materialized).insert(range);
-    lock(&state.dirty).insert(range);
 }

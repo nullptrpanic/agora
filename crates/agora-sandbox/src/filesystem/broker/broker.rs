@@ -1,9 +1,9 @@
 use super::protocol::{ByteRange, Request, Response};
-use super::{ByteRangeSet, LocalOpenState};
+use super::{ByteRangeSet, LOCAL_STATUS_FLAGS_MASK, LocalOpenState};
 use crate::filesystem::crypto::PLAINTEXT_BLOCK_SIZE;
 use crate::filesystem::{EncryptedFile, FileCipher};
 use ring::digest::{SHA256, digest};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -82,7 +82,6 @@ struct SharedPlaintext {
     inner: Mutex<SharedFile>,
     lock_anchor: tempfile::NamedTempFile,
     mutations: Mutex<SharedMutations>,
-    mutation_ready: Condvar,
 }
 
 struct SharedFile {
@@ -97,9 +96,9 @@ struct SharedFile {
 
 #[derive(Default)]
 struct SharedMutations {
-    active: Option<WriteKey>,
-    waiting_syncs: usize,
-    syncing: bool,
+    ordinary: HashSet<WriteKey>,
+    append: Option<WriteKey>,
+    exclusive: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -128,70 +127,60 @@ struct BrokerError {
     message: String,
 }
 
-struct SharedSyncGuard<'a> {
+struct SharedExclusiveGuard<'a> {
     shared: &'a SharedPlaintext,
 }
 
-#[derive(Clone, Copy)]
-enum SyncAcquire {
-    Wait,
-    Try,
-}
-
 fn open_status_flags(flags: libc::c_int) -> libc::c_int {
-    flags & (libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK)
+    flags & LOCAL_STATUS_FLAGS_MASK
 }
 
 impl SharedPlaintext {
     fn try_begin_write(&self, key: WriteKey) -> bool {
         let mut mutations = lock(&self.mutations);
-        if mutations.active.as_ref() == Some(&key) {
+        if mutations.ordinary.contains(&key) {
             return true;
         }
-        if mutations.syncing || mutations.waiting_syncs != 0 || mutations.active.is_some() {
+        if mutations.exclusive || mutations.append.is_some() {
             return false;
         }
-        mutations.active = Some(key);
+        mutations.ordinary.insert(key);
+        true
+    }
+
+    fn try_begin_append(&self, key: WriteKey) -> bool {
+        let mut mutations = lock(&self.mutations);
+        if mutations.append.as_ref() == Some(&key) {
+            return true;
+        }
+        if mutations.exclusive || mutations.append.is_some() || !mutations.ordinary.is_empty() {
+            return false;
+        }
+        mutations.append = Some(key);
         true
     }
 
     fn finish_write(&self, key: &WriteKey) {
         let mut mutations = lock(&self.mutations);
-        if mutations.active.as_ref() == Some(key) {
-            mutations.active = None;
-            self.mutation_ready.notify_all();
+        if !mutations.ordinary.remove(key) && mutations.append.as_ref() == Some(key) {
+            mutations.append = None;
         }
     }
 
-    fn begin_sync(&self) -> SharedSyncGuard<'_> {
+    fn try_begin_exclusive(&self) -> Option<SharedExclusiveGuard<'_>> {
         let mut mutations = lock(&self.mutations);
-        mutations.waiting_syncs += 1;
-        while mutations.syncing || mutations.active.is_some() {
-            mutations = self
-                .mutation_ready
-                .wait(mutations)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        mutations.waiting_syncs -= 1;
-        mutations.syncing = true;
-        SharedSyncGuard { shared: self }
-    }
-
-    fn try_begin_sync(&self) -> Option<SharedSyncGuard<'_>> {
-        let mut mutations = lock(&self.mutations);
-        if mutations.syncing || mutations.active.is_some() {
+        if mutations.exclusive || mutations.append.is_some() || !mutations.ordinary.is_empty() {
             return None;
         }
-        mutations.syncing = true;
-        Some(SharedSyncGuard { shared: self })
+        mutations.exclusive = true;
+        Some(SharedExclusiveGuard { shared: self })
     }
 }
 
-impl Drop for SharedSyncGuard<'_> {
+impl Drop for SharedExclusiveGuard<'_> {
     fn drop(&mut self) {
         let mut mutations = lock(&self.shared.mutations);
-        mutations.syncing = false;
-        self.shared.mutation_ready.notify_all();
+        mutations.exclusive = false;
     }
 }
 
@@ -336,7 +325,7 @@ impl LocalBroker {
                 .map_err(BrokerError::into_io)?;
         }
         for (id, _) in &active {
-            self.sync_handle(id, Vec::new(), false, true, false, SyncAcquire::Wait)
+            self.sync_handle(id, Vec::new(), false, true, false)
                 .map_err(BrokerError::into_io)?;
         }
         let mut representatives: Vec<(String, Arc<SharedPlaintext>)> = Vec::new();
@@ -349,7 +338,7 @@ impl LocalBroker {
             }
         }
         for (id, _) in representatives {
-            self.sync_handle(&id, Vec::new(), true, false, false, SyncAcquire::Wait)
+            self.sync_handle(&id, Vec::new(), true, false, false)
                 .map_err(BrokerError::into_io)?;
         }
         Ok(())
@@ -382,7 +371,7 @@ impl LocalBroker {
                 },
             );
         for (id, _) in ids {
-            self.sync_handle(&id, Vec::new(), false, false, false, SyncAcquire::Wait)
+            self.sync_handle(&id, Vec::new(), false, false, false)
                 .map_err(BrokerError::into_io)?;
         }
         if active
@@ -438,7 +427,7 @@ impl LocalBroker {
                 Self::reject_descriptor(descriptor)?;
                 Self::validate_ranges(&ranges)?;
                 self.activate(&handle)?;
-                self.sync_handle(&handle, ranges, durable, true, false, SyncAcquire::Try)?;
+                self.sync_handle(&handle, ranges, durable, true, false)?;
                 Ok(Response::Success)
             }
             Request::PotentiallyDirty { handle, range } => {
@@ -512,7 +501,7 @@ impl LocalBroker {
                     handle: handle.clone(),
                     write_id: write_id.clone(),
                 };
-                if !shared.try_begin_write(key.clone()) {
+                if !shared.try_begin_append(key.clone()) {
                     return Err(BrokerError::busy());
                 }
                 let offset = match lock(&shared.inner).plaintext.metadata() {
@@ -668,14 +657,7 @@ impl LocalBroker {
                     return Ok(Response::Success);
                 };
                 let final_reference = lock(&local).references <= 1;
-                self.sync_handle(
-                    &handle,
-                    ranges,
-                    true,
-                    true,
-                    final_reference,
-                    SyncAcquire::Try,
-                )?;
+                self.sync_handle(&handle, ranges, true, true, final_reference)?;
                 let mut local = lock(&local);
                 if local.references > 0 {
                     local.references -= 1;
@@ -738,7 +720,7 @@ impl LocalBroker {
             if let Some(file) = files.get(&identity).and_then(Weak::upgrade) {
                 drop(files);
                 if flags & libc::O_TRUNC != 0 {
-                    let _sync = file.try_begin_sync().ok_or_else(BrokerError::busy)?;
+                    let _exclusive = file.try_begin_exclusive().ok_or_else(BrokerError::busy)?;
                     let mut shared = lock(&file.inner);
                     shared.plaintext.set_len(0).map_err(|error| {
                         BrokerError::io("failed to truncate shared local plaintext file", error)
@@ -795,7 +777,6 @@ impl LocalBroker {
                             BrokerError::io("failed to create local lock anchor", error)
                         })?,
                     mutations: Mutex::new(SharedMutations::default()),
-                    mutation_ready: Condvar::new(),
                 });
                 lock(&self.files).insert(identity, Arc::downgrade(&file));
                 file
@@ -832,7 +813,7 @@ impl LocalBroker {
     fn materialize(&self, id: &str, range: Option<ByteRange>) -> Result<(), BrokerError> {
         let handle = self.lookup_handle(id)?;
         let shared = Arc::clone(&lock(&handle).shared);
-        let _sync = shared.try_begin_sync().ok_or_else(BrokerError::busy)?;
+        let _exclusive = shared.try_begin_exclusive().ok_or_else(BrokerError::busy)?;
         let mut shared = lock(&shared.inner);
         Self::materialize_locked(&mut shared, range)
     }
@@ -938,17 +919,12 @@ impl LocalBroker {
         durable: bool,
         include_potential: bool,
         include_active: bool,
-        acquire: SyncAcquire,
     ) -> Result<(), BrokerError> {
         if include_active {
             self.abandon_active_writes(id)?;
         }
         let handle = self.lookup_handle(id)?;
         let shared = Arc::clone(&lock(&handle).shared);
-        let _sync = match acquire {
-            SyncAcquire::Wait => shared.begin_sync(),
-            SyncAcquire::Try => shared.try_begin_sync().ok_or_else(BrokerError::busy)?,
-        };
         let mut shared = lock(&shared.inner);
         let handle = lock(&handle);
         let metadata = shared
@@ -985,7 +961,6 @@ impl LocalBroker {
                 candidates.insert(*range);
             }
         }
-        debug_assert!(handle.active_writes.is_empty());
         if include_potential
             && handle.writable
             && candidates.is_empty()

@@ -13,6 +13,7 @@ use crate::filesystem::FileAttributes;
 use crate::filesystem::broker::{LocalFileIdentity, LocalOpenState};
 use anyhow::Result;
 use std::fs::File;
+use std::sync::Mutex;
 
 #[derive(Clone, Copy)]
 pub(crate) enum ContentIoOffset {
@@ -158,12 +159,12 @@ pub(super) trait ContentBackend: Send + Sync {
         false
     }
 
-    fn serializes_operations(&self) -> bool {
-        false
+    fn supports_async_write(&self) -> bool {
+        true
     }
 
-    fn tracks_dirty_ranges(&self) -> bool {
-        false
+    fn operation_lock(&self) -> Option<&Mutex<()>> {
+        None
     }
 
     fn publishes_writes(&self) -> bool {

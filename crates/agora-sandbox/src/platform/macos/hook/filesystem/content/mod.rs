@@ -15,9 +15,7 @@ use std::sync::MutexGuard;
 
 impl ManagedContent {
     fn mutation_guard(&self) -> Option<MutexGuard<'_, ()>> {
-        self.backend
-            .serializes_operations()
-            .then(|| lock(&self.state.mutation))
+        self.backend.operation_lock().map(lock)
     }
 
     pub(crate) fn plain(writable: bool) -> Self {
@@ -84,11 +82,15 @@ impl ManagedContent {
         self.backend.prepare_native_snapshot(&self.state, runtime)
     }
 
+    pub(super) fn supports_async_write(&self) -> bool {
+        self.backend.supports_async_write()
+    }
+
     pub(super) fn record_snapshot_write(&self, range: Option<LocalByteRange>) {
         if self.backend.records_native_snapshot_writes()
             && let Some(range) = range
         {
-            self.record_write(range);
+            self.state.record_write(range);
         }
     }
 
@@ -167,15 +169,6 @@ impl ManagedContent {
     ) -> Result<()> {
         let _mutation = self.mutation_guard();
         self.backend.materialize(&self.state, runtime, range)
-    }
-
-    pub(super) fn record_write(&self, range: LocalByteRange) {
-        if !self.state.writable || !self.backend.tracks_dirty_ranges() {
-            return;
-        }
-        let _mutation = self.mutation_guard();
-        lock(&self.state.materialized).insert(range);
-        lock(&self.state.dirty).insert(range);
     }
 
     pub(super) fn sync(

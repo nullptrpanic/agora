@@ -906,7 +906,7 @@ pub unsafe extern "C" fn agora_sandbox_aio_write(control: *mut libc::aiocb) -> l
                 return -1;
             }
         };
-        if let Err(error) = prepare_native_snapshot_descriptor(runtime, copied.aio_fildes) {
+        if let Err(error) = prepare_async_write_descriptor(runtime, copied.aio_fildes) {
             return unsafe { fail(&error, -1) };
         }
         record_snapshot_write_descriptor(runtime, copied.aio_fildes, aio_read_range(&copied));
@@ -960,8 +960,7 @@ pub unsafe extern "C" fn agora_sandbox_lio_listio(
                     .map(|range| materialize_descriptor(runtime, control.aio_fildes, Some(range)))
                     .transpose(),
                 libc::LIO_WRITE => {
-                    let materialized =
-                        prepare_native_snapshot_descriptor(runtime, control.aio_fildes);
+                    let materialized = prepare_async_write_descriptor(runtime, control.aio_fildes);
                     if materialized.is_ok() {
                         record_snapshot_write_descriptor(
                             runtime,
@@ -1000,6 +999,19 @@ fn prepare_native_snapshot_descriptor(
     let Some(open) = runtime.tracked_open(descriptor) else {
         return Ok(());
     };
+    open.managed().prepare_native_snapshot_if_needed(runtime)
+}
+
+fn prepare_async_write_descriptor(
+    runtime: &FilesystemHookRuntime,
+    descriptor: libc::c_int,
+) -> Result<()> {
+    let Some(open) = runtime.tracked_open(descriptor) else {
+        return Ok(());
+    };
+    if !open.managed().supports_async_write() {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into());
+    }
     open.managed().prepare_native_snapshot_if_needed(runtime)
 }
 

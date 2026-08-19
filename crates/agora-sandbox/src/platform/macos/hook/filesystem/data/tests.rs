@@ -97,6 +97,42 @@ unsafe fn write_managed_file(path: &CString, contents: &[u8]) {
     assert_eq!(unsafe { super::super::agora_sandbox_close(descriptor) }, 0);
 }
 
+unsafe fn read_managed_file(path: &CString) -> Vec<u8> {
+    let descriptor =
+        unsafe { super::super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0) };
+    assert!(descriptor >= 0);
+    let mut contents = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read =
+            unsafe { agora_sandbox_read(descriptor, buffer.as_mut_ptr().cast(), buffer.len()) };
+        assert!(read >= 0);
+        if read == 0 {
+            break;
+        }
+        contents.extend_from_slice(&buffer[..read as usize]);
+    }
+    assert_eq!(unsafe { super::super::agora_sandbox_close(descriptor) }, 0);
+    contents
+}
+
+unsafe fn await_submitted_aio(control: &mut libc::aiocb) -> libc::ssize_t {
+    let controls = [control as *const libc::aiocb];
+    while unsafe { libc::aio_error(control) } == libc::EINPROGRESS {
+        assert_eq!(
+            unsafe {
+                libc::aio_suspend(
+                    controls.as_ptr(),
+                    controls.len() as libc::c_int,
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+    }
+    unsafe { libc::aio_return(control) }
+}
+
 async fn broker_runtime(directory: &Path) -> (FilesystemHookRuntime, LocalController) {
     const KEY: &[u8] = b"broker-hook-test-key";
     const SALT: &[u8] = b"0123456789abcdef";
@@ -613,6 +649,41 @@ async fn broker_managed_descriptors_preserve_complete_posix_io_semantics() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broker_managed_synchronous_writes_preserve_flags_and_complete_durably() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    let path = c_path(&directory.path().join("synchronous.txt"));
+
+    with_test_runtime(&runtime, || unsafe {
+        let descriptor = super::super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC | libc::O_SYNC | libc::O_DSYNC,
+            0o600,
+        );
+        assert!(descriptor >= 0);
+        let native = libc::fcntl(descriptor, libc::F_GETFL);
+        assert!(native >= 0);
+        let logical = super::super::agora_sandbox_fcntl_getfl(descriptor, native);
+        assert_eq!(
+            logical & (libc::O_SYNC | libc::O_DSYNC),
+            libc::O_SYNC | libc::O_DSYNC
+        );
+        assert_eq!(
+            super::super::agora_sandbox_fcntl_setfl_argument(descriptor, logical)
+                & (libc::O_SYNC | libc::O_DSYNC),
+            0
+        );
+        assert_eq!(
+            agora_sandbox_pwrite(descriptor, b"durable".as_ptr().cast(), 7, 0),
+            7
+        );
+        assert_eq!(super::super::agora_sandbox_close(descriptor), 0);
+    });
+
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lazy_broker_reads_materialize_ranges_before_native_io() {
     let directory = tempfile::tempdir().unwrap();
     let logical = directory.path().join("lazy-read.bin");
@@ -993,6 +1064,130 @@ async fn lazy_broker_reads_materialize_ranges_before_native_io() {
     });
 
     controller.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broker_managed_aio_write_is_rejected_before_native_io() {
+    let directory = tempfile::tempdir().unwrap();
+    let logical = directory.path().join("lazy-aio-write.bin");
+    let path = c_path(&logical);
+    let contents = (0..2 * 1024 * 1024)
+        .map(|index| (index % 251 + 1) as u8)
+        .collect::<Vec<_>>();
+
+    let (writer_runtime, writer_controller) = broker_runtime(directory.path()).await;
+    with_test_runtime(&writer_runtime, || unsafe {
+        write_managed_file(&path, &contents);
+    });
+    writer_controller.shutdown().await.unwrap();
+    drop(writer_runtime);
+
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    let (result, errno) = with_test_runtime(&runtime, || unsafe {
+        let descriptor = super::super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
+        assert!(descriptor >= 0);
+        assert!(
+            runtime
+                .tracked_open(descriptor)
+                .unwrap()
+                .local_inheritance()
+                .unwrap()
+                .lazy
+        );
+        let mut replacement = [0x7f_u8];
+        let mut control = std::mem::zeroed::<libc::aiocb>();
+        control.aio_fildes = descriptor;
+        control.aio_offset = 1024 * 1024 + 17;
+        control.aio_buf = replacement.as_mut_ptr().cast();
+        control.aio_nbytes = replacement.len();
+        let result = agora_sandbox_aio_write(&mut control);
+        let errno = *libc::__error();
+        if result == 0 {
+            assert_eq!(
+                await_submitted_aio(&mut control),
+                replacement.len() as isize
+            );
+        }
+        assert_eq!(super::super::agora_sandbox_close(descriptor), 0);
+        (result, errno)
+    });
+    controller.shutdown().await.unwrap();
+    drop(runtime);
+
+    let (reader_runtime, reader_controller) = broker_runtime(directory.path()).await;
+    let actual = with_test_runtime(&reader_runtime, || unsafe { read_managed_file(&path) });
+    reader_controller.shutdown().await.unwrap();
+
+    assert_eq!(result, -1);
+    assert_eq!(errno, libc::ENOTSUP);
+    assert!(
+        actual == contents,
+        "rejected AIO write changed managed contents"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broker_managed_lio_write_is_rejected_before_native_io() {
+    let directory = tempfile::tempdir().unwrap();
+    let logical = directory.path().join("lazy-lio-write.bin");
+    let path = c_path(&logical);
+    let contents = (0..2 * 1024 * 1024)
+        .map(|index| (index % 251 + 1) as u8)
+        .collect::<Vec<_>>();
+
+    let (writer_runtime, writer_controller) = broker_runtime(directory.path()).await;
+    with_test_runtime(&writer_runtime, || unsafe {
+        write_managed_file(&path, &contents);
+    });
+    writer_controller.shutdown().await.unwrap();
+    drop(writer_runtime);
+
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    let (result, errno) = with_test_runtime(&runtime, || unsafe {
+        let descriptor = super::super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
+        assert!(descriptor >= 0);
+        assert!(
+            runtime
+                .tracked_open(descriptor)
+                .unwrap()
+                .local_inheritance()
+                .unwrap()
+                .lazy
+        );
+        let mut replacement = [0x5a_u8];
+        let mut control = std::mem::zeroed::<libc::aiocb>();
+        control.aio_fildes = descriptor;
+        control.aio_offset = 512 * 1024 + 19;
+        control.aio_buf = replacement.as_mut_ptr().cast();
+        control.aio_nbytes = replacement.len();
+        control.aio_lio_opcode = libc::LIO_WRITE;
+        let controls = [&mut control as *mut libc::aiocb];
+        let result = agora_sandbox_lio_listio(
+            libc::LIO_WAIT,
+            controls.as_ptr(),
+            controls.len() as libc::c_int,
+            std::ptr::null_mut(),
+        );
+        let errno = *libc::__error();
+        if result == 0 {
+            assert_eq!(libc::aio_return(&mut control), replacement.len() as isize);
+        }
+        assert_eq!(super::super::agora_sandbox_close(descriptor), 0);
+        (result, errno)
+    });
+    controller.shutdown().await.unwrap();
+    drop(runtime);
+
+    let (reader_runtime, reader_controller) = broker_runtime(directory.path()).await;
+    let actual = with_test_runtime(&reader_runtime, || unsafe { read_managed_file(&path) });
+    reader_controller.shutdown().await.unwrap();
+
+    assert_eq!(result, -1);
+    assert_eq!(errno, libc::ENOTSUP);
+    assert!(
+        actual == contents,
+        "rejected LIO write changed managed contents"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

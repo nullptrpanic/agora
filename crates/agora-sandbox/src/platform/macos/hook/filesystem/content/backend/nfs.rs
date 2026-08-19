@@ -15,6 +15,7 @@ pub(crate) struct NfsContent {
     pub(crate) handle: String,
     pub(crate) metadata: Mutex<RemoteMetadata>,
     pub(crate) snapshot: AtomicBool,
+    pub(crate) operation: Mutex<()>,
 }
 
 impl ContentBackend for NfsContent {
@@ -171,7 +172,7 @@ impl ContentBackend for NfsContent {
             return Ok(result);
         }
         if let Some(range) = operation.reservation {
-            record_write(state, range);
+            state.record_write(range);
         }
         runtime.refresh_attributes(
             operation.descriptor,
@@ -290,12 +291,8 @@ impl ContentBackend for NfsContent {
         true
     }
 
-    fn serializes_operations(&self) -> bool {
-        true
-    }
-
-    fn tracks_dirty_ranges(&self) -> bool {
-        true
+    fn operation_lock(&self) -> Option<&Mutex<()>> {
+        Some(&self.operation)
     }
 
     fn publishes_writes(&self) -> bool {
@@ -374,16 +371,8 @@ fn set_offset_after_io(descriptor: libc::c_int, offset: u64, length: u64) -> Res
     }
 }
 
-fn record_write(state: &ContentState, range: LocalByteRange) {
-    if !state.writable {
-        return;
-    }
-    lock(&state.materialized).insert(range);
-    lock(&state.dirty).insert(range);
-}
-
 fn record_write_bounds(state: &ContentState, start: u64, end: u64) {
     if let Ok(range) = LocalByteRange::new(start, end) {
-        record_write(state, range);
+        state.record_write(range);
     }
 }
