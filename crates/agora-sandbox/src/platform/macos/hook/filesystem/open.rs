@@ -118,16 +118,18 @@ unsafe fn sandbox_open_with_operation(
     operation: OpenOperation,
 ) -> libc::c_int {
     catch_filesystem_panic(-1, || {
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(guard) = FilesystemHookGuard::enter() else {
             return unsafe { operation.call(path, flags, mode) };
         };
         let Some(runtime) = FilesystemHookRuntime::global() else {
+            drop(guard);
             return unsafe { operation.call(path, flags, mode) };
         };
         match runtime.prepare_open(path, libc::AT_FDCWD, flags, mode) {
             Ok(request) => {
                 match request.native_path() {
                     Ok(Some(native)) => {
+                        drop(guard);
                         return unsafe { operation.call(native.as_ptr(), flags, mode) };
                     }
                     Ok(None) => {}
@@ -138,21 +140,31 @@ unsafe fn sandbox_open_with_operation(
                 }
                 let mut prepared = request.into_prepared();
                 let target_is_path = matches!(prepared.prepared.target(), OpenTarget::Path(_));
+                let mut guard = Some(guard);
                 let path_descriptor = match prepared.prepared.target() {
                     OpenTarget::Path(mapped) => {
                         let mapped = match CString::new(mapped.as_os_str().as_bytes()) {
                             Ok(mapped) => mapped,
                             Err(error) => return unsafe { fail(&error.into(), -1) },
                         };
-                        Some(unsafe { operation.call(mapped.as_ptr(), flags, mode) })
+                        drop(guard.take());
+                        let descriptor = unsafe { operation.call(mapped.as_ptr(), flags, mode) };
+                        if descriptor < 0 {
+                            return descriptor;
+                        }
+                        guard = FilesystemHookGuard::enter();
+                        if guard.is_none() {
+                            unsafe { operation.close(descriptor) };
+                            unsafe { set_errno(libc::EIO) };
+                            return -1;
+                        }
+                        Some(descriptor)
                     }
                     OpenTarget::Descriptor(_) => None,
                 };
-                if path_descriptor.is_some_and(|descriptor| descriptor < 0) {
-                    return path_descriptor.unwrap();
-                }
                 if let Err(error) = runtime.commit_open(&mut prepared) {
                     if let Some(descriptor) = path_descriptor {
+                        drop(guard.take());
                         unsafe { operation.close(descriptor) };
                     }
                     return unsafe { fail(&error, -1) };
@@ -278,16 +290,18 @@ unsafe fn sandbox_openat_with_mode(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(directory, path, flags, mode) };
         };
         let Some(runtime) = FilesystemHookRuntime::global() else {
+            drop(guard);
             return unsafe { original(directory, path, flags, mode) };
         };
         match runtime.prepare_open(path, directory, flags, mode) {
             Ok(request) => {
                 match request.native_path() {
                     Ok(Some(native)) => {
+                        drop(guard);
                         return unsafe { original(libc::AT_FDCWD, native.as_ptr(), flags, mode) };
                     }
                     Ok(None) => {}
@@ -298,23 +312,36 @@ unsafe fn sandbox_openat_with_mode(
                 }
                 let mut prepared = request.into_prepared();
                 let target_is_path = matches!(prepared.prepared.target(), OpenTarget::Path(_));
+                let mut guard = Some(guard);
                 let path_descriptor = match prepared.prepared.target() {
                     OpenTarget::Path(mapped) => {
                         let mapped = match CString::new(mapped.as_os_str().as_bytes()) {
                             Ok(mapped) => mapped,
                             Err(error) => return unsafe { fail(&error.into(), -1) },
                         };
-                        Some(unsafe { original(libc::AT_FDCWD, mapped.as_ptr(), flags, mode) })
+                        drop(guard.take());
+                        let descriptor =
+                            unsafe { original(libc::AT_FDCWD, mapped.as_ptr(), flags, mode) };
+                        if descriptor < 0 {
+                            return descriptor;
+                        }
+                        guard = FilesystemHookGuard::enter();
+                        if guard.is_none() {
+                            if let Some(close) = original_close() {
+                                unsafe { close(descriptor) };
+                            }
+                            unsafe { set_errno(libc::EIO) };
+                            return -1;
+                        }
+                        Some(descriptor)
                     }
                     OpenTarget::Descriptor(_) => None,
                 };
-                if path_descriptor.is_some_and(|descriptor| descriptor < 0) {
-                    return path_descriptor.unwrap();
-                }
                 if let Err(error) = runtime.commit_open(&mut prepared) {
                     if let Some(descriptor) = path_descriptor
                         && let Some(close) = original_close()
                     {
+                        drop(guard.take());
                         unsafe { close(descriptor) };
                     }
                     return unsafe { fail(&error, -1) };
@@ -370,16 +397,20 @@ unsafe fn sandbox_fopen(path: *const libc::c_char, mode: *const libc::c_char) ->
             unsafe { set_errno(libc::ENOSYS) };
             return std::ptr::null_mut();
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(path, mode) };
         };
         let Some(runtime) = FilesystemHookRuntime::global() else {
+            drop(guard);
             return unsafe { original(path, mode) };
         };
         match runtime.prepare_fopen(path, mode) {
             Ok(request) => {
                 match request.native_path() {
-                    Ok(Some(native)) => return unsafe { original(native.as_ptr(), mode) },
+                    Ok(Some(native)) => {
+                        drop(guard);
+                        return unsafe { original(native.as_ptr(), mode) };
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         return unsafe { fail(&error, std::ptr::null_mut()) };
@@ -390,6 +421,7 @@ unsafe fn sandbox_fopen(path: *const libc::c_char, mode: *const libc::c_char) ->
                     return unsafe { fail_audit(&error, std::ptr::null_mut()) };
                 }
                 let mut prepared = request.into_prepared();
+                let mut guard = Some(guard);
                 let path_stream = match prepared.prepared.target() {
                     OpenTarget::Path(mapped) => {
                         let mapped = match CString::new(mapped.as_os_str().as_bytes()) {
@@ -398,22 +430,39 @@ unsafe fn sandbox_fopen(path: *const libc::c_char, mode: *const libc::c_char) ->
                                 return unsafe { fail(&error.into(), std::ptr::null_mut()) };
                             }
                         };
-                        Some(unsafe { original(mapped.as_ptr(), mode) })
+                        drop(guard.take());
+                        let stream = unsafe { original(mapped.as_ptr(), mode) };
+                        if stream.is_null() {
+                            return stream;
+                        }
+                        guard = FilesystemHookGuard::enter();
+                        if guard.is_none() {
+                            if let Some(close) = original_fclose() {
+                                unsafe { close(stream) };
+                            }
+                            unsafe { set_errno(libc::EIO) };
+                            return std::ptr::null_mut();
+                        }
+                        Some(stream)
                     }
                     OpenTarget::Descriptor(_) => None,
                 };
-                if path_stream.is_some_and(|stream| stream.is_null()) {
-                    return std::ptr::null_mut();
-                }
                 if let Err(error) = runtime.commit_open(&mut prepared) {
                     if let Some(stream) = path_stream
                         && let Some(close) = original_fclose()
                     {
+                        drop(guard.take());
                         unsafe { close(stream) };
                     }
                     return unsafe { fail(&error, std::ptr::null_mut()) };
                 }
                 let (target, open) = prepared.into_parts();
+                if let OpenTarget::Descriptor(file) = &target
+                    && let Err(error) = open.managed().materialize(runtime, None)
+                {
+                    let _ = runtime.finish_open_file(file.as_raw_fd(), &open);
+                    return unsafe { fail(&error, std::ptr::null_mut()) };
+                }
                 let stream = match target {
                     OpenTarget::Path(_) => path_stream.expect("path target was opened"),
                     OpenTarget::Descriptor(file) => {

@@ -416,6 +416,113 @@ fn nfs_files_use_anonymous_descriptors_without_overlay_state() {
 }
 
 #[test]
+fn nfs_fclose_flushes_buffered_stream_data_before_remote_close() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage
+        .insert_file(0, "buffered.txt", b"stale contents");
+    let path = Fixture::c_path(&nfs.logical_root.join("buffered.txt"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let stream = sandbox_fopen(path.as_ptr(), c"w".as_ptr());
+        assert!(!stream.is_null());
+        assert_eq!(
+            libc::setvbuf(stream, std::ptr::null_mut(), libc::_IOFBF, 4096),
+            0
+        );
+        let contents = b"buffered remote contents";
+        assert_eq!(
+            libc::fwrite(contents.as_ptr().cast(), 1, contents.len(), stream),
+            contents.len()
+        );
+        assert_eq!(nfs.storage.data(0, "buffered.txt"), Some(Vec::new()));
+        assert_eq!(sandbox_fclose(stream), 0);
+    });
+
+    assert_eq!(
+        nfs.storage.data(0, "buffered.txt"),
+        Some(b"buffered remote contents".to_vec())
+    );
+}
+
+#[test]
+fn nfs_direct_fstat_and_seek_end_refresh_external_size_changes() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "metadata.txt", b"old");
+    let path = Fixture::c_path(&nfs.logical_root.join("metadata.txt"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
+        assert!(descriptor >= 0);
+        nfs.storage.replace(0, "metadata.txt", b"external contents");
+
+        let mut status = std::mem::zeroed();
+        assert_eq!(sandbox_fstat(descriptor, &mut status), 0);
+        assert_eq!(status.st_size, 17);
+        assert_eq!(status.st_mtime, 2);
+        assert_eq!(sandbox_lseek(descriptor, 0, libc::SEEK_END), 17);
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+}
+
+#[test]
+fn nfs_direct_write_stays_successful_if_the_local_placeholder_cannot_resize() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "placeholder-write.txt", b"old");
+    let path = Fixture::c_path(&nfs.logical_root.join("placeholder-write.txt"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
+        assert!(descriptor >= 0);
+        let mut pipe = [-1; 2];
+        assert_eq!(libc::pipe(pipe.as_mut_ptr()), 0);
+        assert_eq!(libc::dup2(pipe[1], descriptor), descriptor);
+        assert_eq!(libc::close(pipe[1]), 0);
+
+        assert_eq!(
+            sandbox_pwrite(descriptor, b"remote".as_ptr().cast(), 6, 0),
+            6
+        );
+        assert_eq!(
+            nfs.storage.data(0, "placeholder-write.txt"),
+            Some(b"remote".to_vec())
+        );
+        assert_eq!(sandbox_close(descriptor), 0);
+        assert_eq!(libc::close(pipe[0]), 0);
+    });
+}
+
+#[test]
+fn nfs_direct_truncate_stays_successful_if_the_local_placeholder_cannot_resize() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage
+        .insert_file(0, "placeholder-truncate.txt", b"remote contents");
+    let path = Fixture::c_path(&nfs.logical_root.join("placeholder-truncate.txt"));
+    let replacement = fixture.lower.join("read-only-placeholder");
+    std::fs::write(&replacement, b"local").unwrap();
+    let replacement = Fixture::c_path(&replacement);
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
+        assert!(descriptor >= 0);
+        let read_only = libc::open(replacement.as_ptr(), libc::O_RDONLY);
+        assert!(read_only >= 0);
+        assert_eq!(libc::dup2(read_only, descriptor), descriptor);
+        assert_eq!(libc::close(read_only), 0);
+
+        assert_eq!(sandbox_ftruncate(descriptor, 6), 0);
+        assert_eq!(
+            nfs.storage.data(0, "placeholder-truncate.txt"),
+            Some(b"remote".to_vec())
+        );
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+}
+
+#[test]
 fn nfs_positioned_and_vectored_writes_preserve_offsets_and_flush_exact_content() {
     let mut fixture = Fixture::new();
     let nfs = fixture.attach_nfs();
@@ -4120,6 +4227,57 @@ fn filesystem_hook_guard_blocks_catchable_signals_while_state_is_active() {
         drop(guard);
         assert!(!signal.is_blocked());
     });
+}
+
+unsafe extern "C" fn interrupt_open(_signal: libc::c_int) {}
+
+#[test]
+fn native_blocking_open_is_interruptible_after_managed_path_preparation() {
+    let fixture = Fixture::new();
+    let fifo = fixture.lower.join("blocking-fifo");
+    let fifo_path = Fixture::c_path(&fifo);
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    let signal = super::super::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+    let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    action.sa_sigaction = interrupt_open as *const () as usize;
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    assert_eq!(
+        unsafe { libc::sigaction(libc::SIGUSR2, &action, &mut previous) },
+        0
+    );
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let opener = libc::pthread_self() as usize;
+        let release_path = fifo_path.clone();
+        let interrupter = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            assert_eq!(
+                libc::pthread_kill(opener as libc::pthread_t, libc::SIGUSR2),
+                0
+            );
+            thread::sleep(Duration::from_millis(100));
+            let release = libc::open(release_path.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK);
+            assert!(release >= 0);
+            libc::close(release);
+        });
+
+        let result = sandbox_open_with_mode(fifo_path.as_ptr(), libc::O_RDONLY, 0);
+        let error = std::io::Error::last_os_error();
+        if result >= 0 {
+            libc::close(result);
+        }
+        interrupter.join().unwrap();
+
+        assert_eq!(result, -1);
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    });
+
+    assert_eq!(
+        unsafe { libc::sigaction(libc::SIGUSR2, &previous, std::ptr::null_mut()) },
+        0
+    );
+    assert!(!signal.is_blocked());
 }
 
 unsafe extern "C" fn flock_requiring_unblocked_signals(

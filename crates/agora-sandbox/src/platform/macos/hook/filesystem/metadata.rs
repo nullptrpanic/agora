@@ -359,15 +359,25 @@ unsafe fn sandbox_fstat(descriptor: libc::c_int, status: *mut libc::stat) -> lib
             && !status.is_null()
             && let Some(open) = runtime.tracked_open(descriptor)
         {
-            let attributes = match open.managed_attributes(runtime) {
-                Ok(Some(attributes)) => Some(attributes),
+            let (plaintext_size, attributes) = match open.managed_attributes(runtime) {
+                Ok(Some((size, attributes))) => {
+                    let size = match libc::off_t::try_from(size) {
+                        Ok(size) => size,
+                        Err(_) => {
+                            return unsafe {
+                                fail(&io::Error::from_raw_os_error(libc::EOVERFLOW).into(), -1)
+                            };
+                        }
+                    };
+                    (Some(size), Some(attributes))
+                }
                 Ok(None) => match runtime.filesystem.attributes(&open.logical()) {
-                    Ok(attributes) => attributes,
+                    Ok(attributes) => (None, attributes),
                     Err(error) => return unsafe { fail(&error, -1) },
                 },
                 Err(error) => return unsafe { fail(&error, -1) },
             };
-            unsafe { patch_stat(&mut *status, None, attributes.as_ref()) };
+            unsafe { patch_stat(&mut *status, plaintext_size, attributes.as_ref()) };
             if let Some(local) = open.local_inheritance() {
                 unsafe {
                     (*status).st_dev = local.identity.device as _;

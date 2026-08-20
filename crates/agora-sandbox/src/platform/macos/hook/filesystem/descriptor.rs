@@ -305,10 +305,11 @@ unsafe fn sandbox_fclose(stream: *mut libc::FILE) -> libc::c_int {
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(stream) };
         };
         let Some(runtime) = FilesystemHookRuntime::global() else {
+            drop(guard);
             return unsafe { original(stream) };
         };
         let descriptor = if stream.is_null() {
@@ -316,23 +317,26 @@ unsafe fn sandbox_fclose(stream: *mut libc::FILE) -> libc::c_int {
         } else {
             unsafe { libc::fileno(stream) }
         };
+        let Some(file) = runtime.tracked(descriptor) else {
+            drop(guard);
+            return unsafe { original(stream) };
+        };
+        if let Err(error) = runtime.publish(FileOperation::Close, file) {
+            return unsafe { fail_audit(&error, -1) };
+        }
+        drop(guard);
+        let flush_result = unsafe { libc::fflush(stream) };
+        let flush_errno = (flush_result != 0).then(|| unsafe { *libc::__error() });
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            unsafe { set_errno(libc::EIO) };
+            return -1;
+        };
         let _operation = runtime.operations.acquire(
             mapping::OperationRequest::new()
                 .descriptor_registry_shared()
                 .descriptor_exclusive(descriptor),
         );
         let transition = runtime.begin_descriptor_transition_under_lease(descriptor);
-        if let Some(file) = runtime.tracked(descriptor)
-            && let Err(error) = runtime.publish(FileOperation::Close, file)
-        {
-            return unsafe { fail_audit(&error, -1) };
-        }
-        let flush_result = if descriptor >= 0 {
-            unsafe { libc::fflush(stream) }
-        } else {
-            0
-        };
-        let flush_errno = (flush_result != 0).then(|| unsafe { *libc::__error() });
         let tracked = runtime.take_descriptor_during_transition_under_lease(descriptor);
         if let Some((open, true)) = &tracked {
             let result = if runtime.has_mapping(open) {

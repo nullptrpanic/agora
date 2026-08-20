@@ -1085,6 +1085,37 @@ fn sync_ignores_ranges_beyond_eof_and_reports_plaintext_read_failures() {
 }
 
 #[test]
+fn failed_close_keeps_the_live_reference_for_a_later_retry() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("close-retry", b"data");
+    let (handle, _) = fixture.open(&path, true);
+
+    {
+        let local = lock(&fixture.broker.handles).get(&handle).unwrap().clone();
+        let shared = Arc::clone(&lock(&local).shared);
+        let mut shared = lock(&shared.inner);
+        shared.plaintext = File::open(fixture.root.path()).unwrap();
+        shared.baseline = PlaintextIdentity::from_metadata(&shared.plaintext.metadata().unwrap());
+    }
+
+    let response = fixture
+        .broker
+        .handle(
+            Request::Close {
+                handle: handle.clone(),
+                ranges: vec![ByteRange::new(0, 1).unwrap()],
+            },
+            None,
+        )
+        .response;
+    assert!(matches!(response, Response::Error { .. }));
+
+    let local = lock(&fixture.broker.handles).get(&handle).unwrap().clone();
+    assert_eq!(lock(&local).references, 1);
+    assert!(lock(&local).closed_at.is_none());
+}
+
+#[test]
 fn broker_protocol_errors_preserve_their_message() {
     let error = BrokerError::protocol_error(anyhow::anyhow!("invalid backing path"));
 

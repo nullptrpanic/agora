@@ -289,6 +289,18 @@ impl RemoteFilesystem {
         request_sync(&self.client, handle, ranges)
     }
 
+    pub(super) fn metadata(&self, handle: &str) -> Result<RemoteMetadata> {
+        let reply = self.request(Request::Metadata {
+            handle: handle.to_string(),
+        })?;
+        match reply.response {
+            Response::Metadata { metadata } => Ok(metadata),
+            _ => Err(protocol_error(
+                "remote metadata returned an unexpected response",
+            )),
+        }
+    }
+
     pub(super) fn read(&self, handle: &str, offset: u64, length: u32) -> Result<(OwnedFd, u32)> {
         let mut reply = self.request(Request::Read {
             handle: handle.to_string(),

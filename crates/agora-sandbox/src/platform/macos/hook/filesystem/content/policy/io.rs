@@ -40,7 +40,7 @@ pub(crate) unsafe fn managed_seek_io(
     descriptor: libc::c_int,
     requested_offset: libc::off_t,
     whence: libc::c_int,
-    mut native: impl FnMut() -> libc::off_t,
+    mut native: impl FnMut(libc::off_t, libc::c_int) -> libc::off_t,
 ) -> Option<libc::off_t> {
     let runtime = FilesystemHookRuntime::global()?;
     let _operation = runtime.operations.acquire(

@@ -92,7 +92,7 @@ unsafe fn sandbox_read_with(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(hook_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, buffer, length) };
         };
         match unsafe {
@@ -120,7 +120,10 @@ unsafe fn sandbox_read_with(
             )
         } {
             Some(result) => result,
-            None => unsafe { original(descriptor, buffer, length) },
+            None => {
+                drop(hook_guard);
+                unsafe { original(descriptor, buffer, length) }
+            }
         }
     })
 }
@@ -154,7 +157,7 @@ unsafe fn sandbox_pread_with(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(hook_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, buffer, length, offset) };
         };
         match unsafe {
@@ -168,7 +171,10 @@ unsafe fn sandbox_pread_with(
             )
         } {
             Some(result) => result,
-            None => unsafe { original(descriptor, buffer, length, offset) },
+            None => {
+                drop(hook_guard);
+                unsafe { original(descriptor, buffer, length, offset) }
+            }
         }
     })
 }
@@ -195,7 +201,7 @@ unsafe fn sandbox_readv_with(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(hook_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, vectors, count) };
         };
         match unsafe {
@@ -223,7 +229,10 @@ unsafe fn sandbox_readv_with(
             )
         } {
             Some(result) => result,
-            None => unsafe { original(descriptor, vectors, count) },
+            None => {
+                drop(hook_guard);
+                unsafe { original(descriptor, vectors, count) }
+            }
         }
     })
 }
@@ -257,7 +266,7 @@ unsafe fn sandbox_preadv_with(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(hook_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, vectors, count, offset) };
         };
         match unsafe {
@@ -271,7 +280,10 @@ unsafe fn sandbox_preadv_with(
             )
         } {
             Some(result) => result,
-            None => unsafe { original(descriptor, vectors, count, offset) },
+            None => {
+                drop(hook_guard);
+                unsafe { original(descriptor, vectors, count, offset) }
+            }
         }
     })
 }
@@ -298,7 +310,7 @@ unsafe fn sandbox_write_with(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(hook_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, buffer, length) };
         };
         match unsafe {
@@ -327,7 +339,10 @@ unsafe fn sandbox_write_with(
             )
         } {
             Some(result) => result,
-            None => unsafe { original(descriptor, buffer, length) },
+            None => {
+                drop(hook_guard);
+                unsafe { original(descriptor, buffer, length) }
+            }
         }
     })
 }
@@ -361,7 +376,7 @@ unsafe fn sandbox_pwrite_with(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(hook_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, buffer, length, offset) };
         };
         match unsafe {
@@ -376,7 +391,10 @@ unsafe fn sandbox_pwrite_with(
             )
         } {
             Some(result) => result,
-            None => unsafe { original(descriptor, buffer, length, offset) },
+            None => {
+                drop(hook_guard);
+                unsafe { original(descriptor, buffer, length, offset) }
+            }
         }
     })
 }
@@ -403,7 +421,7 @@ unsafe fn sandbox_writev_with(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(hook_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, vectors, count) };
         };
         match unsafe {
@@ -441,7 +459,10 @@ unsafe fn sandbox_writev_with(
             )
         } {
             Some(result) => result,
-            None => unsafe { original(descriptor, vectors, count) },
+            None => {
+                drop(hook_guard);
+                unsafe { original(descriptor, vectors, count) }
+            }
         }
     })
 }
@@ -475,7 +496,7 @@ unsafe fn sandbox_pwritev_with(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(hook_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, vectors, count, offset) };
         };
         match unsafe {
@@ -499,7 +520,10 @@ unsafe fn sandbox_pwritev_with(
             )
         } {
             Some(result) => result,
-            None => unsafe { original(descriptor, vectors, count, offset) },
+            None => {
+                drop(hook_guard);
+                unsafe { original(descriptor, vectors, count, offset) }
+            }
         }
     })
 }
@@ -526,7 +550,7 @@ pub unsafe extern "C" fn agora_sandbox_guarded_write(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_hook_guard) = FilesystemHookGuard::enter() else {
+        let Some(hook_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, guard, buffer, length) };
         };
         if let Some(runtime) = FilesystemHookRuntime::global()
@@ -553,7 +577,10 @@ pub unsafe extern "C" fn agora_sandbox_guarded_write(
             )
         } {
             Some(result) => result,
-            None => unsafe { original(descriptor, guard, buffer, length) },
+            None => {
+                drop(hook_guard);
+                unsafe { original(descriptor, guard, buffer, length) }
+            }
         }
     })
 }
@@ -571,7 +598,7 @@ pub unsafe extern "C" fn agora_sandbox_guarded_pwrite(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_hook_guard) = FilesystemHookGuard::enter() else {
+        let Some(hook_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, guard, buffer, length, offset) };
         };
         if let Some(runtime) = FilesystemHookRuntime::global()
@@ -591,7 +618,10 @@ pub unsafe extern "C" fn agora_sandbox_guarded_pwrite(
             )
         } {
             Some(result) => result,
-            None => unsafe { original(descriptor, guard, buffer, length, offset) },
+            None => {
+                drop(hook_guard);
+                unsafe { original(descriptor, guard, buffer, length, offset) }
+            }
         }
     })
 }
@@ -608,7 +638,7 @@ pub unsafe extern "C" fn agora_sandbox_guarded_writev(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_hook_guard) = FilesystemHookGuard::enter() else {
+        let Some(hook_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, guard, vectors, count) };
         };
         if let Some(runtime) = FilesystemHookRuntime::global()
@@ -632,7 +662,10 @@ pub unsafe extern "C" fn agora_sandbox_guarded_writev(
             )
         } {
             Some(result) => result,
-            None => unsafe { original(descriptor, guard, vectors, count) },
+            None => {
+                drop(hook_guard);
+                unsafe { original(descriptor, guard, vectors, count) }
+            }
         }
     })
 }
@@ -647,16 +680,19 @@ unsafe fn sandbox_lseek(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(hook_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, offset, whence) };
         };
         match unsafe {
-            managed_seek_io(descriptor, offset, whence, || {
+            managed_seek_io(descriptor, offset, whence, |offset, whence| {
                 original(descriptor, offset, whence)
             })
         } {
             Some(result) => result,
-            None => unsafe { original(descriptor, offset, whence) },
+            None => {
+                drop(hook_guard);
+                unsafe { original(descriptor, offset, whence) }
+            }
         }
     })
 }

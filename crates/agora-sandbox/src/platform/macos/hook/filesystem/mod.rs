@@ -310,7 +310,7 @@ impl OpenFile {
     fn managed_attributes(
         &self,
         runtime: &FilesystemHookRuntime,
-    ) -> Result<Option<FileAttributes>> {
+    ) -> Result<Option<(u64, FileAttributes)>> {
         self.managed().file_attributes(runtime)
     }
 

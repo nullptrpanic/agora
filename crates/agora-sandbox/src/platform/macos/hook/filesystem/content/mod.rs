@@ -61,7 +61,8 @@ impl ManagedContent {
     pub(super) fn file_attributes(
         &self,
         runtime: &FilesystemHookRuntime,
-    ) -> Result<Option<crate::filesystem::FileAttributes>> {
+    ) -> Result<Option<(u64, crate::filesystem::FileAttributes)>> {
+        let _mutation = self.mutation_guard();
         self.backend.file_attributes(runtime)
     }
 

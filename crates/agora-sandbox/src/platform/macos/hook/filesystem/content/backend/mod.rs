@@ -102,9 +102,9 @@ pub(super) trait ContentBackend: Send + Sync {
         _descriptor: libc::c_int,
         _requested_offset: libc::off_t,
         _whence: libc::c_int,
-        native: &mut dyn FnMut() -> libc::off_t,
+        native: &mut dyn FnMut(libc::off_t, libc::c_int) -> libc::off_t,
     ) -> Result<libc::off_t> {
-        Ok(native())
+        Ok(native(_requested_offset, _whence))
     }
 
     fn truncate(
@@ -179,7 +179,10 @@ pub(super) trait ContentBackend: Send + Sync {
         false
     }
 
-    fn file_attributes(&self, _runtime: &FilesystemHookRuntime) -> Result<Option<FileAttributes>> {
+    fn file_attributes(
+        &self,
+        _runtime: &FilesystemHookRuntime,
+    ) -> Result<Option<(u64, FileAttributes)>> {
         Ok(None)
     }
 

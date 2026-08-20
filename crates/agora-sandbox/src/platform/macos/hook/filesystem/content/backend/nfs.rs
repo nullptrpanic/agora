@@ -1,4 +1,4 @@
-use super::super::super::{FilesystemHookRuntime, LocalByteRange, OpenFile, lock};
+use super::super::super::{FilesystemHookRuntime, LocalByteRange, OpenFile, lock, set_errno};
 use super::super::policy::{ReadOperations, WriteOperations, errno_error};
 use super::super::state::ContentState;
 use super::{
@@ -112,16 +112,8 @@ impl ContentBackend for NfsContent {
         if written > copied {
             return Err(errno_error(libc::EIO));
         }
-        let local_size = libc::off_t::try_from(size).map_err(|_| errno_error(libc::EFBIG))?;
-        if unsafe { libc::ftruncate(descriptor, local_size) } != 0 {
-            return Ok(ContentWriteResult {
-                result: -1,
-                start: Some(actual_offset),
-                published: true,
-                recoverable: false,
-            });
-        }
         lock(&self.metadata).size = size;
+        Self::resize_placeholder(descriptor, size);
         Ok(ContentWriteResult {
             result: written as libc::ssize_t,
             start: Some(actual_offset),
@@ -135,14 +127,27 @@ impl ContentBackend for NfsContent {
         state: &ContentState,
         runtime: &FilesystemHookRuntime,
         _descriptor: libc::c_int,
-        _requested_offset: libc::off_t,
+        requested_offset: libc::off_t,
         whence: libc::c_int,
-        native: &mut dyn FnMut() -> libc::off_t,
+        native: &mut dyn FnMut(libc::off_t, libc::c_int) -> libc::off_t,
     ) -> Result<libc::off_t> {
         if matches!(whence, libc::SEEK_DATA | libc::SEEK_HOLE) {
             self.materialize(state, runtime, None)?;
+            return Ok(native(requested_offset, whence));
         }
-        Ok(native())
+        if whence != libc::SEEK_END || self.snapshot.load(Ordering::Acquire) {
+            return Ok(native(requested_offset, whence));
+        }
+        let metadata = self.refresh_metadata(runtime)?;
+        let size =
+            libc::off_t::try_from(metadata.size).map_err(|_| errno_error(libc::EOVERFLOW))?;
+        let next = size
+            .checked_add(requested_offset)
+            .ok_or_else(|| errno_error(libc::EOVERFLOW))?;
+        if next < 0 {
+            return Err(errno_error(libc::EINVAL));
+        }
+        Ok(native(next, libc::SEEK_SET))
     }
 
     fn truncate(
@@ -157,11 +162,11 @@ impl ContentBackend for NfsContent {
                 .as_ref()
                 .context("remote filesystem runtime is unavailable")?
                 .set_length(&self.handle, operation.requested_length)?;
-            let result = (operation.native)();
-            if result == 0 {
-                lock(&self.metadata).size = size;
-            }
-            return Ok(result);
+            lock(&self.metadata).size = size;
+            let caller_errno = unsafe { *libc::__error() };
+            let _ = (operation.native)();
+            unsafe { set_errno(caller_errno) };
+            return Ok(0);
         }
         let result = (operation.native)();
         if result != 0 {
@@ -278,12 +283,17 @@ impl ContentBackend for NfsContent {
     fn file_attributes(
         &self,
         runtime: &FilesystemHookRuntime,
-    ) -> Result<Option<crate::filesystem::FileAttributes>> {
+    ) -> Result<Option<(u64, crate::filesystem::FileAttributes)>> {
         let remote = runtime
             .remote
             .as_ref()
             .context("remote filesystem runtime is unavailable")?;
-        Ok(Some(remote.attributes(&lock(&self.metadata))))
+        let metadata = if self.snapshot.load(Ordering::Acquire) {
+            lock(&self.metadata).clone()
+        } else {
+            self.refresh_metadata(runtime)?
+        };
+        Ok(Some((metadata.size, remote.attributes(&metadata))))
     }
 
     fn is_directory(&self) -> bool {
@@ -301,6 +311,16 @@ impl ContentBackend for NfsContent {
 }
 
 impl NfsContent {
+    fn refresh_metadata(&self, runtime: &FilesystemHookRuntime) -> Result<RemoteMetadata> {
+        let metadata = runtime
+            .remote
+            .as_ref()
+            .context("remote filesystem runtime is unavailable")?
+            .metadata(&self.handle)?;
+        *lock(&self.metadata) = metadata.clone();
+        Ok(metadata)
+    }
+
     fn sync_dirty(
         &self,
         state: &ContentState,
@@ -313,16 +333,22 @@ impl NfsContent {
             .context("remote filesystem runtime is unavailable")?;
         let mut dirty = lock(&state.dirty);
         if let Some(metadata) = remote.sync(&self.handle, dirty.to_vec())? {
-            if descriptor >= 0 {
-                let size =
-                    libc::off_t::try_from(metadata.size).map_err(|_| errno_error(libc::EFBIG))?;
-                if unsafe { libc::ftruncate(descriptor, size) } != 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-            }
+            Self::resize_placeholder(descriptor, metadata.size);
             *lock(&self.metadata) = metadata;
         }
         dirty.clear();
         Ok(())
+    }
+
+    fn resize_placeholder(descriptor: libc::c_int, size: u64) {
+        let Ok(size) = libc::off_t::try_from(size) else {
+            return;
+        };
+        if descriptor < 0 {
+            return;
+        }
+        let caller_errno = unsafe { *libc::__error() };
+        let _ = unsafe { libc::ftruncate(descriptor, size) };
+        unsafe { set_errno(caller_errno) };
     }
 }

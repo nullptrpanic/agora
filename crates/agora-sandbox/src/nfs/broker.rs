@@ -256,7 +256,8 @@ where
             | Request::CreateDirectory { path, .. }
             | Request::Remove { path, .. } => Some(path.root()),
             Request::Rename { from, .. } => Some(from.root()),
-            Request::Read { handle, .. }
+            Request::Metadata { handle }
+            | Request::Read { handle, .. }
             | Request::Write { handle, .. }
             | Request::SetLength { handle, .. }
             | Request::Materialize { handle, .. }
@@ -306,6 +307,13 @@ where
                     ));
                 }
                 Ok(success())
+            }
+            Request::Metadata { handle } => {
+                let metadata = self.metadata(&handle).await?;
+                Ok(BrokerReply {
+                    response: Response::Metadata { metadata },
+                    descriptor: None,
+                })
             }
             Request::Read {
                 handle,
@@ -848,6 +856,24 @@ where
         })
     }
 
+    async fn metadata(&self, id: &str) -> StorageResult<RemoteMetadata> {
+        let handle = self.open_handle(id).await?;
+        let mut handle = handle.lock().await;
+        if handle.snapshot || handle.backend.is_none() {
+            return handle
+                .baseline
+                .clone()
+                .ok_or_else(|| StorageError::new(libc::EBADF, "remote metadata is unavailable"));
+        }
+        let backend = handle
+            .backend
+            .as_mut()
+            .ok_or_else(|| StorageError::new(libc::EISDIR, "remote handle is a directory"))?;
+        let metadata = self.storage.file_metadata(backend).await?;
+        handle.baseline = Some(metadata.clone());
+        Ok(metadata)
+    }
+
     async fn write(
         &self,
         id: &str,
@@ -985,7 +1011,21 @@ where
             .clone()
             .ok_or_else(|| StorageError::new(libc::EBADF, "remote metadata is unavailable"))?;
         if range.is_none() && !handle.snapshot && handle.materialized.is_empty() {
-            let (metadata, checksum) = {
+            let (metadata, checksum) = if baseline.size == 0 {
+                let current = self.snapshot_backend_metadata(&mut handle).await?;
+                ensure_same_snapshot(&baseline, &current)?;
+                let file = handle.file.as_ref().ok_or_else(|| {
+                    StorageError::new(libc::EBADF, "remote placeholder is unavailable")
+                })?;
+                let checksum = checksum_file(
+                    file.try_clone().map_err(|error| {
+                        storage_io("failed to clone empty remote snapshot", error)
+                    })?,
+                    deadline,
+                )
+                .await?;
+                (current, checksum)
+            } else {
                 let RemoteHandle { backend, file, .. } = &mut *handle;
                 let backend = backend.as_mut().ok_or_else(|| {
                     StorageError::new(libc::EISDIR, "remote handle is a directory")

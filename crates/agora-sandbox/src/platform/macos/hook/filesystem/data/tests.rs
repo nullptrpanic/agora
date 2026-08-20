@@ -71,6 +71,69 @@ fn untracked_blocking_write_is_interruptible_outside_the_rust_hook_guard() {
     assert!(!signal.is_blocked());
 }
 
+#[test]
+fn high_untracked_blocking_write_is_interruptible_outside_the_rust_hook_guard() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = FilesystemHookRuntime::new(directory.path().join("fs")).unwrap();
+    let signal = super::super::super::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+    let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    action.sa_sigaction = interrupt_write as *const () as usize;
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    assert_eq!(
+        unsafe { libc::sigaction(libc::SIGUSR2, &action, &mut previous) },
+        0
+    );
+    let mut descriptors = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+    let read = descriptors[0];
+    let original_write = descriptors[1];
+    let write = unsafe { libc::fcntl(original_write, libc::F_DUPFD, 65_536) };
+    assert!(write >= 65_536);
+    assert_eq!(unsafe { libc::close(original_write) }, 0);
+    let flags = unsafe { libc::fcntl(write, libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(write, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let bytes = [0_u8; 4096];
+    while unsafe { libc::write(write, bytes.as_ptr().cast(), bytes.len()) } >= 0 {}
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(unsafe { libc::fcntl(write, libc::F_SETFL, flags) }, 0);
+
+    let writer = unsafe { libc::pthread_self() } as usize;
+    let interrupter = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            unsafe { libc::pthread_kill(writer as libc::pthread_t, libc::SIGUSR2) },
+            0
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let mut buffer = [0_u8; 4096];
+        unsafe { libc::read(read, buffer.as_mut_ptr().cast(), buffer.len()) };
+        unsafe { libc::close(read) };
+    });
+
+    let result = with_test_runtime(&runtime, || unsafe {
+        agora_sandbox_write_shim(write, bytes.as_ptr().cast(), 1)
+    });
+    let error = std::io::Error::last_os_error();
+    unsafe { libc::close(write) };
+    interrupter.join().unwrap();
+    assert_eq!(
+        unsafe { libc::sigaction(libc::SIGUSR2, &previous, std::ptr::null_mut()) },
+        0
+    );
+
+    assert_eq!(result, -1);
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    assert!(!signal.is_blocked());
+}
+
 unsafe fn raw_pread(
     descriptor: libc::c_int,
     buffer: *mut libc::c_void,

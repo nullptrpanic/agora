@@ -135,7 +135,7 @@ impl ContentBackend for EncryptedContent {
         descriptor: libc::c_int,
         requested_offset: libc::off_t,
         whence: libc::c_int,
-        native: &mut dyn FnMut() -> libc::off_t,
+        native: &mut dyn FnMut(libc::off_t, libc::c_int) -> libc::off_t,
     ) -> Result<libc::off_t> {
         let open_state = self.state.lock()?;
         let next = match whence {
@@ -150,7 +150,7 @@ impl ContentBackend for EncryptedContent {
             }
             libc::SEEK_DATA | libc::SEEK_HOLE => {
                 self.materialize(state, runtime, None)?;
-                let next = native();
+                let next = native(requested_offset, whence);
                 if next < 0 {
                     return Ok(-1);
                 }

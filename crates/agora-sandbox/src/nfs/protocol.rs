@@ -4,7 +4,7 @@ use crate::filesystem::ByteRange;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 8;
+pub(crate) const PROTOCOL_VERSION: u16 = 9;
 pub(crate) const MAX_REMOTE_IO_BYTES: u32 = 64 * 1024;
 #[cfg(not(agora_sandbox_hook_build))]
 pub(crate) const MAX_REMOTE_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -80,6 +80,9 @@ pub(crate) enum Request {
         path: RemotePath,
         mode: i32,
     },
+    Metadata {
+        handle: String,
+    },
     Read {
         handle: String,
         offset: u64,
@@ -137,6 +140,9 @@ pub(crate) enum Response {
     Success,
     Open {
         handle: String,
+        metadata: RemoteMetadata,
+    },
+    Metadata {
         metadata: RemoteMetadata,
     },
     Read {

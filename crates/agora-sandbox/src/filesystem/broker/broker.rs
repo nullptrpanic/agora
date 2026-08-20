@@ -716,7 +716,7 @@ impl LocalBroker {
                     return Ok(Response::Success);
                 };
                 let final_reference = lock(&local).references <= 1;
-                let sync_result = self.sync_handle(&handle, ranges, true, true, final_reference);
+                self.sync_handle(&handle, ranges, true, true, final_reference)?;
                 let mut local = lock(&local);
                 if local.references > 0 {
                     local.references -= 1;
@@ -726,7 +726,7 @@ impl LocalBroker {
                 }
                 drop(local);
                 self.prune_closed(Instant::now());
-                sync_result.map(|()| Response::Success)
+                Ok(Response::Success)
             }
         }
     }
