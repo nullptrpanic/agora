@@ -29,6 +29,19 @@ fn prepare_owned_directory_with_policy(
     };
     fs::create_dir_all(path)
         .with_context(|| format!("failed to create {description} {}", path.display()))?;
+    let directory = open_owned_directory(path, description)?;
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("failed to inspect {description} {}", path.display()))?;
+    if (secure_existing || !existed) && metadata.permissions().mode() & 0o7777 != 0o700 {
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to secure {description} {}", path.display()))?;
+    }
+    Ok(directory)
+}
+
+pub(crate) fn open_owned_directory(path: &Path, description: &str) -> Result<File> {
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -45,11 +58,6 @@ fn prepare_owned_directory_with_policy(
             "{description} is not owned by the current user: {}",
             path.display()
         );
-    }
-    if (secure_existing || !existed) && metadata.permissions().mode() & 0o7777 != 0o700 {
-        directory
-            .set_permissions(fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to secure {description} {}", path.display()))?;
     }
     Ok(directory)
 }

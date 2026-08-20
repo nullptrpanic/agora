@@ -1,17 +1,23 @@
 use super::crypto::FileCipher;
-use super::metadata::{EntryState, MetadataStore};
+use super::metadata::{EntryState, Materializer, MetadataStore};
 use super::namespace;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_KEY_METADATA_PARENT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 const ROOT_DIRECTORY: &str = "fs";
 const LOCK_FILE: &str = ".fs.lock";
@@ -66,7 +72,12 @@ struct PreparedRekeyEntry {
     renamed_destination: PathBuf,
     staged: PathBuf,
     backup: PathBuf,
-    ciphertext: bool,
+    plaintext_digest: Option<[u8; 32]>,
+}
+
+enum KeyMetadataPublication {
+    Durable,
+    PublishedUnconfirmed(anyhow::Error),
 }
 
 pub(crate) struct EncryptedWorkspace {
@@ -108,7 +119,10 @@ impl EncryptedWorkspace {
                 );
             }
             let metadata = Self::new_key_metadata(passphrase)?;
-            Self::write_key_metadata(&root, &metadata)?;
+            match Self::write_key_metadata(&root, &metadata)? {
+                KeyMetadataPublication::Durable => {}
+                KeyMetadataPublication::PublishedUnconfirmed(error) => return Err(error),
+            }
             metadata
         };
         let salt = Self::decode_salt(&metadata)?;
@@ -169,6 +183,8 @@ impl EncryptedWorkspace {
         on_progress(KeyMigrationStage::AcquiringLock);
         let workdir = Self::resolved_destination(workdir)?;
         let root = workdir.join(ROOT_DIRECTORY);
+        let _root_directory =
+            crate::managed_fs::open_owned_directory(&root, "encrypted filesystem migration root")?;
         if !root.join(KEY_FILE).is_file() {
             bail!(
                 "encrypted filesystem key metadata does not exist: {}",
@@ -177,6 +193,7 @@ impl EncryptedWorkspace {
         }
         let _lock = Self::lock(&root)?;
         Self::recover_migration(&root)?;
+        Self::cleanup_orphaned_staging(&root)?;
         let metadata = Self::read_key_metadata(&root)?;
         let old_salt = Self::decode_salt(&metadata)?;
         let old_cipher = FileCipher::derive(old_passphrase, &old_salt)?;
@@ -193,22 +210,20 @@ impl EncryptedWorkspace {
 
         on_progress(KeyMigrationStage::ReencryptingFiles);
         let metadata_store = MetadataStore::encrypted(&root, old_cipher.clone())?;
+        let sources = Self::prepare_migration_sources(&root, &metadata_store)?;
         let filename_plan = metadata_store.prepare_filename_migration(&new_cipher)?;
-        let sources = Self::encrypted_files(&root, &old_cipher)?;
         let mut entries = Vec::new();
         let prepared = (|| {
             let mut handled = HashSet::new();
             for source in sources {
-                let mut plaintext = tempfile::tempfile()
-                    .context("failed to create anonymous filesystem migration file")?;
-                old_cipher.decrypt(&source, &mut plaintext)?;
                 let parent = source
                     .parent()
                     .context("encrypted filesystem file has no parent")?;
                 let temporary =
                     parent.join(format!(".agora-rekey-{}.tmp", Uuid::new_v4().simple()));
                 let backup = parent.join(format!(".agora-rekey-old-{}", Uuid::new_v4().simple()));
-                new_cipher.encrypt(&mut plaintext, &temporary)?;
+                let plaintext_digest =
+                    old_cipher.reencrypt_sparse(&source, &new_cipher, &temporary)?;
                 let renamed_destination = filename_plan
                     .renames
                     .get(&source)
@@ -220,7 +235,7 @@ impl EncryptedWorkspace {
                     renamed_destination,
                     staged: temporary,
                     backup,
-                    ciphertext: true,
+                    plaintext_digest: Some(plaintext_digest),
                 });
             }
             for (source, renamed_destination) in &filename_plan.renames {
@@ -249,7 +264,7 @@ impl EncryptedWorkspace {
                     renamed_destination: renamed_destination.clone(),
                     staged: temporary,
                     backup: parent.join(format!(".agora-rekey-old-{}", Uuid::new_v4().simple())),
-                    ciphertext: false,
+                    plaintext_digest: None,
                 });
             }
             for (destination, renamed_destination, contents) in &filename_plan.leases {
@@ -273,10 +288,16 @@ impl EncryptedWorkspace {
 
         on_progress(KeyMigrationStage::VerifyingNewKey);
         let verified = (|| {
-            for entry in entries.iter().filter(|entry| entry.ciphertext) {
-                let mut verified = tempfile::tempfile()
-                    .context("failed to create anonymous filesystem verification file")?;
-                new_cipher.decrypt(&entry.staged, &mut verified)?;
+            for entry in entries
+                .iter()
+                .filter_map(|entry| entry.plaintext_digest.map(|digest| (entry, digest)))
+            {
+                if new_cipher.plaintext_digest(&entry.0.staged)? != entry.1 {
+                    bail!(
+                        "re-encrypted filesystem file content does not match its source: {}",
+                        entry.0.destination.display()
+                    );
+                }
             }
             Ok::<_, anyhow::Error>(())
         })();
@@ -323,7 +344,7 @@ impl EncryptedWorkspace {
             }
             return Err(error);
         }
-        let migration = (|| {
+        let publication = (|| {
             for entry in &entries {
                 fs::rename(&entry.destination, &entry.backup).with_context(|| {
                     format!(
@@ -340,11 +361,9 @@ impl EncryptedWorkspace {
                 })?;
                 Self::sync_parent(&entry.renamed_destination)?;
             }
-            on_progress(KeyMigrationStage::UpdatingMetadata);
-            Self::write_key_metadata(&root, &new_metadata)?;
-            Self::recover_migration(&root)
+            Ok::<_, anyhow::Error>(())
         })();
-        if let Err(error) = migration {
+        if let Err(error) = publication {
             let recovery = Self::recover_migration(&root);
             return match recovery {
                 Ok(()) => Err(error),
@@ -352,6 +371,31 @@ impl EncryptedWorkspace {
                     "filesystem key migration recovery also failed: {recovery:#}"
                 ))),
             };
+        }
+        on_progress(KeyMigrationStage::UpdatingMetadata);
+        let key_publication = match Self::write_key_metadata(&root, &new_metadata) {
+            Ok(publication) => publication,
+            Err(error) => {
+                let recovery = Self::recover_migration(&root);
+                return match recovery {
+                    Ok(()) => Err(error),
+                    Err(recovery) => Err(error.context(format!(
+                        "filesystem key migration recovery also failed: {recovery:#}"
+                    ))),
+                };
+            }
+        };
+        if let KeyMetadataPublication::PublishedUnconfirmed(error) = key_publication {
+            return Err(error.context(
+                "key metadata publication was not durably confirmed; migration recovery state was preserved",
+            ));
+        }
+        if let Err(cleanup) = Self::recover_migration(&root)
+            && let Err(retry) = Self::recover_migration(&root)
+        {
+            return Err(cleanup.context(format!(
+                "new filesystem key is active, but migration cleanup remains incomplete: {retry:#}"
+            )));
         }
         on_progress(KeyMigrationStage::Completed);
         Ok(())
@@ -463,7 +507,7 @@ impl EncryptedWorkspace {
         })
     }
 
-    fn write_key_metadata(root: &Path, metadata: &KeyMetadata) -> Result<()> {
+    fn write_key_metadata(root: &Path, metadata: &KeyMetadata) -> Result<KeyMetadataPublication> {
         let path = root.join(KEY_FILE);
         let temporary = root.join(format!(".key.json.{}.tmp", Uuid::new_v4().simple()));
         let contents = serde_json::to_vec_pretty(metadata)
@@ -471,7 +515,7 @@ impl EncryptedWorkspace {
         if contents.len() > MAX_KEY_METADATA_BYTES {
             bail!("encrypted filesystem key metadata exceeds {MAX_KEY_METADATA_BYTES} bytes");
         }
-        let result = (|| {
+        let publication = (|| {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -479,18 +523,26 @@ impl EncryptedWorkspace {
                 .open(&temporary)?;
             std::io::Write::write_all(&mut file, &contents)?;
             file.sync_all()?;
-            fs::rename(&temporary, &path)?;
-            Self::sync_parent(&path)
+            fs::rename(&temporary, &path)
         })();
-        if result.is_err() {
+        if publication.is_err() {
             let _ = fs::remove_file(&temporary);
         }
-        result.with_context(|| {
+        publication.with_context(|| {
             format!(
                 "failed to write encrypted filesystem key metadata {}",
                 path.display()
             )
-        })
+        })?;
+        match Self::sync_key_metadata_parent(&path) {
+            Ok(()) => Ok(KeyMetadataPublication::Durable),
+            Err(error) => Ok(KeyMetadataPublication::PublishedUnconfirmed(error.context(
+                format!(
+                    "failed to sync encrypted filesystem key metadata directory {}",
+                    root.display()
+                ),
+            ))),
+        }
     }
 
     fn contains_unmanaged_data(root: &Path) -> Result<bool> {
@@ -503,8 +555,20 @@ impl EncryptedWorkspace {
         Ok(false)
     }
 
-    fn encrypted_files(root: &Path, cipher: &FileCipher) -> Result<Vec<PathBuf>> {
-        let metadata = MetadataStore::encrypted(root, cipher.clone())?;
+    fn sync_key_metadata_parent(path: &Path) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_NEXT_KEY_METADATA_PARENT_SYNC.with(std::cell::Cell::take) {
+            bail!("injected key metadata parent sync failure");
+        }
+        Self::sync_parent(path)
+    }
+
+    #[cfg(test)]
+    fn fail_next_key_metadata_parent_sync() {
+        FAIL_NEXT_KEY_METADATA_PARENT_SYNC.with(|fail| fail.set(true));
+    }
+
+    fn prepare_migration_sources(root: &Path, metadata: &MetadataStore) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
         let mut directories = vec![root.to_path_buf()];
         while let Some(directory) = directories.pop() {
@@ -519,18 +583,41 @@ impl EncryptedWorkspace {
                 let file_type = entry.file_type()?;
                 if file_type.is_dir() {
                     directories.push(entry.path());
-                } else if file_type.is_file() && !Self::is_control_file(&entry.path()) {
-                    let physical_name = entry.file_name();
-                    let logical_name = aliases
-                        .get(&physical_name)
-                        .cloned()
-                        .unwrap_or(namespace::decode_name(&physical_name)?);
-                    if !matches!(
-                        metadata.state(&logical_directory.join(logical_name))?,
-                        Some(EntryState::Cached { .. } | EntryState::Whiteout)
-                    ) {
-                        files.push(entry.path());
+                    continue;
+                }
+                if Self::is_control_file(&entry.path()) {
+                    continue;
+                }
+                let physical_name = entry.file_name();
+                let logical_name = aliases
+                    .get(&physical_name)
+                    .cloned()
+                    .unwrap_or(namespace::decode_name(&physical_name)?);
+                let logical = logical_directory.join(logical_name);
+                if file_type.is_socket() {
+                    fs::remove_file(entry.path())?;
+                    metadata.remove(&logical)?;
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                match metadata.state(&logical)? {
+                    Some(EntryState::Cached {
+                        materializer: Materializer::Copy,
+                        ..
+                    }) => {
+                        fs::remove_file(entry.path())?;
+                        let lease = MetadataStore::lease_path(&entry.path())?;
+                        match fs::remove_file(lease) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                        metadata.remove(&logical)?;
                     }
+                    Some(EntryState::Cached { .. } | EntryState::Whiteout) => {}
+                    Some(EntryState::Cow) | None => files.push(entry.path()),
                 }
             }
         }
@@ -559,7 +646,7 @@ impl EncryptedWorkspace {
             renamed_destination: renamed_destination.to_path_buf(),
             staged,
             backup,
-            ciphertext: false,
+            plaintext_digest: None,
         })
     }
 
@@ -610,6 +697,8 @@ impl EncryptedWorkspace {
     }
 
     fn recover_migration(root: &Path) -> Result<()> {
+        let _root_directory =
+            crate::managed_fs::open_owned_directory(root, "encrypted filesystem migration root")?;
         let path = root.join(REKEY_JOURNAL_FILE);
         let mut options = OpenOptions::new();
         options.read(true);
@@ -652,28 +741,31 @@ impl EncryptedWorkspace {
             let staged = Self::decode_relative_path(root, &entry.staged)?;
             let backup = Self::decode_relative_path(root, &entry.backup)?;
             if committed {
-                Self::remove_file_if_exists(&backup)?;
-                Self::remove_file_if_exists(&staged)?;
-                Self::sync_parent_directories([backup.as_path(), staged.as_path()])?;
+                Self::remove_migration_file_if_exists(root, &backup)?;
+                Self::remove_migration_file_if_exists(root, &staged)?;
+                Self::sync_migration_parent_directories(
+                    root,
+                    [backup.as_path(), staged.as_path()],
+                )?;
             } else {
-                if Self::path_entry_exists(&backup)? {
-                    Self::remove_file_if_exists(&renamed_destination)?;
-                    fs::rename(&backup, &destination).with_context(|| {
-                        format!("failed to restore encrypted file {}", destination.display())
-                    })?;
-                    Self::sync_parent_directories([
-                        renamed_destination.as_path(),
-                        destination.as_path(),
-                    ])?;
+                if Self::migration_path_entry_exists(root, &backup)? {
+                    Self::remove_migration_file_if_exists(root, &renamed_destination)?;
+                    Self::rename_migration_path(root, &backup, &destination).with_context(
+                        || format!("failed to restore encrypted file {}", destination.display()),
+                    )?;
+                    Self::sync_migration_parent_directories(
+                        root,
+                        [renamed_destination.as_path(), destination.as_path()],
+                    )?;
                 }
-                Self::remove_file_if_exists(&staged)?;
-                Self::sync_parent(&staged)?;
+                Self::remove_migration_file_if_exists(root, &staged)?;
+                Self::sync_migration_parent(root, &staged)?;
             }
         }
-        fs::remove_file(&path).with_context(|| {
+        Self::remove_migration_file_if_exists(root, &path).with_context(|| {
             format!("failed to remove key migration journal {}", path.display())
         })?;
-        Self::sync_parent(&path)
+        Self::sync_migration_parent(root, &path)
     }
 
     fn encode_relative_path(root: &Path, path: &Path) -> Result<String> {
@@ -690,35 +782,151 @@ impl EncryptedWorkspace {
     }
 
     fn decode_relative_path(root: &Path, encoded: &str) -> Result<PathBuf> {
+        Ok(root.join(Self::decode_relative_path_value(encoded)?))
+    }
+
+    fn decode_relative_path_value(encoded: &str) -> Result<PathBuf> {
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(encoded)
             .context("invalid migration path encoding")?;
         let relative = PathBuf::from(std::ffi::OsString::from_vec(bytes));
-        if relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
         {
             bail!("invalid path in key migration journal");
         }
-        Ok(root.join(relative))
+        Ok(relative)
     }
 
-    fn remove_file_if_exists(path: &Path) -> Result<()> {
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error)
-                .with_context(|| format!("failed to remove migration file {}", path.display())),
+    fn open_migration_parent(root: &Path, path: &Path) -> Result<(File, CString)> {
+        let relative = path.strip_prefix(root).with_context(|| {
+            format!(
+                "migration path is outside filesystem root: {}",
+                path.display()
+            )
+        })?;
+        let components = relative
+            .components()
+            .map(|component| match component {
+                Component::Normal(name) => Ok(name),
+                _ => bail!("invalid filesystem migration path: {}", path.display()),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (leaf, parents) = components
+            .split_last()
+            .context("filesystem migration path has no filename")?;
+        let mut directory =
+            crate::managed_fs::open_owned_directory(root, "encrypted filesystem migration root")?;
+        for component in parents {
+            let component = CString::new(component.as_bytes())
+                .context("filesystem migration path contains a null byte")?;
+            let descriptor = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    component.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if descriptor < 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "failed to open filesystem migration parent {}",
+                        path.display()
+                    )
+                });
+            }
+            directory = unsafe { File::from_raw_fd(descriptor) };
+        }
+        let leaf = CString::new(leaf.as_bytes())
+            .context("filesystem migration filename contains a null byte")?;
+        Ok((directory, leaf))
+    }
+
+    fn remove_migration_file_if_exists(root: &Path, path: &Path) -> Result<()> {
+        let (parent, leaf) = Self::open_migration_parent(root, path)?;
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), leaf.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+                .with_context(|| format!("failed to remove migration file {}", path.display()))
         }
     }
 
-    fn path_entry_exists(path: &Path) -> Result<bool> {
-        match fs::symlink_metadata(path) {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error)
-                .with_context(|| format!("failed to inspect migration file {}", path.display())),
+    fn migration_path_entry_exists(root: &Path, path: &Path) -> Result<bool> {
+        let (parent, leaf) = Self::open_migration_parent(root, path)?;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                leaf.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+        {
+            return Ok(true);
         }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(error)
+                .with_context(|| format!("failed to inspect migration file {}", path.display()))
+        }
+    }
+
+    fn rename_migration_path(root: &Path, source: &Path, destination: &Path) -> Result<()> {
+        let (source_parent, source_leaf) = Self::open_migration_parent(root, source)?;
+        let (destination_parent, destination_leaf) =
+            Self::open_migration_parent(root, destination)?;
+        if unsafe {
+            libc::renameat(
+                source_parent.as_raw_fd(),
+                source_leaf.as_ptr(),
+                destination_parent.as_raw_fd(),
+                destination_leaf.as_ptr(),
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "failed to rename migration file {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })
+        }
+    }
+
+    fn sync_migration_parent(root: &Path, path: &Path) -> Result<()> {
+        let (parent, _) = Self::open_migration_parent(root, path)?;
+        parent
+            .sync_all()
+            .with_context(|| format!("failed to sync migration parent for {}", path.display()))
+    }
+
+    fn sync_migration_parent_directories<'a>(
+        root: &Path,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<()> {
+        let mut synced = HashSet::new();
+        for path in paths {
+            let parent = path
+                .parent()
+                .context("filesystem migration path has no parent")?;
+            if synced.insert(parent.to_path_buf()) {
+                Self::sync_migration_parent(root, path)?;
+            }
+        }
+        Ok(())
     }
 
     fn sync_parent(path: &Path) -> Result<()> {
@@ -745,10 +953,40 @@ impl EncryptedWorkspace {
         Ok(())
     }
 
+    fn cleanup_orphaned_staging(root: &Path) -> Result<()> {
+        let mut directories = vec![root.to_path_buf()];
+        let mut removed = Vec::new();
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(&directory).with_context(|| {
+                format!(
+                    "failed to inspect encrypted filesystem directory {}",
+                    directory.display()
+                )
+            })? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    directories.push(entry.path());
+                    continue;
+                }
+                let path = entry.path();
+                if !Self::is_internal_migration_name(&path, b".agora-rekey-", b".tmp")
+                    && !Self::is_internal_migration_name(&path, b".agora-encrypted-", b".tmp")
+                {
+                    continue;
+                }
+                Self::remove_migration_file_if_exists(root, &path)?;
+                removed.push(path);
+            }
+        }
+        Self::sync_migration_parent_directories(root, removed.iter().map(PathBuf::as_path))
+    }
+
     fn validate_rekey_journal(journal: &RekeyJournal) -> Result<()> {
         if journal.entries.len() > MAX_REKEY_JOURNAL_ENTRIES {
             bail!("filesystem key migration journal exceeds {MAX_REKEY_JOURNAL_ENTRIES} entries");
         }
+        let mut assigned = HashSet::new();
         for entry in &journal.entries {
             let paths = [
                 Some(entry.destination.as_str()),
@@ -766,8 +1004,77 @@ impl EncryptedWorkspace {
                     super::MAX_CONTROL_PATH_BYTES
                 );
             }
+            let destination = Self::decode_relative_path_value(&entry.destination)?;
+            let renamed_destination = entry
+                .renamed_destination
+                .as_deref()
+                .map(Self::decode_relative_path_value)
+                .transpose()?;
+            let staged = Self::decode_relative_path_value(&entry.staged)?;
+            let backup = Self::decode_relative_path_value(&entry.backup)?;
+            if Self::is_migration_control_target(&destination)
+                || renamed_destination
+                    .as_deref()
+                    .is_some_and(Self::is_migration_control_target)
+            {
+                bail!("key migration journal targets a managed control file");
+            }
+            if !Self::is_internal_migration_name(&staged, b".agora-rekey-", b".tmp")
+                || !Self::is_internal_migration_name(&backup, b".agora-rekey-old-", b"")
+            {
+                bail!("key migration journal contains an invalid internal filename");
+            }
+            let parent = destination.parent();
+            if staged.parent() != parent
+                || backup.parent() != parent
+                || renamed_destination
+                    .as_deref()
+                    .is_some_and(|renamed| renamed.parent() != parent)
+            {
+                bail!("key migration journal paths do not share one parent directory");
+            }
+            for path in [
+                Some(&destination),
+                renamed_destination.as_ref(),
+                Some(&staged),
+                Some(&backup),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !assigned.insert(path.clone()) {
+                    bail!("key migration journal contains overlapping paths");
+                }
+            }
         }
         Ok(())
+    }
+
+    fn is_migration_control_target(path: &Path) -> bool {
+        let Some(name) = path.file_name().map(|name| name.as_bytes()) else {
+            return true;
+        };
+        name == LOCK_FILE.as_bytes()
+            || name == KEY_FILE.as_bytes()
+            || name == VFS_LOCK_FILE.as_bytes()
+            || name == REKEY_JOURNAL_FILE.as_bytes()
+            || name.starts_with(b".key.json.")
+            || name.starts_with(b".rekey.json.")
+            || name.starts_with(b".agora-encrypted-")
+            || name.starts_with(b".agora-rekey-")
+    }
+
+    fn is_internal_migration_name(path: &Path, prefix: &[u8], suffix: &[u8]) -> bool {
+        let Some(name) = path.file_name().map(|name| name.as_bytes()) else {
+            return false;
+        };
+        let Some(identifier) = name
+            .strip_prefix(prefix)
+            .and_then(|name| name.strip_suffix(suffix))
+        else {
+            return false;
+        };
+        identifier.len() == 32 && identifier.iter().all(u8::is_ascii_hexdigit)
     }
 }
 

@@ -388,7 +388,7 @@ impl MetadataStore {
         Ok(plan)
     }
 
-    fn lease_path(destination: &Path) -> Result<PathBuf> {
+    pub(super) fn lease_path(destination: &Path) -> Result<PathBuf> {
         let name = destination
             .file_name()
             .context("encrypted filesystem destination has no filename")?;

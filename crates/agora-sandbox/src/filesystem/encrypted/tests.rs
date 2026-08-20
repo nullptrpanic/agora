@@ -2,12 +2,14 @@ use super::{
     EncryptedWorkspace, KEY_METADATA_VERSION, KeyMetadata, KeyMigrationStage,
     REKEY_JOURNAL_VERSION, RekeyEntry, RekeyJournal,
 };
-use crate::filesystem::crypto::FileCipher;
+use crate::filesystem::crypto::{CIPHERTEXT_BLOCK_SIZE, CONTENT_HEADER_SIZE, FileCipher};
 use crate::filesystem::metadata::{EntryState, Materializer, MetadataStore};
 use crate::filesystem::{Credentials, OpenTarget, VirtualFilesystem};
 use base64::Engine;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt, symlink};
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
 fn temporary_directory(label: &str) -> PathBuf {
@@ -132,6 +134,52 @@ fn key_migration_rejects_a_symlinked_root_without_touching_its_target() {
 }
 
 #[test]
+fn key_migration_rejects_a_symlinked_root_before_recovering_its_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let external_workdir = directory.path().join("external");
+    let external = EncryptedWorkspace::start(&external_workdir, b"old-key").unwrap();
+    let root = external.root().to_path_buf();
+    let destination = root.join("secret");
+    let backup = root.join(".agora-rekey-old-11111111111111111111111111111111");
+    let staged = root.join(".agora-rekey-22222222222222222222222222222222.tmp");
+    let old_key = EncryptedWorkspace::read_key_metadata(&root).unwrap();
+    let old_cipher = FileCipher::derive(b"old-key", external.salt()).unwrap();
+    write_encrypted(&old_cipher, &destination, b"old contents");
+    drop(external);
+
+    let new_key = EncryptedWorkspace::new_key_metadata(b"new-key").unwrap();
+    let new_salt = EncryptedWorkspace::decode_salt(&new_key).unwrap();
+    let new_cipher = FileCipher::derive(b"new-key", &new_salt).unwrap();
+    std::fs::rename(&destination, &backup).unwrap();
+    write_encrypted(&new_cipher, &destination, b"new contents");
+    EncryptedWorkspace::write_journal(
+        &root,
+        &RekeyJournal {
+            version: REKEY_JOURNAL_VERSION,
+            old_key,
+            new_key,
+            entries: vec![RekeyEntry {
+                destination: EncryptedWorkspace::encode_relative_path(&root, &destination).unwrap(),
+                renamed_destination: None,
+                staged: EncryptedWorkspace::encode_relative_path(&root, &staged).unwrap(),
+                backup: EncryptedWorkspace::encode_relative_path(&root, &backup).unwrap(),
+            }],
+        },
+    )
+    .unwrap();
+
+    let workdir = directory.path().join("workdir");
+    std::fs::create_dir(&workdir).unwrap();
+    symlink(&root, workdir.join("fs")).unwrap();
+
+    assert!(EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"replacement").is_err());
+    assert!(root.join(".rekey.json").is_file());
+    assert!(backup.is_file());
+    assert_eq!(decrypt(&new_cipher, &destination), b"new contents");
+    assert_eq!(decrypt(&old_cipher, &backup), b"old contents");
+}
+
+#[test]
 fn encrypted_workspace_rejects_a_symlinked_rekey_journal() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("fs");
@@ -214,6 +262,86 @@ fn key_migration_ignores_persistent_executable_caches() {
 
     assert_eq!(std::fs::read(cached).unwrap(), b"prepared executable");
     drop(EncryptedWorkspace::start(&workdir, b"new-key").unwrap());
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn key_migration_discards_encrypted_cached_copies() {
+    let workdir = temporary_directory("migration-cached-copy");
+    let lower = temporary_directory("migration-cached-copy-lower");
+    std::fs::create_dir_all(&lower).unwrap();
+    let logical = lower.join("cached");
+    std::fs::write(&logical, b"cached contents").unwrap();
+
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let old_cipher = FileCipher::derive(b"old-key", workspace.salt()).unwrap();
+    let filesystem = VirtualFilesystem::encrypted(workspace.root(), old_cipher).unwrap();
+    let staged = filesystem.stage_write(&logical, false).unwrap();
+    let old_backing = staged.destination().to_path_buf();
+    assert!(matches!(
+        filesystem.state_for_test(&logical).unwrap(),
+        Some(EntryState::Cached {
+            materializer: Materializer::Copy,
+            ..
+        })
+    ));
+    drop(staged);
+    let old_lease = MetadataStore::lease_path(&old_backing).unwrap();
+    std::fs::write(&old_lease, old_backing.as_os_str().as_bytes()).unwrap();
+    drop(filesystem);
+    drop(workspace);
+
+    EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key").unwrap();
+
+    let workspace = EncryptedWorkspace::start(&workdir, b"new-key").unwrap();
+    let new_cipher = FileCipher::derive(b"new-key", workspace.salt()).unwrap();
+    let filesystem = VirtualFilesystem::encrypted(workspace.root(), new_cipher).unwrap();
+    assert!(!old_backing.exists());
+    assert!(!old_lease.exists());
+    assert_eq!(filesystem.state_for_test(&logical).unwrap(), None);
+    assert_eq!(filesystem.prepare_read(&logical).unwrap(), logical);
+    assert_eq!(std::fs::read(&logical).unwrap(), b"cached contents");
+
+    drop(filesystem);
+    drop(workspace);
+    std::fs::remove_dir_all(lower).unwrap();
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn key_migration_discards_inactive_unix_sockets() {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let workdir = PathBuf::from(format!("/tmp/am-{}", &suffix[..8]));
+    let lower = PathBuf::from(format!("/tmp/al-{}", &suffix[..8]));
+    std::fs::create_dir_all(&lower).unwrap();
+    let logical = lower.join("service.sock");
+
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let old_cipher = FileCipher::derive(b"old-key", workspace.salt()).unwrap();
+    let filesystem = VirtualFilesystem::encrypted(workspace.root(), old_cipher).unwrap();
+    let listener = filesystem
+        .bind_socket_authorized(&logical, &Credentials::effective(), |mapped| {
+            UnixListener::bind(mapped).map_err(Into::into)
+        })
+        .unwrap();
+    let backing = filesystem.prepare_read(&logical).unwrap();
+    assert!(backing.symlink_metadata().unwrap().file_type().is_socket());
+    drop(listener);
+    drop(filesystem);
+    drop(workspace);
+
+    EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key").unwrap();
+
+    let workspace = EncryptedWorkspace::start(&workdir, b"new-key").unwrap();
+    let new_cipher = FileCipher::derive(b"new-key", workspace.salt()).unwrap();
+    let filesystem = VirtualFilesystem::encrypted(workspace.root(), new_cipher).unwrap();
+    assert!(!backing.exists());
+    assert_eq!(filesystem.state_for_test(&logical).unwrap(), None);
+    assert!(filesystem.prepare_read(&logical).is_err());
+
+    drop(filesystem);
+    drop(workspace);
+    std::fs::remove_dir_all(lower).unwrap();
     std::fs::remove_dir_all(workdir).unwrap();
 }
 
@@ -317,8 +445,8 @@ fn startup_recovers_interrupted_key_migration_before_opening_the_workspace() {
     let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
     let root = workspace.root().to_path_buf();
     let destination = root.join("project/secret");
-    let backup = root.join("project/.agora-rekey-old-test");
-    let staged = root.join("project/.agora-rekey-test.tmp");
+    let backup = root.join("project/.agora-rekey-old-66666666666666666666666666666666");
+    let staged = root.join("project/.agora-rekey-77777777777777777777777777777777.tmp");
     let old_key = EncryptedWorkspace::read_key_metadata(&root).unwrap();
     write_encrypted(
         &FileCipher::derive(b"old-key", workspace.salt()).unwrap(),
@@ -406,8 +534,8 @@ fn migration_recovery_restores_a_dangling_symlink_backup() {
     let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
     let root = workspace.root().to_path_buf();
     let destination = root.join("link");
-    let backup = root.join(".agora-rekey-old-link");
-    let staged = root.join(".agora-rekey-link.tmp");
+    let backup = root.join(".agora-rekey-old-88888888888888888888888888888888");
+    let staged = root.join(".agora-rekey-99999999999999999999999999999999.tmp");
     let old_key = EncryptedWorkspace::read_key_metadata(&root).unwrap();
     let new_key = EncryptedWorkspace::new_key_metadata(b"new-key").unwrap();
     drop(workspace);
@@ -598,6 +726,107 @@ fn key_migration_removes_ciphertext_that_fails_staged_verification() {
 }
 
 #[test]
+fn key_migration_rejects_a_zeroed_staged_ciphertext_block() {
+    let workdir = temporary_directory("migration-zeroed-staged-block");
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let root = workspace.root().to_path_buf();
+    write_encrypted(
+        &FileCipher::derive(b"old-key", workspace.salt()).unwrap(),
+        &root.join("secret"),
+        &vec![b'x'; 4096],
+    );
+    drop(workspace);
+
+    let progress_root = root.clone();
+    let result = EncryptedWorkspace::migrate_key_with_progress(
+        &workdir,
+        b"old-key",
+        b"new-key",
+        move |stage| {
+            if stage == KeyMigrationStage::VerifyingNewKey {
+                let staged = rekey_files(&progress_root)
+                    .into_iter()
+                    .find(|path| path.extension().is_some_and(|extension| extension == "tmp"))
+                    .unwrap();
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(staged)
+                    .unwrap();
+                assert_eq!(
+                    file.write_at(
+                        &vec![0_u8; CIPHERTEXT_BLOCK_SIZE],
+                        CONTENT_HEADER_SIZE as u64,
+                    )
+                    .unwrap(),
+                    CIPHERTEXT_BLOCK_SIZE
+                );
+            }
+        },
+    );
+
+    assert!(result.is_err());
+    assert!(directory_tree_has_no_rekey_files(&root));
+    drop(EncryptedWorkspace::start(&workdir, b"old-key").unwrap());
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn key_migration_preserves_sparse_ciphertext_allocation() {
+    const SPARSE_OFFSET: u64 = 16 * 1024 * 1024;
+    const MAX_ALLOCATED_BYTES: u64 = 512 * 1024;
+
+    let workdir = temporary_directory("migration-sparse");
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let root = workspace.root().to_path_buf();
+    let source = root.join("sparse");
+    let old_cipher = FileCipher::derive(b"old-key", workspace.salt()).unwrap();
+    let mut encrypted = old_cipher.create_file(&source).unwrap();
+    encrypted.write_at(b"tail", SPARSE_OFFSET).unwrap();
+    encrypted.sync_all().unwrap();
+    drop(encrypted);
+    drop(workspace);
+
+    EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key").unwrap();
+
+    let allocated = source.metadata().unwrap().blocks() * 512;
+    assert!(
+        allocated <= MAX_ALLOCATED_BYTES,
+        "sparse migration allocated {allocated} bytes"
+    );
+    let reopened = EncryptedWorkspace::start(&workdir, b"new-key").unwrap();
+    let cipher = FileCipher::derive(b"new-key", reopened.salt()).unwrap();
+    let encrypted = cipher.open_file(&source).unwrap();
+    let mut tail = [0_u8; 4];
+    assert_eq!(encrypted.read_at(&mut tail, SPARSE_OFFSET).unwrap(), 4);
+    assert_eq!(&tail, b"tail");
+    drop(reopened);
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn key_migration_removes_unpublished_migration_staging_files() {
+    let workdir = temporary_directory("migration-orphaned-staging");
+    let workspace = EncryptedWorkspace::start(&workdir, b"key").unwrap();
+    let root = workspace.root().to_path_buf();
+    drop(workspace);
+    let directory = root.join("nested");
+    std::fs::create_dir(&directory).unwrap();
+    let rekey = directory.join(".agora-rekey-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.tmp");
+    let encrypted = directory.join(".agora-encrypted-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.tmp");
+    let backup = directory.join(".agora-rekey-old-cccccccccccccccccccccccccccccccc");
+    std::fs::write(&rekey, b"staged").unwrap();
+    std::fs::write(&encrypted, b"staged").unwrap();
+    std::fs::write(&backup, b"preserve without a journal").unwrap();
+
+    EncryptedWorkspace::migrate_key(&workdir, b"key", b"new-key").unwrap();
+
+    assert!(!rekey.exists());
+    assert!(!encrypted.exists());
+    assert!(backup.exists());
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
 fn key_migration_cleans_staged_files_when_the_journal_cannot_be_published() {
     let workdir = temporary_directory("migration-journal-failure");
     let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
@@ -708,6 +937,91 @@ fn key_migration_reports_and_recovers_a_metadata_update_failure() {
 }
 
 #[test]
+fn key_migration_keeps_recovery_state_when_key_commit_is_not_durable() {
+    let workdir = temporary_directory("migration-key-sync-failure");
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let root = workspace.root().to_path_buf();
+    let source = root.join("secret");
+    write_encrypted(
+        &FileCipher::derive(b"old-key", workspace.salt()).unwrap(),
+        &source,
+        b"secret contents",
+    );
+    drop(workspace);
+
+    EncryptedWorkspace::fail_next_key_metadata_parent_sync();
+    let error = EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key").unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("key metadata publication was not durably confirmed"),
+        "{error:#}"
+    );
+    assert!(root.join(".rekey.json").is_file());
+    assert!(rekey_files(&root).iter().any(|path| {
+        path.file_name()
+            .unwrap()
+            .as_bytes()
+            .starts_with(b".agora-rekey-old-")
+    }));
+
+    let reopened = EncryptedWorkspace::start(&workdir, b"new-key").unwrap();
+    let cipher = FileCipher::derive(b"new-key", reopened.salt()).unwrap();
+    assert_eq!(decrypt(&cipher, &source), b"secret contents");
+    assert!(!root.join(".rekey.json").exists());
+    drop(reopened);
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn key_migration_reports_that_the_new_key_is_active_when_cleanup_fails() {
+    let workdir = temporary_directory("migration-committed-cleanup-failure");
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let root = workspace.root().to_path_buf();
+    let source = root.join("secret");
+    write_encrypted(
+        &FileCipher::derive(b"old-key", workspace.salt()).unwrap(),
+        &source,
+        b"secret contents",
+    );
+    drop(workspace);
+
+    let mut blocked_backup = None;
+    let error =
+        EncryptedWorkspace::migrate_key_with_progress(&workdir, b"old-key", b"new-key", |stage| {
+            if stage == KeyMigrationStage::UpdatingMetadata {
+                let backup = rekey_files(&root)
+                    .into_iter()
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .as_bytes()
+                            .starts_with(b".agora-rekey-old-")
+                    })
+                    .unwrap();
+                std::fs::remove_file(&backup).unwrap();
+                std::fs::create_dir(&backup).unwrap();
+                blocked_backup = Some(backup);
+            }
+        })
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("new filesystem key is active"),
+        "{error:#}"
+    );
+    let blocked_backup = blocked_backup.unwrap();
+    std::fs::remove_dir(blocked_backup).unwrap();
+    EncryptedWorkspace::recover_migration(&root).unwrap();
+    let reopened = EncryptedWorkspace::start(&workdir, b"new-key").unwrap();
+    let cipher = FileCipher::derive(b"new-key", reopened.salt()).unwrap();
+    assert_eq!(decrypt(&cipher, &source), b"secret contents");
+    drop(reopened);
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
 fn migration_helpers_reject_external_paths_and_inconsistent_journals() {
     let workdir = temporary_directory("migration-helper-errors");
     let root = workdir.join("fs");
@@ -720,7 +1034,7 @@ fn migration_helpers_reject_external_paths_and_inconsistent_journals() {
 
     let directory = root.join("directory");
     std::fs::create_dir(&directory).unwrap();
-    assert!(EncryptedWorkspace::remove_file_if_exists(&directory).is_err());
+    assert!(EncryptedWorkspace::remove_migration_file_if_exists(&root, &directory).is_err());
 
     let journal_path = root.join(".rekey.json");
     std::fs::create_dir(&journal_path).unwrap();
@@ -773,6 +1087,86 @@ fn migration_helpers_reject_external_paths_and_inconsistent_journals() {
     assert!(EncryptedWorkspace::recover_migration(&root).is_err());
 
     std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn migration_recovery_rejects_control_file_aliases_without_deleting_them() {
+    let workdir = temporary_directory("migration-control-alias");
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let root = workspace.root().to_path_buf();
+    let old_key = EncryptedWorkspace::read_key_metadata(&root).unwrap();
+    let new_key = EncryptedWorkspace::new_key_metadata(b"new-key").unwrap();
+    drop(workspace);
+    EncryptedWorkspace::write_key_metadata(&root, &new_key).unwrap();
+    let staged = root.join(".agora-rekey-33333333333333333333333333333333.tmp");
+    std::fs::write(&staged, b"staged").unwrap();
+    let key_path = root.join(".key.json");
+    let journal = RekeyJournal {
+        version: REKEY_JOURNAL_VERSION,
+        old_key,
+        new_key,
+        entries: vec![RekeyEntry {
+            destination: EncryptedWorkspace::encode_relative_path(&root, &root.join("destination"))
+                .unwrap(),
+            renamed_destination: None,
+            staged: EncryptedWorkspace::encode_relative_path(&root, &staged).unwrap(),
+            backup: EncryptedWorkspace::encode_relative_path(&root, &key_path).unwrap(),
+        }],
+    };
+    std::fs::write(
+        root.join(".rekey.json"),
+        serde_json::to_vec(&journal).unwrap(),
+    )
+    .unwrap();
+
+    assert!(EncryptedWorkspace::recover_migration(&root).is_err());
+    assert!(key_path.is_file());
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn migration_recovery_does_not_follow_intermediate_symlinks() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().join("workdir");
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let root = workspace.root().to_path_buf();
+    let old_key = EncryptedWorkspace::read_key_metadata(&root).unwrap();
+    let new_key = EncryptedWorkspace::new_key_metadata(b"new-key").unwrap();
+    drop(workspace);
+    EncryptedWorkspace::write_key_metadata(&root, &new_key).unwrap();
+
+    let external = directory.path().join("external");
+    std::fs::create_dir(&external).unwrap();
+    let backup_name = ".agora-rekey-old-44444444444444444444444444444444";
+    let external_backup = external.join(backup_name);
+    std::fs::write(&external_backup, b"must remain").unwrap();
+    symlink(&external, root.join("redirect")).unwrap();
+    let redirected = root.join("redirect");
+    let staged = redirected.join(".agora-rekey-55555555555555555555555555555555.tmp");
+    let journal = RekeyJournal {
+        version: REKEY_JOURNAL_VERSION,
+        old_key,
+        new_key,
+        entries: vec![RekeyEntry {
+            destination: EncryptedWorkspace::encode_relative_path(
+                &root,
+                &redirected.join("destination"),
+            )
+            .unwrap(),
+            renamed_destination: None,
+            staged: EncryptedWorkspace::encode_relative_path(&root, &staged).unwrap(),
+            backup: EncryptedWorkspace::encode_relative_path(&root, &redirected.join(backup_name))
+                .unwrap(),
+        }],
+    };
+    std::fs::write(
+        root.join(".rekey.json"),
+        serde_json::to_vec(&journal).unwrap(),
+    )
+    .unwrap();
+
+    assert!(EncryptedWorkspace::recover_migration(&root).is_err());
+    assert_eq!(std::fs::read(external_backup).unwrap(), b"must remain");
 }
 
 #[test]

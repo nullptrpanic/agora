@@ -229,6 +229,73 @@ impl FileCipher {
         Ok(())
     }
 
+    pub(crate) fn reencrypt_sparse(
+        &self,
+        source: &Path,
+        replacement: &Self,
+        destination: &Path,
+    ) -> Result<[u8; 32]> {
+        let encrypted = self.open_file(source).with_context(|| {
+            format!(
+                "failed to open encrypted filesystem file {}",
+                source.display()
+            )
+        })?;
+        let result = (|| {
+            let mut replacement_file = replacement.create_file(destination)?;
+            let mut digest = digest::Context::new(&digest::SHA256);
+            let mut offset = 0_u64;
+            let mut buffer = [0_u8; PLAINTEXT_BLOCK_SIZE];
+            while offset < encrypted.len() {
+                let read = encrypted.read_at(&mut buffer, offset)?;
+                if read == 0 {
+                    bail!("encrypted filesystem file ended before its logical length");
+                }
+                digest.update(&buffer[..read]);
+                if buffer[..read].iter().any(|byte| *byte != 0) {
+                    replacement_file.write_at(&buffer[..read], offset)?;
+                }
+                offset = offset
+                    .checked_add(read as u64)
+                    .context("encrypted filesystem file is too large")?;
+            }
+            replacement_file.set_len(encrypted.len())?;
+            replacement_file.sync_all()?;
+            let digest: [u8; 32] = digest
+                .finish()
+                .as_ref()
+                .try_into()
+                .expect("SHA-256 output has a fixed length");
+            Ok(digest)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(destination);
+        }
+        result.with_context(|| format!("failed to re-encrypt filesystem file {}", source.display()))
+    }
+
+    pub(crate) fn plaintext_digest(&self, source: &Path) -> Result<[u8; 32]> {
+        let encrypted = self.open_file(source)?;
+        let mut digest = digest::Context::new(&digest::SHA256);
+        let mut offset = 0_u64;
+        let mut buffer = [0_u8; PLAINTEXT_BLOCK_SIZE];
+        while offset < encrypted.len() {
+            let read = encrypted.read_at(&mut buffer, offset)?;
+            if read == 0 {
+                bail!("encrypted filesystem file ended before its logical length");
+            }
+            digest.update(&buffer[..read]);
+            offset = offset
+                .checked_add(read as u64)
+                .context("encrypted filesystem file is too large")?;
+        }
+        Ok(digest
+            .finish()
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 output has a fixed length"))
+    }
+
     pub(crate) fn overwrite(&self, plaintext: &mut File, destination: &Path) -> Result<()> {
         let mut encrypted = self.open_file(destination)?;
         encrypted.set_len(0)?;
