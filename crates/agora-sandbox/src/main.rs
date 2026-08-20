@@ -98,14 +98,6 @@ fn open_log(path: &Path) -> Result<File> {
     {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create log directory {}", parent.display()))?;
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(parent)
-            .with_context(|| format!("failed to open log directory {}", parent.display()))?;
-        if !directory.metadata()?.is_dir() {
-            anyhow::bail!("log path is not a directory: {}", parent.display());
-        }
     }
     let file = OpenOptions::new()
         .create(true)

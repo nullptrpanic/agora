@@ -280,17 +280,18 @@ fn open_log_rejects_a_symlink_without_touching_its_target() {
 }
 
 #[test]
-fn open_log_rejects_a_symlinked_output_directory() {
+fn open_log_allows_a_symlinked_output_directory() {
     let root = tempfile::tempdir().unwrap();
     let external = root.path().join("external");
     let logs = root.path().join("logs");
     std::fs::create_dir(&external).unwrap();
     std::os::unix::fs::symlink(&external, &logs).unwrap();
 
-    let accepted = open_log(&logs.join("sandbox.jsonl")).is_ok();
+    let output = open_log(&logs.join("sandbox.jsonl"))
+        .expect("a symbolic-link log directory should follow native path resolution");
 
-    assert!(!accepted, "a symbolic-link log directory was accepted");
-    assert_eq!(std::fs::read_dir(external).unwrap().count(), 0);
+    assert!(external.join("sandbox.jsonl").is_file());
+    drop(output);
 }
 
 #[tokio::test]

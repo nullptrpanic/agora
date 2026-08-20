@@ -79,17 +79,18 @@ fn ca_generation_failure_does_not_truncate_an_existing_certificate() {
 }
 
 #[test]
-fn ca_generation_rejects_a_symlinked_managed_directory() {
+fn ca_generation_allows_a_symlinked_output_directory() {
     let directory = tempfile::tempdir().unwrap();
     let external = directory.path().join("external");
-    let managed = directory.path().join("managed");
+    let output = directory.path().join("output");
     std::fs::create_dir(&external).unwrap();
-    std::os::unix::fs::symlink(&external, &managed).unwrap();
+    std::os::unix::fs::symlink(&external, &output).unwrap();
 
-    let accepted = generate_ca(&managed.join("ca.pem"), &managed.join("ca-key.pem")).is_ok();
+    generate_ca(&output.join("ca.pem"), &output.join("ca-key.pem"))
+        .expect("a symbolic-link CA output directory should follow native path resolution");
 
-    assert!(!accepted, "a symbolic-link CA directory was accepted");
-    assert_eq!(std::fs::read_dir(external).unwrap().count(), 0);
+    assert!(external.join("ca.pem").is_file());
+    assert!(external.join("ca-key.pem").is_file());
 }
 
 #[test]

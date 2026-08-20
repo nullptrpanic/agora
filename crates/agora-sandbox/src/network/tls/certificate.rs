@@ -64,12 +64,8 @@ fn write_ca_file(path: &Path, contents: &[u8]) -> Result<()> {
         .with_context(|| format!("failed to create TLS CA directory {}", parent.display()))?;
     let directory = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(parent)
         .with_context(|| format!("failed to open TLS CA directory {}", parent.display()))?;
-    if !directory.metadata()?.is_dir() {
-        bail!("TLS CA path is not a directory: {}", parent.display());
-    }
 
     let temporary = parent.join(format!(".agora-ca-{}.tmp", uuid::Uuid::new_v4().simple()));
     let result = (|| {
