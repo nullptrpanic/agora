@@ -1839,7 +1839,7 @@ fn broker_rejects_conflicting_write_ids_and_read_only_write_protocols() {
             .response,
         Response::Success
     );
-    assert_eq!(
+    assert_error(
         fixture
             .broker
             .handle(
@@ -1851,8 +1851,7 @@ fn broker_rejects_conflicting_write_ids_and_read_only_write_protocols() {
                 None,
             )
             .response,
-        Response::Success,
-        "an idempotent retry must retain the original reservation"
+        libc::EPROTO,
     );
     assert_error(
         fixture

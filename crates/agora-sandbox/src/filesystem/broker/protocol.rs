@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) use crate::filesystem::ByteRange;
 
-pub(crate) const PROTOCOL_VERSION: u16 = 8;
+pub(crate) const PROTOCOL_VERSION: u16 = 9;
 
 pub(crate) fn valid_request_id(value: &str) -> bool {
     value.len() == 32
@@ -34,6 +34,7 @@ pub(crate) struct ResponseEnvelope {
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(crate) enum Request {
     Ping,
+    AttachWriteLease,
     Open {
         path: BackingPath,
         flags: libc::c_int,

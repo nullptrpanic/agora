@@ -218,14 +218,11 @@ impl FilesystemHookRuntime {
             .checked_add(u64::try_from(length).context("memory mapping length overflowed")?)
             .context("memory mapping file range overflowed")?;
         let range = LocalByteRange::new(file_offset, file_end)?;
-        open.managed()
+        let writable = open
+            .managed()
             .prepare_mapping(self, descriptor, range, protection, flags)?;
         if flags & libc::MAP_SHARED == 0 {
             return Ok(None);
-        }
-        let writable = open.managed().writable();
-        if writable {
-            self.register_potential_range(&open, file_offset, file_end)?;
         }
         Ok(Some(PendingMapping {
             file_offset,
@@ -257,11 +254,6 @@ impl FilesystemHookRuntime {
         });
         self.memory_index.publish_mappings(&mappings);
         Ok(())
-    }
-
-    fn register_potential_range(&self, open: &OpenFile, start: u64, end: u64) -> Result<()> {
-        let range = LocalByteRange::new(start, end)?;
-        open.managed().prepare_writable_mapping(self, range)
     }
 
     fn mapping_slices(&self, start: usize, end: usize, writable_only: bool) -> Vec<MappingSlice> {

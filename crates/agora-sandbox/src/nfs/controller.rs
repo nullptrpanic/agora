@@ -321,7 +321,10 @@ where
             let (request, descriptor) = received?;
             let request_id = request.request_id.clone();
             let authenticated = request.version == PROTOCOL_VERSION
-                && constant_time_equal(request.token.as_bytes(), state.token.as_bytes());
+                && crate::ipc::constant_time_equal(
+                    request.token.as_bytes(),
+                    state.token.as_bytes(),
+                );
             let expects_descriptor = matches!(&request.request, Request::Write { .. });
             let descriptor_valid = expects_descriptor == descriptor.is_some();
             let valid = authenticated && descriptor_valid;
@@ -391,16 +394,6 @@ fn configure_server_stream(
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(read_timeout))?;
     stream.set_write_timeout(Some(write_timeout))
-}
-
-fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
-    let mut difference = left.len() ^ right.len();
-    for index in 0..left.len().max(right.len()) {
-        let left = left.get(index).copied().unwrap_or(0);
-        let right = right.get(index).copied().unwrap_or(0);
-        difference |= usize::from(left ^ right);
-    }
-    difference == 0
 }
 
 #[cfg(test)]

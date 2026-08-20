@@ -1,16 +1,16 @@
 mod backend;
-mod io;
+mod policy;
 mod state;
 
 pub(super) use backend::{EncryptedContent, LocalContentInheritance, NfsContent};
-pub(super) use io::{ContentIoOffset, managed_read_io, managed_seek_io, managed_write_io};
+pub(super) use policy::{ContentIoOffset, managed_read_io, managed_seek_io, managed_write_io};
 #[cfg(test)]
-pub(super) use io::{READ_AHEAD_MAX_BYTES, read_materialization_length};
+pub(super) use policy::{READ_AHEAD_MAX_BYTES, read_materialization_length};
 pub(super) use state::ManagedContent;
 
 use super::{FilesystemHookRuntime, LocalByteRange, OpenFile, lock};
 use anyhow::Result;
-use backend::{EagerEncryptedContent, PlainContent, TruncateOperation};
+use backend::{ContentWriteMode, EagerEncryptedContent, PlainContent, TruncateOperation};
 use std::sync::MutexGuard;
 
 impl ManagedContent {
@@ -87,8 +87,12 @@ impl ManagedContent {
     }
 
     pub(super) fn record_snapshot_write(&self, range: Option<LocalByteRange>) {
-        if self.backend.records_native_snapshot_writes()
-            && let Some(range) = range
+        if matches!(
+            self.backend.write_mode(),
+            ContentWriteMode::Native {
+                track_snapshot: true
+            }
+        ) && let Some(range) = range
         {
             self.state.record_write(range);
         }
@@ -146,20 +150,9 @@ impl ManagedContent {
         range: LocalByteRange,
         protection: libc::c_int,
         flags: libc::c_int,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let _mutation = self.mutation_guard();
-        self.backend
-            .prepare_mapping(&self.state, runtime, descriptor, range, protection, flags)
-    }
-
-    pub(super) fn prepare_writable_mapping(
-        &self,
-        runtime: &FilesystemHookRuntime,
-        range: LocalByteRange,
-    ) -> Result<()> {
-        let _mutation = self.mutation_guard();
-        self.backend
-            .prepare_writable_mapping(&self.state, runtime, range)
+        policy::prepare_mapping(self, runtime, descriptor, range, protection, flags)
     }
 
     pub(super) fn materialize(

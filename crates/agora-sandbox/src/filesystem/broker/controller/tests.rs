@@ -55,12 +55,12 @@ async fn controller_serves_the_complete_local_client_lifecycle() {
             .unwrap();
         opened.descriptor.write_all_at(b"after!", 0).unwrap();
         client
-            .finish_write(&opened.handle, &write, ByteRange::new(0, 6).unwrap())
+            .finish_write(write, ByteRange::new(0, 6).unwrap())
             .unwrap();
         let cancelled = client
             .begin_write(&opened.handle, ByteRange::new(0, 1).unwrap())
             .unwrap();
-        client.cancel_write(&opened.handle, &cancelled).unwrap();
+        client.cancel_write(cancelled).unwrap();
         client
             .potentially_dirty(&opened.handle, ByteRange::new(0, 6).unwrap())
             .unwrap();
@@ -89,25 +89,335 @@ async fn controller_serves_the_complete_local_client_lifecycle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_write_connection_releases_its_reservation() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir(&root).unwrap();
+    let cipher = cipher();
+    let backing = root.join("content");
+    let mut source = tempfile::tempfile().unwrap();
+    source.write_all(b"before").unwrap();
+    cipher.encrypt(&mut source, &backing).unwrap();
+    let controller = LocalController::start(&root, cipher, &runtime)
+        .await
+        .unwrap();
+    let client = LocalClient::new(controller.runtime().socket(), controller.runtime().token());
+    let opened = client.open(&backing, libc::O_RDWR).unwrap();
+
+    let write = client
+        .begin_write(&opened.handle, ByteRange::new(0, 1).unwrap())
+        .unwrap();
+    drop(write);
+
+    let write_id = "11111111111111111111111111111111";
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let offset = loop {
+        let response = controller
+            .broker
+            .handle(
+                Request::BeginAppend {
+                    handle: opened.handle.clone(),
+                    write_id: write_id.to_string(),
+                },
+                None,
+            )
+            .response;
+        match response {
+            Response::Offset { offset } => break offset,
+            Response::Error {
+                errno: libc::EAGAIN,
+                ..
+            } if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+            response => panic!("write reservation was not released after EOF: {response:?}"),
+        }
+    };
+    assert_eq!(offset, 6);
+    assert_eq!(
+        controller
+            .broker
+            .handle(
+                Request::CancelWrite {
+                    handle: opened.handle.clone(),
+                    write_id: write_id.to_string(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+
+    client.close(&opened.handle, Vec::new()).unwrap();
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_lease_begin_cannot_be_replayed_onto_a_second_connection() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir(&root).unwrap();
+    let cipher = cipher();
+    let backing = root.join("content");
+    let mut source = tempfile::tempfile().unwrap();
+    source.write_all(b"before").unwrap();
+    cipher.encrypt(&mut source, &backing).unwrap();
+    let controller = LocalController::start(&root, cipher, &runtime)
+        .await
+        .unwrap();
+    let client = LocalClient::new(controller.runtime().socket(), controller.runtime().token());
+    let opened = client.open(&backing, libc::O_RDWR).unwrap();
+    let request_id = "11111111111111111111111111111111";
+    let write_id = "22222222222222222222222222222222";
+    let begin = RequestEnvelope {
+        version: PROTOCOL_VERSION,
+        token: controller.runtime().token().to_string(),
+        request_id: request_id.to_string(),
+        request: Request::BeginWrite {
+            handle: opened.handle.clone(),
+            write_id: write_id.to_string(),
+            range: ByteRange::new(0, 1).unwrap(),
+        },
+    };
+
+    let mut owner = std::os::unix::net::UnixStream::connect(controller.runtime().socket()).unwrap();
+    ipc::send(&mut owner, &begin, None).unwrap();
+    assert_eq!(
+        ipc::receive::<ResponseEnvelope>(&mut owner)
+            .unwrap()
+            .0
+            .response,
+        Response::Success
+    );
+
+    let mut replay =
+        std::os::unix::net::UnixStream::connect(controller.runtime().socket()).unwrap();
+    ipc::send(&mut replay, &begin, None).unwrap();
+    let response = ipc::receive::<ResponseEnvelope>(&mut replay)
+        .unwrap()
+        .0
+        .response;
+    assert!(matches!(
+        response,
+        Response::Error {
+            errno: libc::EPROTO,
+            ..
+        }
+    ));
+
+    ipc::send(
+        &mut owner,
+        &RequestEnvelope {
+            version: PROTOCOL_VERSION,
+            token: controller.runtime().token().to_string(),
+            request_id: "33333333333333333333333333333333".to_string(),
+            request: Request::CancelWrite {
+                handle: opened.handle.clone(),
+                write_id: write_id.to_string(),
+            },
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        ipc::receive::<ResponseEnvelope>(&mut owner)
+            .unwrap()
+            .0
+            .response,
+        Response::Success
+    );
+
+    client.close(&opened.handle, Vec::new()).unwrap();
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_resident_write_recovers_the_current_vnode() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir(&root).unwrap();
+    let cipher = cipher();
+    let backing = root.join("content");
+    let mut source = tempfile::tempfile().unwrap();
+    source.write_all(b"before").unwrap();
+    cipher.encrypt(&mut source, &backing).unwrap();
+    let controller = LocalController::start(&root, cipher.clone(), &runtime)
+        .await
+        .unwrap();
+    let client = LocalClient::new(controller.runtime().socket(), controller.runtime().token());
+    let opened = client.open(&backing, libc::O_RDWR).unwrap();
+    assert!(!opened.lazy);
+
+    let write = client
+        .begin_write(&opened.handle, ByteRange::new(0, 6).unwrap())
+        .unwrap();
+    opened.descriptor.write_all_at(b"after!", 0).unwrap();
+    drop(write);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let response = controller
+            .broker
+            .handle(
+                Request::BeginAppend {
+                    handle: opened.handle.clone(),
+                    write_id: "11111111111111111111111111111111".to_string(),
+                },
+                None,
+            )
+            .response;
+        match response {
+            Response::Offset { .. } => {
+                assert_eq!(
+                    controller
+                        .broker
+                        .handle(
+                            Request::CancelWrite {
+                                handle: opened.handle.clone(),
+                                write_id: "11111111111111111111111111111111".to_string(),
+                            },
+                            None,
+                        )
+                        .response,
+                    Response::Success
+                );
+                break;
+            }
+            Response::Error {
+                errno: libc::EAGAIN,
+                ..
+            } if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+            response => panic!("resident write reservation was not recovered: {response:?}"),
+        }
+    }
+
+    client.close(&opened.handle, Vec::new()).unwrap();
+    controller.shutdown().await.unwrap();
+
+    let mut decrypted = tempfile::tempfile().unwrap();
+    cipher.decrypt(&backing, &mut decrypted).unwrap();
+    decrypted.seek(SeekFrom::Start(0)).unwrap();
+    let mut contents = String::new();
+    decrypted.read_to_string(&mut contents).unwrap();
+    assert_eq!(contents, "after!");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_lazy_write_preserves_the_last_valid_ciphertext() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir(&root).unwrap();
+    let cipher = cipher();
+    let backing = root.join("content");
+    let original = vec![b'Q'; 1024 * 1024 + 4096];
+    let mut source = tempfile::tempfile().unwrap();
+    source.write_all(&original).unwrap();
+    cipher.encrypt(&mut source, &backing).unwrap();
+    let controller = LocalController::start(&root, cipher.clone(), &runtime)
+        .await
+        .unwrap();
+    let client = LocalClient::new(controller.runtime().socket(), controller.runtime().token());
+    let opened = client.open(&backing, libc::O_RDWR).unwrap();
+    assert!(opened.lazy);
+
+    let range = ByteRange::new(4096, 8192).unwrap();
+    let write = client.begin_write(&opened.handle, range).unwrap();
+    drop(write);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match controller
+            .broker
+            .handle(
+                Request::Materialize {
+                    handle: opened.handle.clone(),
+                    range: Some(range),
+                },
+                None,
+            )
+            .response
+        {
+            Response::Error {
+                errno: libc::EIO, ..
+            } => break,
+            Response::Error {
+                errno: libc::EAGAIN,
+                ..
+            } if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+            response => panic!("abandoned lazy vnode did not fail closed: {response:?}"),
+        }
+    }
+
+    let reopened = client.open(&backing, libc::O_RDONLY).unwrap();
+    client.materialize(&reopened.handle, Some(range)).unwrap();
+    let mut restored = vec![0_u8; (range.end - range.start) as usize];
+    reopened
+        .descriptor
+        .read_exact_at(&mut restored, range.start)
+        .unwrap();
+    assert_eq!(restored, original[range.start as usize..range.end as usize]);
+
+    assert_eq!(
+        client
+            .close(&opened.handle, Vec::new())
+            .unwrap_err()
+            .errno(),
+        libc::EIO
+    );
+    client.close(&reopened.handle, Vec::new()).unwrap();
+    controller.shutdown().await.unwrap();
+
+    let mut decrypted = tempfile::tempfile().unwrap();
+    cipher.decrypt(&backing, &mut decrypted).unwrap();
+    let mut contents = Vec::new();
+    decrypted.seek(SeekFrom::Start(0)).unwrap();
+    decrypted.read_to_end(&mut contents).unwrap();
+    assert_eq!(contents, original);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authenticated_local_control_stream_survives_new_connection_denial() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("fs");
     std::fs::create_dir(&root).unwrap();
-    let controller = LocalController::start(&root, cipher(), &directory.path().join("runtime"))
-        .await
-        .unwrap();
+    let cipher = cipher();
+    let backing = root.join("content");
+    let mut source = tempfile::tempfile().unwrap();
+    source.write_all(b"before").unwrap();
+    cipher.encrypt(&mut source, &backing).unwrap();
+    let controller =
+        LocalController::start(&root, cipher.clone(), &directory.path().join("runtime"))
+            .await
+            .unwrap();
     let socket = controller.runtime().socket().to_path_buf();
     let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
     let shared =
         InheritedControlStream::new(stream, InheritedControlLock::anonymous().unwrap(), 0).unwrap();
     let client = LocalClient::with_shared(&socket, controller.runtime().token(), shared);
 
+    let opened = client.open(&backing, libc::O_RDWR).unwrap();
     client.ping_shared().unwrap();
     std::fs::remove_file(&socket).unwrap();
-    client.close("missing", Vec::new()).unwrap();
+    let write = client
+        .begin_write(&opened.handle, ByteRange::new(0, 6).unwrap())
+        .unwrap();
+    opened.descriptor.write_all_at(b"after!", 0).unwrap();
+    client
+        .finish_write(write, ByteRange::new(0, 6).unwrap())
+        .unwrap();
+    client.close(&opened.handle, Vec::new()).unwrap();
 
     drop(client);
     controller.shutdown().await.unwrap();
+
+    let mut decrypted = tempfile::tempfile().unwrap();
+    cipher.decrypt(&backing, &mut decrypted).unwrap();
+    decrypted.seek(SeekFrom::Start(0)).unwrap();
+    let mut contents = String::new();
+    decrypted.read_to_string(&mut contents).unwrap();
+    assert_eq!(contents, "after!");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -500,9 +810,9 @@ async fn startup_errors_and_constant_time_token_checks_are_explicit() {
     };
     assert!(error.to_string().contains("No such file"));
 
-    assert!(constant_time_equal(b"same", b"same"));
-    assert!(!constant_time_equal(b"same", b"diff"));
-    assert!(!constant_time_equal(b"short", b"longer"));
+    assert!(crate::ipc::constant_time_equal(b"same", b"same"));
+    assert!(!crate::ipc::constant_time_equal(b"same", b"diff"));
+    assert!(!crate::ipc::constant_time_equal(b"short", b"longer"));
 
     let request = Request::Open {
         path: BackingPath::from_path(Path::new("/tmp/example")),

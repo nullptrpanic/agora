@@ -121,6 +121,69 @@ fn client_retries_busy_mutations_with_a_new_request_id() {
 }
 
 #[test]
+fn write_lifecycle_reuses_the_begin_connection() {
+    let runtime = tempfile::tempdir().unwrap();
+    let socket = runtime.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut begin_stream, _) = listener.accept().unwrap();
+        let (begin, descriptor) = ipc::receive::<RequestEnvelope>(&mut begin_stream).unwrap();
+        assert!(descriptor.is_none());
+        assert!(matches!(begin.request, Request::BeginWrite { .. }));
+        ipc::send(
+            &mut begin_stream,
+            &ResponseEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: begin.request_id,
+                response: Response::Success,
+            },
+            None,
+        )
+        .unwrap();
+
+        let (finish, same_connection, mut finish_stream) =
+            match ipc::receive::<RequestEnvelope>(&mut begin_stream) {
+                Ok((finish, descriptor)) => {
+                    assert!(descriptor.is_none());
+                    (finish, true, begin_stream)
+                }
+                Err(_) => {
+                    let (mut finish_stream, _) = listener.accept().unwrap();
+                    let (finish, descriptor) =
+                        ipc::receive::<RequestEnvelope>(&mut finish_stream).unwrap();
+                    assert!(descriptor.is_none());
+                    (finish, false, finish_stream)
+                }
+            };
+        assert!(matches!(finish.request, Request::FinishWrite { .. }));
+        ipc::send(
+            &mut finish_stream,
+            &ResponseEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: finish.request_id,
+                response: Response::Success,
+            },
+            None,
+        )
+        .unwrap();
+        same_connection
+    });
+    let client = LocalClient::new(&socket, "token");
+
+    let write = client
+        .begin_write("handle", ByteRange::new(1, 3).unwrap())
+        .unwrap();
+    client
+        .finish_write(write, ByteRange::new(1, 3).unwrap())
+        .unwrap();
+
+    assert!(
+        server.join().unwrap(),
+        "FinishWrite opened a second UDS connection"
+    );
+}
+
+#[test]
 fn client_rejects_mismatched_and_descriptor_bearing_responses() {
     for descriptor_response in [false, true] {
         let runtime = tempfile::tempdir().unwrap();

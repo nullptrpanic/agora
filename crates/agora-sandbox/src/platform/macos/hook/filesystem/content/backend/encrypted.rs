@@ -1,9 +1,9 @@
 use super::super::super::{FilesystemHookRuntime, LocalByteRange, OpenFile, lock, set_errno};
-use super::super::io::{errno_error, positional_reservation_range, read_materialization_length};
+use super::super::policy::{WriteOperations, errno_error, positional_reservation_range};
 use super::super::state::ContentState;
 use super::{
-    ContentBackend, ContentIoOffset, LocalContentInheritance, ReadOperations, TruncateOperation,
-    WriteOperations,
+    ContentBackend, ContentReadMode, ContentWriteMode, ContentWritePosition, ContentWriteResult,
+    LocalContentInheritance, TruncateOperation,
 };
 use crate::filesystem::Writeback;
 use crate::filesystem::broker::{LOCAL_STATUS_FLAGS_MASK, LocalFileIdentity, LocalOpenState};
@@ -44,143 +44,88 @@ impl EagerEncryptedContent {
 }
 
 impl ContentBackend for EncryptedContent {
+    fn read_mode(&self) -> ContentReadMode {
+        ContentReadMode::Positioned {
+            materialize: self.lazy,
+        }
+    }
+
+    fn write_mode(&self) -> ContentWriteMode {
+        ContentWriteMode::Explicit
+    }
+
+    fn logical_open_state(&self) -> Option<&LocalOpenState> {
+        Some(&self.state)
+    }
+
     fn supports_async_write(&self) -> bool {
         false
     }
 
-    fn read(
+    fn write_explicit(
         &self,
-        state: &ContentState,
+        _state: &ContentState,
         runtime: &FilesystemHookRuntime,
         _descriptor: libc::c_int,
-        requested_offset: ContentIoOffset,
-        operations: &mut ReadOperations<'_>,
-    ) -> Result<libc::ssize_t> {
-        let open_state = self.state.lock()?;
-        let flags = open_state.flags()?;
-        if flags & libc::O_ACCMODE == libc::O_WRONLY {
-            return Err(errno_error(libc::EBADF));
-        }
-        let offset = match requested_offset {
-            ContentIoOffset::Sequential => open_state.offset()?,
-            ContentIoOffset::Positioned(offset) => offset,
-        };
-        if offset < 0 {
-            return Err(errno_error(libc::EINVAL));
-        }
-        if self.lazy {
-            let length = (operations.requested_length)().map_err(errno_error)?;
-            if length != 0 {
-                let start = offset as u64;
-                let requested = u64::try_from(length).unwrap_or(u64::MAX);
-                let end = start.saturating_add(read_materialization_length(requested));
-                let range = LocalByteRange::new(start, end).expect("non-empty read range");
-                self.materialize(state, runtime, Some(range))?;
-            }
-        }
-        let result = (operations.positioned)(offset);
-        if result > 0 && matches!(requested_offset, ContentIoOffset::Sequential) {
-            let next = offset
-                .checked_add(result as libc::off_t)
-                .ok_or_else(|| errno_error(libc::EOVERFLOW))?;
-            open_state.set_offset(next)?;
-        }
-        Ok(result)
-    }
-
-    fn write(
-        &self,
-        state: &ContentState,
-        runtime: &FilesystemHookRuntime,
-        _descriptor: libc::c_int,
-        requested_offset: ContentIoOffset,
+        position: ContentWritePosition,
         reservation_length: Option<usize>,
         operations: &mut WriteOperations<'_>,
-    ) -> Result<libc::ssize_t> {
-        if !state.writable {
-            return Err(errno_error(libc::EBADF));
-        }
-        let open_state = self.state.lock()?;
-        let flags = open_state.flags()?;
-        if flags & libc::O_ACCMODE == libc::O_RDONLY {
-            return Err(errno_error(libc::EBADF));
-        }
+    ) -> Result<ContentWriteResult> {
         let local = runtime
             .local
             .as_ref()
             .context("local filesystem runtime is unavailable")?;
-        let (active, offset) = match requested_offset {
-            ContentIoOffset::Sequential if reservation_length == Some(0) => {
-                (None, open_state.offset()?)
-            }
-            ContentIoOffset::Sequential if flags & libc::O_APPEND != 0 => {
+        let (active, start) = match position {
+            ContentWritePosition::Append => {
                 let (active, offset) = local.begin_append(&self.handle)?;
-                let offset = libc::off_t::try_from(offset).map_err(|_| {
-                    let _ = local.cancel_write(&self.handle, &active);
-                    errno_error(libc::EOVERFLOW)
-                })?;
                 (Some(active), offset)
             }
-            ContentIoOffset::Sequential => {
-                let offset = open_state.offset()?;
-                if offset < 0 {
-                    return Err(errno_error(libc::EINVAL));
+            ContentWritePosition::At(start) => {
+                let range = positional_reservation_range(start, reservation_length);
+                let active = range
+                    .map(|range| local.begin_write(&self.handle, range))
+                    .transpose()?;
+                (active, start)
+            }
+        };
+        let mut active = active;
+        let offset = match libc::off_t::try_from(start) {
+            Ok(offset) => offset,
+            Err(_) => {
+                if let Some(active) = active.take() {
+                    let _ = local.cancel_write(active);
                 }
-                let range = positional_reservation_range(offset as u64, reservation_length);
-                let active = range
-                    .map(|range| local.begin_write(&self.handle, range))
-                    .transpose()?;
-                (active, offset)
+                return Err(errno_error(libc::EOVERFLOW));
             }
-            ContentIoOffset::Positioned(offset) if offset >= 0 => {
-                let range = positional_reservation_range(offset as u64, reservation_length);
-                let active = range
-                    .map(|range| local.begin_write(&self.handle, range))
-                    .transpose()?;
-                (active, offset)
-            }
-            ContentIoOffset::Positioned(_) => return Err(errno_error(libc::EINVAL)),
         };
         if offset < 0 {
-            if let Some(active) = &active {
-                let _ = local.cancel_write(&self.handle, active);
+            if let Some(active) = active.take() {
+                let _ = local.cancel_write(active);
             }
             return Err(errno_error(libc::EINVAL));
         }
         let result = (operations.positioned)(offset);
-        if result > 0 {
-            if let Ok(range) =
-                LocalByteRange::new(offset as u64, (offset as u64).saturating_add(result as u64))
-            {
-                let finish_failed = active.as_ref().is_none_or(|write| {
-                    if local.finish_write(&self.handle, write, range).is_ok() {
-                        false
-                    } else {
-                        let _ = local.cancel_write(&self.handle, write);
-                        true
-                    }
-                });
-                if matches!(requested_offset, ContentIoOffset::Sequential) {
-                    let end = libc::off_t::try_from(range.end)
-                        .map_err(|_| errno_error(libc::EOVERFLOW))?;
-                    open_state.set_offset(end)?;
-                }
-                if flags & (libc::O_SYNC | libc::O_DSYNC) != 0 {
-                    let ranges = finish_failed.then_some(range).into_iter().collect();
-                    if let Err(error) = local.sync(&self.handle, ranges, true) {
-                        state.record_write(range);
-                        return Err(error.into());
-                    }
-                } else if finish_failed {
-                    state.record_write(range);
-                }
-            }
-        } else if let Some(active) = &active {
+        let published = if result > 0 {
+            let range = LocalByteRange::new(start, start.saturating_add(result as u64))?;
+            active
+                .take()
+                .is_some_and(|write| local.finish_write(write, range).is_ok())
+        } else {
+            false
+        };
+        if result <= 0
+            && let Some(active) = active.take()
+        {
             let errno = unsafe { *libc::__error() };
-            let _ = local.cancel_write(&self.handle, active);
+            let _ = local.cancel_write(active);
             unsafe { set_errno(errno) };
         }
-        Ok(result)
+        Ok(ContentWriteResult {
+            result,
+            start: Some(start),
+            published,
+            recoverable: true,
+        })
     }
 
     fn seek(
@@ -231,15 +176,15 @@ impl ContentBackend for EncryptedContent {
             .local
             .as_ref()
             .context("local filesystem runtime is unavailable")?;
-        let active = operation
+        let mut active = operation
             .reservation
             .map(|range| local.begin_write(&self.handle, range))
             .transpose()?;
         let result = (operation.native)();
         if result != 0 {
             let errno = unsafe { *libc::__error() };
-            if let Some(active) = &active {
-                let _ = local.cancel_write(&self.handle, active);
+            if let Some(active) = active.take() {
+                let _ = local.cancel_write(active);
             }
             unsafe { set_errno(errno) };
             return Ok(result);
@@ -249,43 +194,16 @@ impl ContentBackend for EncryptedContent {
             operation.open.logical().to_string_lossy().as_ref(),
         )?;
         if let Some(range) = operation.reservation
-            && active.as_ref().is_none_or(|active| {
-                if local.finish_write(&self.handle, active, range).is_ok() {
-                    false
-                } else {
-                    let _ = local.cancel_write(&self.handle, active);
-                    true
-                }
-            })
+            && active
+                .take()
+                .is_none_or(|active| local.finish_write(active, range).is_err())
         {
             state.record_write(range);
         }
         Ok(result)
     }
 
-    fn prepare_mapping(
-        &self,
-        state: &ContentState,
-        runtime: &FilesystemHookRuntime,
-        _descriptor: libc::c_int,
-        range: LocalByteRange,
-        protection: libc::c_int,
-        flags: libc::c_int,
-    ) -> Result<()> {
-        let open_state = self.state.lock()?;
-        let access = open_state.flags()? & libc::O_ACCMODE;
-        if access == libc::O_WRONLY
-            || (flags & libc::MAP_SHARED != 0
-                && protection & libc::PROT_WRITE != 0
-                && access == libc::O_RDONLY)
-        {
-            return Err(errno_error(libc::EACCES));
-        }
-        drop(open_state);
-        self.materialize(state, runtime, Some(range))
-    }
-
-    fn prepare_writable_mapping(
+    fn potentially_dirty(
         &self,
         state: &ContentState,
         runtime: &FilesystemHookRuntime,

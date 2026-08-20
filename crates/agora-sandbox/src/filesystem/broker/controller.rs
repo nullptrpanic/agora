@@ -6,14 +6,14 @@ use crate::filesystem::FileCipher;
 use crate::ipc;
 use anyhow::{Context, Result};
 use std::net::Shutdown;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -138,11 +138,30 @@ struct Server {
     listener: UnixListener,
     state: Arc<ServerState>,
     connections: Arc<Semaphore>,
+    attached_tx: mpsc::Sender<AttachedConnection>,
+    attached_rx: mpsc::Receiver<AttachedConnection>,
+}
+
+struct AttachedConnection {
+    stream: std::os::unix::net::UnixStream,
+    permit: OwnedSemaphorePermit,
 }
 
 struct ConnectionControl {
     stream: std::os::unix::net::UnixStream,
     state: AtomicU8,
+}
+
+enum ConnectionMode {
+    Initial,
+    Shared,
+    WriteLease(WriteLease),
+}
+
+#[derive(Clone)]
+struct WriteLease {
+    handle: String,
+    write_id: String,
 }
 
 impl ConnectionControl {
@@ -180,14 +199,17 @@ impl ConnectionControl {
 
 impl Server {
     fn new(listener: UnixListener, state: Arc<ServerState>) -> Self {
+        let (attached_tx, attached_rx) = mpsc::channel(MAX_CONNECTIONS);
         Self {
             listener,
             state,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            attached_tx,
+            attached_rx,
         }
     }
 
-    async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut tasks = JoinSet::new();
         let mut controls = Vec::new();
         let shutdown_requested = Arc::new(AtomicBool::new(false));
@@ -222,6 +244,16 @@ impl Server {
                         writebacks.spawn_blocking(move || broker.flush_due(Instant::now()));
                     }
                 },
+                Some(attached_connection) = self.attached_rx.recv() => {
+                    let AttachedConnection { stream, permit } = attached_connection;
+                    self.spawn_connection(
+                        &mut tasks,
+                        &mut controls,
+                        stream,
+                        permit,
+                        Arc::clone(&shutdown_requested),
+                    )?;
+                }
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted?;
                     let Ok(permit) = Arc::clone(&self.connections).try_acquire_owned() else {
@@ -230,20 +262,18 @@ impl Server {
                     };
                     let stream = stream.into_std()?;
                     stream.set_nonblocking(false)?;
-                    let control = Arc::new(ConnectionControl {
-                        stream: stream.try_clone()?,
-                        state: AtomicU8::new(CONNECTION_INITIAL),
-                    });
-                    controls.push(Arc::downgrade(&control));
-                    let state = Arc::clone(&self.state);
-                    let shutdown_requested = Arc::clone(&shutdown_requested);
-                    tasks.spawn(async move {
-                        let _permit = permit;
-                        let _ = Self::handle(stream, state, control, shutdown_requested).await;
-                    });
+                    self.spawn_connection(
+                        &mut tasks,
+                        &mut controls,
+                        stream,
+                        permit,
+                        Arc::clone(&shutdown_requested),
+                    )?;
                 }
             }
         }
+        self.attached_rx.close();
+        while self.attached_rx.try_recv().is_ok() {}
         controls
             .iter()
             .filter_map(Weak::upgrade)
@@ -255,111 +285,256 @@ impl Server {
         Ok(())
     }
 
+    fn spawn_connection(
+        &self,
+        tasks: &mut JoinSet<()>,
+        controls: &mut Vec<Weak<ConnectionControl>>,
+        stream: std::os::unix::net::UnixStream,
+        permit: OwnedSemaphorePermit,
+        shutdown_requested: Arc<AtomicBool>,
+    ) -> Result<()> {
+        let control = Arc::new(ConnectionControl {
+            stream: stream.try_clone()?,
+            state: AtomicU8::new(CONNECTION_INITIAL),
+        });
+        controls.push(Arc::downgrade(&control));
+        let state = Arc::clone(&self.state);
+        let connections = Arc::clone(&self.connections);
+        let attached = self.attached_tx.clone();
+        tasks.spawn(async move {
+            let _permit = permit;
+            let _ = Self::handle(
+                stream,
+                state,
+                control,
+                shutdown_requested,
+                connections,
+                attached,
+            )
+            .await;
+        });
+        Ok(())
+    }
+
     async fn handle(
         stream: std::os::unix::net::UnixStream,
         state: Arc<ServerState>,
         control: Arc<ConnectionControl>,
         shutdown_requested: Arc<AtomicBool>,
+        connections: Arc<Semaphore>,
+        attached: mpsc::Sender<AttachedConnection>,
     ) -> Result<()> {
         stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
         stream.set_write_timeout(Some(RESPONSE_TIMEOUT))?;
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             let mut stream = stream;
-            let mut persistent = false;
-            loop {
-                let (request, descriptor) = ipc::receive::<RequestEnvelope>(&mut stream)?;
-                if persistent && !control.begin_request() {
-                    return Ok(());
-                }
-                let authenticated = request.version == PROTOCOL_VERSION
-                    && constant_time_equal(request.token.as_bytes(), state.token.as_bytes());
-                let valid_id = valid_request_id(&request.request_id)
-                    && !matches!(
-                        &request.request,
-                        Request::Claim { request_id } if !valid_request_id(request_id)
-                    )
-                    && !matches!(
-                        &request.request,
-                        Request::BeginWrite { write_id, .. }
-                            | Request::BeginAppend { write_id, .. }
-                            | Request::FinishWrite { write_id, .. }
-                            | Request::CancelWrite { write_id, .. }
-                            if !valid_request_id(write_id)
-                    );
-                let ping = matches!(&request.request, Request::Ping) && descriptor.is_none();
-                let reply = if request.version != PROTOCOL_VERSION {
-                    super::service::BrokerReply {
-                        response: Response::Error {
-                            errno: libc::EPROTO,
-                            message: "unsupported local filesystem protocol version".to_string(),
-                        },
-                        descriptors: Vec::new(),
+            let mut mode = ConnectionMode::Initial;
+            let mut active_lease = None;
+            let result = (|| {
+                loop {
+                    let (request, descriptor) = ipc::receive::<RequestEnvelope>(&mut stream)?;
+                    if !matches!(&mode, ConnectionMode::Initial) && !control.begin_request() {
+                        return Ok(());
                     }
-                } else if !authenticated {
-                    super::service::BrokerReply {
-                        response: Response::Error {
-                            errno: libc::EACCES,
-                            message: "invalid local filesystem token".to_string(),
-                        },
-                        descriptors: Vec::new(),
+                    let authenticated = request.version == PROTOCOL_VERSION
+                        && ipc::constant_time_equal(
+                            request.token.as_bytes(),
+                            state.token.as_bytes(),
+                        );
+                    let valid_id = valid_request_id(&request.request_id)
+                        && !matches!(
+                            &request.request,
+                            Request::Claim { request_id } if !valid_request_id(request_id)
+                        )
+                        && !matches!(
+                            &request.request,
+                            Request::BeginWrite { write_id, .. }
+                                | Request::BeginAppend { write_id, .. }
+                                | Request::FinishWrite { write_id, .. }
+                                | Request::CancelWrite { write_id, .. }
+                                if !valid_request_id(write_id)
+                        );
+                    let descriptor_free = descriptor.is_none();
+                    let ping = matches!(&request.request, Request::Ping) && descriptor_free;
+                    let requested_lease = match &request.request {
+                        Request::BeginWrite {
+                            handle, write_id, ..
+                        }
+                        | Request::BeginAppend { handle, write_id } => Some(WriteLease {
+                            handle: handle.clone(),
+                            write_id: write_id.clone(),
+                        }),
+                        _ => None,
+                    };
+                    let begin_write = matches!(&request.request, Request::BeginWrite { .. });
+                    let begin_append = matches!(&request.request, Request::BeginAppend { .. });
+                    let attach_write_lease = matches!(&request.request, Request::AttachWriteLease);
+                    let valid_for_connection = match &mode {
+                        ConnectionMode::Initial => !matches!(
+                            &request.request,
+                            Request::AttachWriteLease
+                                | Request::FinishWrite { .. }
+                                | Request::CancelWrite { .. }
+                        ),
+                        ConnectionMode::Shared => !matches!(
+                            &request.request,
+                            Request::BeginWrite { .. }
+                                | Request::BeginAppend { .. }
+                                | Request::FinishWrite { .. }
+                                | Request::CancelWrite { .. }
+                        ),
+                        ConnectionMode::WriteLease(lease) => matches!(
+                            &request.request,
+                            Request::FinishWrite {
+                                handle,
+                                write_id,
+                                ..
+                            } | Request::CancelWrite { handle, write_id }
+                                if handle == &lease.handle && write_id == &lease.write_id
+                        ),
+                    };
+                    let reply = if request.version != PROTOCOL_VERSION {
+                        super::service::BrokerReply::error(
+                            libc::EPROTO,
+                            "unsupported local filesystem protocol version",
+                        )
+                    } else if !authenticated {
+                        super::service::BrokerReply::error(
+                            libc::EACCES,
+                            "invalid local filesystem token",
+                        )
+                    } else if !valid_id {
+                        super::service::BrokerReply::error(
+                            libc::EPROTO,
+                            "invalid local filesystem request ID",
+                        )
+                    } else if !valid_for_connection {
+                        super::service::BrokerReply::error(
+                            libc::EPROTO,
+                            "local filesystem write lifecycle used the wrong connection",
+                        )
+                    } else if attach_write_lease {
+                        Self::attach_write_connection(
+                            descriptor,
+                            Arc::clone(&connections),
+                            &attached,
+                        )
+                    } else if begin_write || begin_append {
+                        state.broker.handle_uncached(request.request, descriptor)
+                    } else {
+                        state.broker.handle_request(
+                            request.request_id.clone(),
+                            request.request,
+                            descriptor,
+                        )
+                    };
+                    let promote_shared = matches!(&mode, ConnectionMode::Initial)
+                        && ping
+                        && authenticated
+                        && valid_id
+                        && matches!(&reply.response, Response::Success);
+                    let promote_lease = if matches!(&mode, ConnectionMode::Initial)
+                        && authenticated
+                        && valid_id
+                        && descriptor_free
+                        && ((begin_write && matches!(&reply.response, Response::Success))
+                            || (begin_append && matches!(&reply.response, Response::Offset { .. })))
+                    {
+                        requested_lease
+                    } else {
+                        None
+                    };
+                    if let Some(lease) = &promote_lease {
+                        active_lease = Some(lease.clone());
                     }
-                } else if !valid_id {
-                    super::service::BrokerReply {
-                        response: Response::Error {
-                            errno: libc::EPROTO,
-                            message: "invalid local filesystem request ID".to_string(),
+                    let descriptors = reply
+                        .descriptors
+                        .iter()
+                        .map(AsRawFd::as_raw_fd)
+                        .collect::<Vec<_>>();
+                    ipc::send_with_descriptors(
+                        &mut stream,
+                        &ResponseEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: request.request_id,
+                            response: reply.response,
                         },
-                        descriptors: Vec::new(),
+                        &descriptors,
+                    )?;
+                    match &mode {
+                        ConnectionMode::Initial if promote_shared => {
+                            stream.set_read_timeout(None)?;
+                            mode = ConnectionMode::Shared;
+                        }
+                        ConnectionMode::Initial if promote_lease.is_some() => {
+                            stream.set_read_timeout(None)?;
+                            mode = ConnectionMode::WriteLease(
+                                promote_lease.expect("write lease promotion was checked"),
+                            );
+                        }
+                        ConnectionMode::Initial => return Ok(()),
+                        ConnectionMode::Shared if !authenticated || !valid_id => return Ok(()),
+                        ConnectionMode::Shared => {}
+                        ConnectionMode::WriteLease(_) => return Ok(()),
                     }
-                } else {
-                    state.broker.handle_request(
-                        request.request_id.clone(),
-                        request.request,
-                        descriptor,
-                    )
-                };
-                let descriptors = reply
-                    .descriptors
-                    .iter()
-                    .map(AsRawFd::as_raw_fd)
-                    .collect::<Vec<_>>();
-                let promote = !persistent && ping && authenticated && valid_id;
-                ipc::send_with_descriptors(
-                    &mut stream,
-                    &ResponseEnvelope {
-                        version: PROTOCOL_VERSION,
-                        request_id: request.request_id,
-                        response: reply.response,
-                    },
-                    &descriptors,
-                )?;
-                if promote {
-                    stream.set_read_timeout(None)?;
-                    persistent = true;
-                } else if !persistent || !authenticated || !valid_id {
-                    return Ok(());
+                    if control.finish_request(&shutdown_requested) {
+                        return Ok(());
+                    }
                 }
-                if control.finish_request(&shutdown_requested) {
-                    return Ok(());
-                }
+            })();
+            if let Some(lease) = active_lease {
+                state.broker.abandon_write(&lease.handle, &lease.write_id);
             }
+            result
         })
         .await
         .context("local filesystem request task failed")??;
         Ok(())
     }
-}
 
-fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
+    fn attach_write_connection(
+        descriptor: Option<OwnedFd>,
+        connections: Arc<Semaphore>,
+        attached: &mpsc::Sender<AttachedConnection>,
+    ) -> super::service::BrokerReply {
+        let result = (|| {
+            let descriptor = descriptor.ok_or((
+                libc::EPROTO,
+                "write lease attachment did not include a Unix stream".to_string(),
+            ))?;
+            let stream = std::os::unix::net::UnixStream::from(descriptor);
+            stream.peer_addr().map_err(|error| {
+                (
+                    libc::EPROTO,
+                    format!("write lease attachment is not a Unix stream: {error}"),
+                )
+            })?;
+            stream.set_nonblocking(false).map_err(|error| {
+                (
+                    error.raw_os_error().unwrap_or(libc::EIO),
+                    format!("failed to configure attached write lease: {error}"),
+                )
+            })?;
+            let permit = connections.try_acquire_owned().map_err(|_| {
+                (
+                    libc::EAGAIN,
+                    "local filesystem connection limit is busy".to_string(),
+                )
+            })?;
+            attached
+                .blocking_send(AttachedConnection { stream, permit })
+                .map_err(|_| {
+                    (
+                        libc::EPIPE,
+                        "local filesystem broker stopped accepting write leases".to_string(),
+                    )
+                })
+        })();
+        match result {
+            Ok(()) => super::service::BrokerReply::response(Response::Success),
+            Err((errno, message)) => super::service::BrokerReply::error(errno, message),
+        }
     }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
 }
 
 #[cfg(test)]

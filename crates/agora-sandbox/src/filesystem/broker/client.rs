@@ -6,6 +6,8 @@ use crate::ipc;
 use crate::ipc::InheritedControlStream;
 use std::fmt;
 use std::fs::File;
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
 use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -54,6 +56,8 @@ struct LocalReply {
 
 pub(crate) struct LocalWrite {
     id: String,
+    handle: String,
+    stream: UnixStream,
 }
 
 #[derive(Debug)]
@@ -238,27 +242,25 @@ impl LocalClient {
         range: ByteRange,
     ) -> Result<LocalWrite, LocalClientError> {
         let write_id = uuid::Uuid::new_v4().simple().to_string();
-        self.success_until_ready(
-            Request::BeginWrite {
-                handle: handle.to_string(),
-                write_id: write_id.clone(),
-                range,
-            },
-            IDEMPOTENT_ATTEMPTS,
-        )?;
-        Ok(LocalWrite { id: write_id })
+        let (stream, reply) = self.begin_write_until_ready(Request::BeginWrite {
+            handle: handle.to_string(),
+            write_id: write_id.clone(),
+            range,
+        })?;
+        Self::expect_success(reply)?;
+        Ok(LocalWrite {
+            id: write_id,
+            handle: handle.to_string(),
+            stream,
+        })
     }
 
     pub(crate) fn begin_append(&self, handle: &str) -> Result<(LocalWrite, u64), LocalClientError> {
         let write_id = uuid::Uuid::new_v4().simple().to_string();
-        let (_, reply) = self.request_until_ready(
-            Request::BeginAppend {
-                handle: handle.to_string(),
-                write_id: write_id.clone(),
-            },
-            None,
-            IDEMPOTENT_ATTEMPTS,
-        )?;
+        let (stream, reply) = self.begin_write_until_ready(Request::BeginAppend {
+            handle: handle.to_string(),
+            write_id: write_id.clone(),
+        })?;
         if !reply.descriptors.is_empty() {
             return Err(LocalClientError::protocol(
                 "local filesystem append unexpectedly returned descriptors",
@@ -269,37 +271,130 @@ impl LocalClient {
                 "local filesystem append returned an unexpected response",
             ));
         };
-        Ok((LocalWrite { id: write_id }, offset))
+        Ok((
+            LocalWrite {
+                id: write_id,
+                handle: handle.to_string(),
+                stream,
+            },
+            offset,
+        ))
     }
 
     pub(crate) fn finish_write(
         &self,
-        handle: &str,
-        write: &LocalWrite,
+        mut write: LocalWrite,
         range: ByteRange,
     ) -> Result<(), LocalClientError> {
-        self.success(
-            Request::FinishWrite {
-                handle: handle.to_string(),
-                write_id: write.id.clone(),
-                range,
-            },
-            IDEMPOTENT_ATTEMPTS,
-        )
+        let request_id = uuid::Uuid::new_v4().simple().to_string();
+        let request = Request::FinishWrite {
+            handle: write.handle.clone(),
+            write_id: write.id.clone(),
+            range,
+        };
+        let reply = Self::exchange(&mut write.stream, &self.token, request_id, request, None)?;
+        Self::expect_success(reply)
     }
 
-    pub(crate) fn cancel_write(
+    pub(crate) fn cancel_write(&self, mut write: LocalWrite) -> Result<(), LocalClientError> {
+        let request_id = uuid::Uuid::new_v4().simple().to_string();
+        let request = Request::CancelWrite {
+            handle: write.handle.clone(),
+            write_id: write.id.clone(),
+        };
+        let reply = Self::exchange(&mut write.stream, &self.token, request_id, request, None)?;
+        Self::expect_success(reply)
+    }
+
+    fn begin_write_until_ready(
         &self,
-        handle: &str,
-        write: &LocalWrite,
-    ) -> Result<(), LocalClientError> {
-        self.success(
-            Request::CancelWrite {
-                handle: handle.to_string(),
-                write_id: write.id.clone(),
-            },
-            IDEMPOTENT_ATTEMPTS,
-        )
+        request: Request,
+    ) -> Result<(UnixStream, LocalReply), LocalClientError> {
+        self.retry_until_ready(|request_id| self.begin_write_once(request_id, request.clone()))
+    }
+
+    fn retry_until_ready<T>(
+        &self,
+        mut attempt: impl FnMut(String) -> Result<T, LocalClientError>,
+    ) -> Result<T, LocalClientError> {
+        let deadline = Instant::now() + CLIENT_TIMEOUT;
+        let mut retry_delay = BUSY_RETRY_DELAY;
+        loop {
+            let request_id = uuid::Uuid::new_v4().simple().to_string();
+            match attempt(request_id) {
+                Ok(result) => return Ok(result),
+                Err(error)
+                    if !error.retryable
+                        && error.errno == libc::EAGAIN
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(retry_delay);
+                    retry_delay = (retry_delay * 2).min(MAX_BUSY_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn begin_write_once(
+        &self,
+        request_id: String,
+        request: Request,
+    ) -> Result<(UnixStream, LocalReply), LocalClientError> {
+        match UnixStream::connect(&self.socket) {
+            Ok(mut stream) => {
+                Self::configure_stream(&stream)?;
+                let reply = Self::exchange(&mut stream, &self.token, request_id, request, None)?;
+                Ok((stream, reply))
+            }
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                if self.shared.is_some() {
+                    return self.begin_attached_write(request_id, request);
+                }
+                Err(LocalClientError::io(
+                    "failed to connect to local filesystem broker write lease",
+                    error,
+                    false,
+                ))
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn begin_attached_write(
+        &self,
+        request_id: String,
+        request: Request,
+    ) -> Result<(UnixStream, LocalReply), LocalClientError> {
+        let (mut client, server) = UnixStream::pair().map_err(|error| {
+            LocalClientError::io(
+                "failed to create local filesystem write lease",
+                error,
+                false,
+            )
+        })?;
+        Self::configure_stream(&client)?;
+        Self::send_request(&mut client, &self.token, request_id.clone(), request, None)?;
+        let attach_id = uuid::Uuid::new_v4().simple().to_string();
+        let reply = self.request_shared(
+            attach_id,
+            Request::AttachWriteLease,
+            Some(server.as_raw_fd()),
+        )?;
+        drop(server);
+        Self::expect_success(reply)?;
+        let reply = Self::receive_reply(&mut client, request_id)?;
+        Ok((client, reply))
+    }
+
+    fn configure_stream(stream: &UnixStream) -> Result<(), LocalClientError> {
+        stream
+            .set_read_timeout(Some(CLIENT_TIMEOUT))
+            .and_then(|()| stream.set_write_timeout(Some(CLIENT_TIMEOUT)))
+            .map_err(|error| {
+                LocalClientError::io("failed to configure local filesystem broker", error, false)
+            })
     }
 
     pub(crate) fn close(
@@ -364,19 +459,10 @@ impl LocalClient {
         descriptor: Option<RawFd>,
         attempts: usize,
     ) -> Result<(String, LocalReply), LocalClientError> {
-        let deadline = Instant::now() + CLIENT_TIMEOUT;
-        let mut retry_delay = BUSY_RETRY_DELAY;
-        loop {
-            let request_id = uuid::Uuid::new_v4().simple().to_string();
-            match self.request_with_id(request_id.clone(), request.clone(), descriptor, attempts) {
-                Ok(reply) => return Ok((request_id, reply)),
-                Err(error) if error.errno == libc::EAGAIN && Instant::now() < deadline => {
-                    std::thread::sleep(retry_delay);
-                    retry_delay = (retry_delay * 2).min(MAX_BUSY_RETRY_DELAY);
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        self.retry_until_ready(|request_id| {
+            self.request_with_id(request_id.clone(), request.clone(), descriptor, attempts)
+                .map(|reply| (request_id, reply))
+        })
     }
 
     fn request(
@@ -445,12 +531,7 @@ impl LocalClient {
                 ));
             }
         };
-        stream
-            .set_read_timeout(Some(CLIENT_TIMEOUT))
-            .and_then(|()| stream.set_write_timeout(Some(CLIENT_TIMEOUT)))
-            .map_err(|error| {
-                LocalClientError::io("failed to configure local filesystem broker", error, false)
-            })?;
+        Self::configure_stream(&stream)?;
         Self::exchange(&mut stream, &self.token, request_id, request, descriptor)
     }
 
@@ -482,6 +563,17 @@ impl LocalClient {
         request: Request,
         descriptor: Option<RawFd>,
     ) -> Result<LocalReply, LocalClientError> {
+        Self::send_request(stream, token, request_id.clone(), request, descriptor)?;
+        Self::receive_reply(stream, request_id)
+    }
+
+    fn send_request(
+        stream: &mut UnixStream,
+        token: &str,
+        request_id: String,
+        request: Request,
+        descriptor: Option<RawFd>,
+    ) -> Result<(), LocalClientError> {
         ipc::send(
             stream,
             &RequestEnvelope {
@@ -494,7 +586,13 @@ impl LocalClient {
         )
         .map_err(|error| {
             LocalClientError::io("failed to send local filesystem request", error, true)
-        })?;
+        })
+    }
+
+    fn receive_reply(
+        stream: &mut UnixStream,
+        request_id: String,
+    ) -> Result<LocalReply, LocalClientError> {
         let (response, descriptors) = ipc::receive_with_descriptors::<ResponseEnvelope>(stream)
             .map_err(|error| {
                 LocalClientError::io("failed to receive local filesystem response", error, true)
