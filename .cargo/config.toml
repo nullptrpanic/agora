@@ -3,3 +3,6 @@ jobs = 16
 
 [env]
 RUST_TEST_THREADS = { value = "16", force = false }
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
