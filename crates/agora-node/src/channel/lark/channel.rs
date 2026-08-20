@@ -9,6 +9,7 @@ use crate::channel::{
 #[cfg(test)]
 use crate::config::ChannelPermissionConfig;
 use crate::config::LarkChannelConfig;
+use crate::store::ChannelIdentity;
 use crate::task::{ChannelTaskInput, CommandRequest, TaskAttachment, TaskContent};
 use agora_core::logger;
 use anyhow::{Context, Result, anyhow};
@@ -474,6 +475,7 @@ impl ChannelRun for LarkRun {
 
 pub struct LarkChannel {
     api: LarkApi,
+    identity: ChannelIdentity,
     permission: PermissionGate,
     bot_open_id: Option<String>,
     group_sessions: GroupSessions,
@@ -485,6 +487,7 @@ impl Clone for LarkChannel {
     fn clone(&self) -> Self {
         Self {
             api: self.api.clone(),
+            identity: self.identity.clone(),
             permission: self.permission.clone(),
             bot_open_id: self.bot_open_id.clone(),
             group_sessions: GroupSessions::default(),
@@ -496,9 +499,11 @@ impl Clone for LarkChannel {
 
 impl LarkChannel {
     pub fn new(config: LarkChannelConfig) -> Result<Self> {
+        let identity = ChannelIdentity::new(config.name.clone(), "lark", config.app_id.clone());
         let permission = PermissionGate::new(config.permission.clone());
         Ok(Self {
             api: LarkApi::new(config)?,
+            identity,
             permission,
             bot_open_id: None,
             group_sessions: GroupSessions::default(),
@@ -528,8 +533,10 @@ impl LarkChannel {
         api: LarkApi,
         permission: ChannelPermissionConfig,
     ) -> Self {
+        let identity = ChannelIdentity::new(api.name(), "lark", "test");
         Self {
             api,
+            identity,
             permission: PermissionGate::new(permission),
             bot_open_id: None,
             group_sessions: GroupSessions::default(),
@@ -759,6 +766,10 @@ impl Channel for LarkChannel {
 
     fn name(&self) -> &str {
         self.api.name()
+    }
+
+    fn identity(&self) -> ChannelIdentity {
+        self.identity.clone()
     }
 
     async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {

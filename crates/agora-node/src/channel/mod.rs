@@ -1,6 +1,7 @@
 use crate::channel::lark::{LarkChannel, LarkRun, LarkTask};
 use crate::channel::telegram::{TelegramChannel, TelegramRun, TelegramTask};
 use crate::config::ChannelConfig;
+use crate::store::ChannelIdentity;
 use crate::task::{ChannelTaskInput, CommandRequest, OutputEvent};
 use anyhow::{Result, bail};
 use std::collections::HashMap;
@@ -18,6 +19,40 @@ mod telegram;
 pub(crate) mod test_http;
 
 pub(crate) const CHANNEL_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub(crate) fn append_bounded_tail(
+    target: &mut String,
+    value: &str,
+    maximum_bytes: usize,
+    truncation_marker: &str,
+) -> bool {
+    debug_assert!(maximum_bytes >= truncation_marker.len());
+    target.push_str(value);
+    if target.len() <= maximum_bytes {
+        return false;
+    }
+
+    let tail_bytes = maximum_bytes.saturating_sub(truncation_marker.len());
+    let mut start = target.len().saturating_sub(tail_bytes);
+    while !target.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = target[start..].to_string();
+    target.clear();
+    target.push_str(truncation_marker);
+    target.push_str(&tail);
+    true
+}
+
+pub(crate) fn bounded_tail(
+    value: String,
+    maximum_bytes: usize,
+    truncation_marker: &str,
+) -> (String, bool) {
+    let mut retained = String::new();
+    let truncated = append_bounded_tail(&mut retained, &value, maximum_bytes, truncation_marker);
+    (retained, truncated)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryDisposition {
@@ -110,6 +145,8 @@ pub trait Channel {
     type Run: ChannelRun;
 
     fn name(&self) -> &str;
+
+    fn identity(&self) -> ChannelIdentity;
 
     fn recv(&mut self) -> impl Future<Output = Result<Option<ChannelDelivery<Self::Task>>>> + Send;
 
@@ -398,6 +435,13 @@ impl Channel for ConfiguredChannel {
         match self {
             ConfiguredChannel::Lark(channel) => channel.name(),
             ConfiguredChannel::Telegram(channel) => channel.name(),
+        }
+    }
+
+    fn identity(&self) -> ChannelIdentity {
+        match self {
+            ConfiguredChannel::Lark(channel) => channel.identity(),
+            ConfiguredChannel::Telegram(channel) => channel.identity(),
         }
     }
 

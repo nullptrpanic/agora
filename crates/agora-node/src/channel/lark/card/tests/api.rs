@@ -123,6 +123,13 @@ async fn lark_card_flushes_queue_and_all_non_success_terminal_states() {
     assert_eq!(
         requests
             .iter()
+            .filter(|request| request.path.ends_with("tenant_access_token/internal"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
             .filter(|request| request.path.ends_with("/reply"))
             .count(),
         3

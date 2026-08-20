@@ -1,8 +1,7 @@
 use anyhow::{Context, bail};
-use dialoguer::{Input, Select, theme::ColorfulTheme};
+use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use serde::Serialize;
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -23,11 +22,23 @@ enum GeneratedChannel {
         name: &'static str,
         app_id: String,
         secret: String,
+        permission: GeneratedPermission,
     },
     Telegram {
         name: &'static str,
         token: String,
+        permission: GeneratedPermission,
     },
+}
+
+#[derive(Serialize)]
+struct GeneratedPermission {
+    users: Vec<GeneratedUserPermission>,
+}
+
+#[derive(Serialize)]
+struct GeneratedUserPermission {
+    id: String,
 }
 
 #[derive(Serialize)]
@@ -110,24 +121,34 @@ fn collect_config(
     )?;
     let (channel_name, channel_config) = match channel {
         0 => {
-            let app_id = prompt(output, input, "Lark App ID", None, false, interactive)?;
-            let secret = prompt(output, input, "Lark App Secret", None, false, interactive)?;
+            let app_id = prompt(output, input, "Lark App ID", None, true, interactive)?;
+            let secret = secret_prompt(output, input, "Lark App Secret", interactive)?;
+            let allowed_user = prompt(
+                output,
+                input,
+                "Allowed Lark user ID",
+                None,
+                true,
+                interactive,
+            )?;
             (
                 "lark",
                 GeneratedChannel::Lark {
                     name: "lark",
                     app_id,
                     secret,
+                    permission: permission(allowed_user),
                 },
             )
         }
         1 => {
-            let token = prompt(
+            let token = secret_prompt(output, input, "Telegram bot token", interactive)?;
+            let allowed_user = prompt(
                 output,
                 input,
-                "Telegram bot token",
+                "Allowed Telegram user ID",
                 None,
-                false,
+                true,
                 interactive,
             )?;
             (
@@ -135,6 +156,7 @@ fn collect_config(
                 GeneratedChannel::Telegram {
                     name: "telegram",
                     token,
+                    permission: permission(allowed_user),
                 },
             )
         }
@@ -187,6 +209,12 @@ fn collect_config(
             }],
         }],
     })
+}
+
+fn permission(user_id: String) -> GeneratedPermission {
+    GeneratedPermission {
+        users: vec![GeneratedUserPermission { id: user_id }],
+    }
 }
 
 fn section(output: &mut impl Write, name: &str, colored: bool) -> anyhow::Result<()> {
@@ -282,6 +310,23 @@ fn prompt(
     }
 }
 
+fn secret_prompt(
+    output: &mut impl Write,
+    input: &mut impl BufRead,
+    label: &str,
+    interactive: bool,
+) -> anyhow::Result<String> {
+    if !interactive {
+        return prompt(output, input, label, None, true, false);
+    }
+    output.flush()?;
+    Password::with_theme(&ColorfulTheme::default())
+        .with_prompt(label)
+        .allow_empty_password(false)
+        .interact()
+        .with_context(|| format!("read {label}"))
+}
+
 fn read_line(input: &mut impl BufRead, label: &str) -> anyhow::Result<String> {
     let mut value = String::new();
     if input.read_line(&mut value)? == 0 {
@@ -333,35 +378,49 @@ fn executable_names(name: &str) -> impl Iterator<Item = OsString> {
 }
 
 fn write_config(path: &Path, config: &GeneratedConfig) -> anyhow::Result<()> {
-    let file = open_config_file(path)
-        .with_context(|| format!("open configuration file {}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, config)?;
-    writeln!(writer)?;
-    writer.flush()?;
+    atomic_write(path, |writer| {
+        serde_json::to_writer_pretty(&mut *writer, config)?;
+        writeln!(writer)?;
+        Ok(())
+    })
+}
+
+fn atomic_write(
+    path: &Path,
+    write: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("configuration path has no parent: {}", path.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "create temporary configuration file in {}",
+            parent.display()
+        )
+    })?;
+    set_private_permissions(temporary.path())?;
+    {
+        let mut writer = BufWriter::new(temporary.as_file_mut());
+        write(&mut writer)?;
+        writer.flush()?;
+    }
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace configuration file {}", path.display()))?;
     Ok(())
 }
 
 #[cfg(unix)]
-fn open_config_file(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
+fn set_private_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
 
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(not(unix))]
-fn open_config_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-}

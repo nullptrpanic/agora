@@ -4,7 +4,7 @@ use super::lark_api::{LarkApi, LarkHttpStatusError};
 use crate::channel::permission::PermissionDenial;
 use crate::channel::{
     ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun,
-    InterruptRegistration, RunEvent,
+    InterruptRegistration, RunEvent, append_bounded_tail, bounded_tail,
 };
 use crate::i18n::{self, RunStatus};
 use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
@@ -18,8 +18,10 @@ use tokio::sync::Mutex;
 
 const MAX_ANSWER_BYTES: usize = 20 * 1024;
 const MAX_PROCESS_ELEMENTS: usize = 160;
+const MAX_RETAINED_PROCESS_PHASES: usize = 64;
+const MAX_RETAINED_PROGRESS_PER_PHASE: usize = 64;
+const MAX_RETAINED_PROCESS_TEXT_BYTES: usize = 8 * 1024;
 const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
-const TENANT_TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
 
 pub(super) struct LarkAgentCard {
     inner: Arc<LarkAgentCardInner>,
@@ -42,7 +44,6 @@ struct LarkAgentCardInner {
 }
 
 struct LarkAgentCardState {
-    token: Option<CachedToken>,
     message_id: Option<String>,
     content: LarkCardContent,
     version: u64,
@@ -51,16 +52,11 @@ struct LarkAgentCardState {
     flush_scheduled: bool,
 }
 
-#[derive(Clone)]
-struct CachedToken {
-    value: String,
-    expires_at: Instant,
-}
-
 pub(super) struct LarkCardContent {
     agent_name: String,
     interrupt: Option<String>,
     process: VecDeque<LarkProcessPhase>,
+    process_truncated: bool,
     answer: String,
     usage: Option<TokenUsage>,
     state: LarkRunState,
@@ -311,6 +307,7 @@ impl LarkCardContent {
             agent_name,
             interrupt: None,
             process: VecDeque::new(),
+            process_truncated: false,
             answer: String::new(),
             usage: None,
             state: LarkRunState::Running,
@@ -334,6 +331,16 @@ impl LarkCardContent {
         match event {
             OutputEvent::Thinking { text } => {
                 if !text.trim().is_empty() {
+                    let (text, truncated) = bounded_tail(
+                        text,
+                        MAX_RETAINED_PROCESS_TEXT_BYTES,
+                        i18n::OUTPUT_TRUNCATED,
+                    );
+                    self.process_truncated |= truncated;
+                    if self.process.len() >= MAX_RETAINED_PROCESS_PHASES {
+                        self.process.pop_back();
+                        self.process_truncated = true;
+                    }
                     self.process.push_front(LarkProcessPhase {
                         thinking: Some(text),
                         progress: VecDeque::new(),
@@ -351,7 +358,14 @@ impl LarkCardContent {
             } => {
                 self.apply_progress(id, command, status, LarkProgressKind::Command, exit_code);
             }
-            OutputEvent::Answer { text } => self.answer.push_str(&text),
+            OutputEvent::Answer { text } => {
+                append_bounded_tail(
+                    &mut self.answer,
+                    &text,
+                    MAX_ANSWER_BYTES,
+                    i18n::OUTPUT_TRUNCATED,
+                );
+            }
             OutputEvent::Usage(usage) => self.usage = Some(usage),
         }
     }
@@ -364,6 +378,12 @@ impl LarkCardContent {
         kind: LarkProgressKind,
         exit_code: Option<i32>,
     ) {
+        let (text, truncated) = bounded_tail(
+            text,
+            MAX_RETAINED_PROCESS_TEXT_BYTES,
+            i18n::OUTPUT_TRUNCATED,
+        );
+        self.process_truncated |= truncated;
         for phase in &mut self.process {
             if let Some(index) = phase.progress.iter().position(|entry| entry.id == id) {
                 phase.progress.remove(index);
@@ -383,7 +403,13 @@ impl LarkCardContent {
                 progress: VecDeque::new(),
             });
         }
-        if let Some(phase) = self.process.front_mut() {
+        let dropped = if let Some(phase) = self.process.front_mut() {
+            let dropped = if phase.progress.len() >= MAX_RETAINED_PROGRESS_PER_PHASE {
+                phase.progress.pop_back();
+                true
+            } else {
+                false
+            };
             phase.progress.push_front(LarkProgressEntry {
                 id,
                 text,
@@ -391,7 +417,11 @@ impl LarkCardContent {
                 kind,
                 exit_code,
             });
-        }
+            dropped
+        } else {
+            false
+        };
+        self.process_truncated |= dropped;
     }
 
     pub(super) fn complete(&mut self) {
@@ -746,8 +776,9 @@ impl LarkCardContent {
             .filter(|phase| !phase.is_empty())
             .collect::<VecDeque<_>>();
         let mut element_count = Self::process_element_count(&phases);
-        let omitted = element_count > MAX_PROCESS_ELEMENTS;
+        let omitted = element_count > MAX_PROCESS_ELEMENTS || self.process_truncated;
         let mut omitted_phases = 0;
+        let mut omitted_elements = false;
 
         if omitted {
             let available = MAX_PROCESS_ELEMENTS.saturating_sub(1);
@@ -764,6 +795,7 @@ impl LarkCardContent {
                     );
                 } else if let Some(phase) = phases.front_mut() {
                     if let Some(removed) = phase.pop() {
+                        omitted_elements = true;
                         element_count =
                             element_count.saturating_sub(Self::tagged_element_count(&removed));
                     } else {
@@ -778,12 +810,16 @@ impl LarkCardContent {
 
         let mut elements = Vec::new();
         if omitted {
+            let mut notices = Vec::new();
+            if self.process_truncated || omitted_elements {
+                notices.push(i18n::OUTPUT_TRUNCATED.trim().to_string());
+            }
+            if omitted_phases > 0 {
+                notices.push(i18n::truncated_phase_count(omitted_phases));
+            }
             elements.push(json!({
                 "tag": "markdown",
-                "content": format!(
-                    "<font color='grey'>{}</font>",
-                    i18n::truncated_phase_count(omitted_phases)
-                )
+                "content": format!("<font color='grey'>{}</font>", notices.join(" · "))
             }));
         }
         for (index, phase) in phases.into_iter().enumerate() {
@@ -1001,16 +1037,14 @@ impl LarkCardContent {
     }
 
     fn truncate_answer(answer: &str) -> String {
-        if answer.len() <= MAX_ANSWER_BYTES {
-            return answer.to_string();
-        }
-        let marker = i18n::OUTPUT_TRUNCATED;
-        let budget = MAX_ANSWER_BYTES.saturating_sub(marker.len());
-        let mut start = answer.len().saturating_sub(budget);
-        while !answer.is_char_boundary(start) {
-            start += 1;
-        }
-        format!("{}{}", marker, &answer[start..])
+        let mut retained = String::new();
+        append_bounded_tail(
+            &mut retained,
+            answer,
+            MAX_ANSWER_BYTES,
+            i18n::OUTPUT_TRUNCATED,
+        );
+        retained
     }
 }
 
@@ -1032,7 +1066,6 @@ impl LarkAgentCard {
                 api,
                 _interrupt: interrupt,
                 state: Mutex::new(LarkAgentCardState {
-                    token: None,
                     message_id: None,
                     content: LarkCardContent::with_interrupt(
                         agent_name,
@@ -1135,7 +1168,7 @@ impl LarkAgentCard {
 
         let mut refreshed = false;
         let published_message_id = loop {
-            let token = self.token().await?;
+            let token = self.inner.api.cached_tenant_access_token().await?;
             let result = if let Some(message_id) = message_id.as_deref() {
                 self.inner
                     .api
@@ -1156,7 +1189,10 @@ impl LarkAgentCard {
                             .downcast_ref::<LarkHttpStatusError>()
                             .is_some_and(LarkHttpStatusError::is_unauthorized) =>
                 {
-                    self.invalidate_token(&token).await;
+                    self.inner
+                        .api
+                        .invalidate_cached_tenant_access_token(&token)
+                        .await;
                     refreshed = true;
                 }
                 result => break result?,
@@ -1170,35 +1206,6 @@ impl LarkAgentCard {
         state.sent_version = state.sent_version.max(version);
         state.last_update = Some(Instant::now());
         Ok(())
-    }
-
-    async fn token(&self) -> Result<String> {
-        {
-            let state = self.inner.state.lock().await;
-            if let Some(token) = &state.token
-                && token.expires_at > Instant::now()
-            {
-                return Ok(token.value.clone());
-            }
-        }
-        let value = self.inner.api.tenant_access_token().await?;
-        let mut state = self.inner.state.lock().await;
-        state.token = Some(CachedToken {
-            value: value.clone(),
-            expires_at: Instant::now() + TENANT_TOKEN_CACHE_TTL,
-        });
-        Ok(value)
-    }
-
-    async fn invalidate_token(&self, value: &str) {
-        let mut state = self.inner.state.lock().await;
-        if state
-            .token
-            .as_ref()
-            .is_some_and(|token| token.value == value)
-        {
-            state.token = None;
-        }
     }
 }
 

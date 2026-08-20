@@ -46,6 +46,7 @@ async fn persists_and_serializes_session_by_channel_and_agent() {
         subscribe: Vec::new(),
     };
     let agent = ConfiguredAgent::from_config(agent).unwrap();
+    let store_key = agent.store_session_key(&channel.identity(), TestTask.session_id());
 
     let first = dispatcher.dispatch_channel_task(&channel, vec![agent.clone()], TestTask);
     let second = dispatcher.dispatch_channel_task(&channel, vec![agent], TestTask);
@@ -62,10 +63,7 @@ async fn persists_and_serializes_session_by_channel_and_agent() {
         ]
     );
     assert_eq!(
-        store
-            .get(&SessionKey::new("codex-dev", IsolationScope::Shared))
-            .unwrap()
-            .as_deref(),
+        store.get(&store_key).unwrap().as_deref(),
         Some("thread-123")
     );
 }
@@ -113,6 +111,8 @@ async fn none_isolation_queues_and_resumes_across_channels() {
         subscribe: Vec::new(),
     })
     .unwrap();
+    let store_key =
+        agent.store_session_key(&ChannelIdentity::new("lark1", "test", "lark1"), "chat-1");
     let first_events = Arc::new(Mutex::new(Vec::new()));
     let second_events = Arc::new(Mutex::new(Vec::new()));
 
@@ -194,10 +194,7 @@ async fn none_isolation_queues_and_resumes_across_channels() {
             .contains(&RunEvent::Queued { ahead: 1 })
     );
     assert_eq!(
-        store
-            .get(&SessionKey::new("codex-dev", IsolationScope::Shared))
-            .unwrap()
-            .as_deref(),
+        store.get(&store_key).unwrap().as_deref(),
         Some("thread-shared")
     );
 }
@@ -249,6 +246,8 @@ async fn session_isolation_separates_backend_sessions_and_reuses_workspace() {
     })
     .unwrap();
     let channel = ScopedChannel::new("lark1");
+    let first_store_key = agent.store_session_key(&channel.identity(), "chat-1");
+    let second_store_key = agent.store_session_key(&channel.identity(), "chat-2");
 
     dispatcher
         .dispatch_channel_task(
@@ -272,23 +271,11 @@ async fn session_isolation_separates_backend_sessions_and_reuses_workspace() {
         ]
     );
     assert_eq!(
-        store
-            .get(&SessionKey::new(
-                "codex-dev",
-                IsolationScope::session("lark1", "chat-1"),
-            ))
-            .unwrap()
-            .as_deref(),
+        store.get(&first_store_key).unwrap().as_deref(),
         Some("thread-1")
     );
     assert_eq!(
-        store
-            .get(&SessionKey::new(
-                "codex-dev",
-                IsolationScope::session("lark1", "chat-2"),
-            ))
-            .unwrap()
-            .as_deref(),
+        store.get(&second_store_key).unwrap().as_deref(),
         Some("thread-2")
     );
     let workdirs = std::fs::read_to_string(workdirs).unwrap();
@@ -331,9 +318,7 @@ async fn replaces_a_missing_agent_session_with_a_new_session() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
 
-    let key = SessionKey::new("codex-dev", IsolationScope::Shared);
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
-    store.save(&key, "missing").unwrap();
     let dispatcher = AgentDispatcher::new(store.clone());
     let channel = RecordingChannel {
         contexts: Arc::new(Mutex::new(Vec::new())),
@@ -354,6 +339,8 @@ async fn replaces_a_missing_agent_session_with_a_new_session() {
         subscribe: Vec::new(),
     })
     .unwrap();
+    let store_key = agent.store_session_key(&channel.identity(), TestTask.session_id());
+    store.observe(&store_key, None, "missing").unwrap();
 
     dispatcher
         .dispatch_channel_task(&channel, vec![agent], TestTask)
@@ -368,5 +355,61 @@ async fn replaces_a_missing_agent_session_with_a_new_session() {
             "exec --json --color never --config model_reasoning_summary=concise -",
         ]
     );
-    assert_eq!(store.get(&key).unwrap().as_deref(), Some("thread-new"));
+    assert_eq!(
+        store.get(&store_key).unwrap().as_deref(),
+        Some("thread-new")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejects_a_successful_fresh_codex_run_without_a_session_id() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(
+        &script,
+        concat!(
+            "#!/bin/sh\n",
+            "cat >/dev/null\n",
+            "printf '%s\\n' ",
+            "'{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}'\n",
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let store = SessionStore::open(temp.path().join("store.db")).unwrap();
+    let dispatcher = AgentDispatcher::new(store.clone());
+    let channel = RecordingChannel {
+        contexts: Arc::new(Mutex::new(Vec::new())),
+        events: Arc::new(Mutex::new(Vec::new())),
+    };
+    let agent = ConfiguredAgent::from_config(AgentConfig {
+        name: "codex-dev".to_string(),
+        isolate: IsolateMode::None,
+        workspace: temp.path().to_string_lossy().into_owned(),
+        agent_type: AgentType::Codex,
+        path: script.to_string_lossy().into_owned(),
+        model: None,
+        effort: None,
+        agent_sandbox: None,
+        proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
+        subscribe: Vec::new(),
+    })
+    .unwrap();
+    let store_key = agent.store_session_key(&channel.identity(), TestTask.session_id());
+
+    let error = dispatcher
+        .dispatch_channel_task(&channel, vec![agent], TestTask)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("without a session id"));
+    assert_eq!(store.get(&store_key).unwrap(), None);
 }

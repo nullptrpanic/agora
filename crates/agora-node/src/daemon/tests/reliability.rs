@@ -308,6 +308,10 @@ impl Channel for ReliabilityChannel {
         "reliability"
     }
 
+    fn identity(&self) -> ChannelIdentity {
+        ChannelIdentity::new(self.name(), "test", self.name())
+    }
+
     async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
         if let Some(delivery) = self.tasks.lock().unwrap().pop_front() {
             Ok(Some(delivery))

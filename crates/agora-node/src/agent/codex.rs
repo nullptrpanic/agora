@@ -155,11 +155,7 @@ impl Agent for CodexAgent {
         let session_update = if command_output.session_not_found() {
             AgentSessionUpdate::NotFound
         } else if let Some(next_session_id) = command_output.take_session_id() {
-            logger::info!(
-                "agent session updated agent={} session_id={}",
-                self.name,
-                next_session_id
-            );
+            logger::info!("agent session observed agent={}", self.name);
             AgentSessionUpdate::Set(next_session_id)
         } else {
             AgentSessionUpdate::Unchanged
@@ -175,6 +171,9 @@ impl Agent for CodexAgent {
         let mut command_output = DeleteSessionCommandOutput::default();
         let outcome = command.run(&mut command_output).await?;
         if outcome.exit_code() != 0 {
+            if missing_session_message(&command_output.message()) {
+                return Ok(DeleteSessionOutcome::Deleted);
+            }
             bail!(
                 "codex delete session failed exit_code={} output={}",
                 outcome.exit_code(),
@@ -276,7 +275,7 @@ where
             return Ok(());
         }
         let stderr = String::from_utf8_lossy(&self.stderr_buffer).into_owned();
-        if self.resume_requested && Self::is_missing_session_message(&stderr) {
+        if self.resume_requested && missing_session_message(&stderr) {
             self.session_not_found = true;
             return Ok(());
         }
@@ -286,12 +285,6 @@ where
             stderr.trim_end()
         );
         Ok(())
-    }
-
-    fn is_missing_session_message(message: &str) -> bool {
-        message.contains("no rollout found for thread id")
-            || message.contains("session not found")
-            || message.contains("thread not found")
     }
 
     async fn publish_pending_message(&mut self, final_answer: bool) -> Result<()> {
@@ -527,6 +520,13 @@ where
         }
         Ok(())
     }
+}
+
+fn missing_session_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("no rollout found for thread id")
+        || message.contains("session not found")
+        || message.contains("thread not found")
 }
 
 struct PendingAgentMessage {

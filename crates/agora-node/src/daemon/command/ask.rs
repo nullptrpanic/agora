@@ -4,7 +4,7 @@ use super::{
 };
 use crate::channel::{ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply};
 use crate::i18n;
-use crate::store::{ChannelSessionKey, SessionStore};
+use crate::store::{ChannelIdentity, SessionStore, StoreChannelSessionKey};
 use crate::task::{CommandRequest, TaskContent};
 use anyhow::{Result, bail};
 use std::collections::HashSet;
@@ -103,7 +103,7 @@ impl AskCommand {
         _arguments: CommandArguments,
     ) -> Result<Option<ChannelReply>> {
         Ok(Some(ChannelReply::agent_list(self.agent_statuses(
-            context.channel_name(),
+            context.channel_identity(),
             context.session_id(),
             context.agents(),
         )?)))
@@ -122,10 +122,11 @@ impl AskCommand {
         else {
             return Ok(Some(Self::unknown_agent_reply(&agent_name)));
         };
-        let key = ChannelSessionKey::new(context.channel_name(), context.session_id());
+        let key =
+            StoreChannelSessionKey::new(context.channel_identity().clone(), context.session_id());
         Ok(Some(ChannelReply::agent_status(ChannelAgentStatus::new(
             agent.name(),
-            self.store.is_agent_enabled(&key, agent.name())?,
+            self.store.is_agent_enabled(&key, agent.identity())?,
         ))))
     }
 
@@ -160,15 +161,15 @@ impl AskCommand {
             return Ok(Some(Self::unknown_agent_reply(&agent_name)));
         };
         self.set_agent_enabled(
-            context.channel_name(),
+            context.channel_identity(),
             context.session_id(),
-            agent.name(),
+            agent,
             enabled,
         )?;
 
         if context.is_structured() {
             return Ok(Some(ChannelReply::agent_list(self.agent_statuses(
-                context.channel_name(),
+                context.channel_identity(),
                 context.session_id(),
                 context.agents(),
             )?)));
@@ -181,11 +182,11 @@ impl AskCommand {
 
     fn agent_statuses(
         &self,
-        channel_name: &str,
+        channel: &ChannelIdentity,
         session_id: &str,
         agents: &[crate::agent::ConfiguredAgent],
     ) -> Result<Vec<ChannelAgentStatus>> {
-        let key = ChannelSessionKey::new(channel_name, session_id);
+        let key = StoreChannelSessionKey::new(channel.clone(), session_id);
         let disabled = self
             .store
             .disabled_agents(&key)?
@@ -194,7 +195,7 @@ impl AskCommand {
         Ok(agents
             .iter()
             .map(|agent| {
-                let enabled = !disabled.contains(agent.name());
+                let enabled = !disabled.contains(agent.identity());
                 ChannelAgentStatus::new(agent.name(), enabled)
                     .with_button(Self::agent_button(agent.name(), enabled))
             })
@@ -203,16 +204,16 @@ impl AskCommand {
 
     fn set_agent_enabled(
         &self,
-        channel_name: &str,
+        channel: &ChannelIdentity,
         session_id: &str,
-        agent_name: &str,
+        agent: &crate::agent::ConfiguredAgent,
         enabled: bool,
     ) -> Result<()> {
-        let key = ChannelSessionKey::new(channel_name, session_id);
+        let key = StoreChannelSessionKey::new(channel.clone(), session_id);
         if enabled {
-            self.store.enable_agent(&key, agent_name)?;
+            self.store.enable_agent(&key, agent.identity())?;
         } else {
-            self.store.disable_agent(&key, agent_name)?;
+            self.store.disable_agent(&key, agent.identity())?;
         }
         Ok(())
     }

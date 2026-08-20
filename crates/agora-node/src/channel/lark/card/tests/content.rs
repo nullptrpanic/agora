@@ -881,13 +881,13 @@ fn lark_card_bounds_one_large_phase_and_preserves_terminal_markers() {
     content.apply_output(OutputEvent::Thinking {
         text: "One large phase".to_string(),
     });
-    for index in 0..200 {
+    for index in 0..60 {
         content.apply_output(OutputEvent::CommandExecution {
             id: format!("command-{index}"),
             command: format!("command {index}"),
-            status: if index == 198 {
+            status: if index == 58 {
                 ProgressStatus::Failed
-            } else if index == 199 {
+            } else if index == 59 {
                 ProgressStatus::Stopped
             } else {
                 ProgressStatus::Completed
@@ -910,7 +910,7 @@ fn lark_card_bounds_one_large_phase_and_preserves_terminal_markers() {
     let card = content.build_card();
     let rendered = serde_json::to_string(&card).unwrap();
     assert!(tagged_element_count(&card) <= 200);
-    assert!(rendered.contains("已省略"));
+    assert!(rendered.contains("已截断"));
     assert!(rendered.contains("×  Failed"));
     assert!(rendered.contains("■  Stopped"));
     let markers = serde_json::to_string(&markers.build_card()).unwrap();
@@ -928,4 +928,27 @@ fn lark_card_formats_token_extremes_and_truncates_unicode_on_a_boundary() {
     assert!(truncated.starts_with(i18n::OUTPUT_TRUNCATED));
     assert!(truncated.ends_with("tail"));
     assert!(truncated.len() <= MAX_ANSWER_BYTES + "界".len());
+
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::Answer { text: answer });
+    assert!(content.answer.starts_with(i18n::OUTPUT_TRUNCATED));
+    assert!(content.answer.ends_with("tail"));
+    assert!(content.answer.len() <= MAX_ANSWER_BYTES);
+
+    for index in 0..100 {
+        content.apply_output(OutputEvent::Thinking {
+            text: format!("phase-{index}"),
+        });
+    }
+    assert!(content.process.len() <= 64);
+
+    let mut progress = LarkCardContent::new("codex-dev".to_string());
+    for index in 0..100 {
+        progress.apply_output(OutputEvent::Progress {
+            id: index.to_string(),
+            text: format!("progress-{index}"),
+            status: ProgressStatus::Running,
+        });
+    }
+    assert!(progress.process.front().unwrap().progress.len() <= 64);
 }

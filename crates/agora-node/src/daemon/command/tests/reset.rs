@@ -41,13 +41,14 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
     .unwrap();
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
     let dispatcher = AgentDispatcher::new(store.clone());
-    let key = SessionKey::new(agent.name(), agent.isolation_scope("lark", "chat-1"));
-    store.save(&key, "old-session").unwrap();
+    let scheduler_key = SessionKey::new(agent.name(), agent.isolation_scope("lark", "chat-1"));
+    let store_key = agent.store_session_key(&command_channel_identity(), "chat-1");
+    store.observe(&store_key, None, "old-session").unwrap();
 
     let active_ticket = dispatcher.scheduler.enqueue(ExecutionScope::new(
         "telegram",
         "chat-2",
-        key.clone(),
+        scheduler_key.clone(),
         std::path::PathBuf::from("/tmp/agora-command-test"),
     ));
     let active_control = active_ticket.control();
@@ -84,7 +85,7 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
         .unwrap()
         .unwrap();
 
-    assert_eq!(store.get(&key).unwrap(), None);
+    assert_eq!(store.get(&store_key).unwrap(), None);
     assert_eq!(
         replies.lock().unwrap().as_slice(),
         [ChannelReply::new("重置成功。")]
@@ -93,7 +94,7 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
     let mut output = IgnoreAgentOutput;
     dispatcher
         .execute_agent(
-            &key,
+            &store_key,
             &agent,
             AgentTask::new("next task"),
             AgentRunControl::new(),
@@ -102,7 +103,10 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
         .await
         .unwrap();
 
-    assert_eq!(store.get(&key).unwrap().as_deref(), Some("new-session"));
+    assert_eq!(
+        store.get(&store_key).unwrap().as_deref(),
+        Some("new-session")
+    );
     let invocations = std::fs::read_to_string(invocations).unwrap();
     assert!(invocations.contains("delete --force old-session\n"));
     assert!(invocations.lines().any(|line| line.starts_with("exec ")));
@@ -142,8 +146,8 @@ async fn reset_preserves_the_mapping_when_backend_deletion_fails() {
     .unwrap();
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
     let dispatcher = AgentDispatcher::new(store.clone());
-    let key = SessionKey::new(agent.name(), agent.isolation_scope("lark", "chat-1"));
-    store.save(&key, "old-session").unwrap();
+    let store_key = agent.store_session_key(&command_channel_identity(), "chat-1");
+    store.observe(&store_key, None, "old-session").unwrap();
 
     let replies = Arc::new(Mutex::new(Vec::new()));
     let channel = CommandTestChannel {
@@ -166,10 +170,70 @@ async fn reset_preserves_the_mapping_when_backend_deletion_fails() {
     .await
     .unwrap();
 
-    assert_eq!(store.get(&key).unwrap().as_deref(), Some("old-session"));
+    assert_eq!(
+        store.get(&store_key).unwrap().as_deref(),
+        Some("old-session")
+    );
     assert_eq!(
         replies.lock().unwrap().as_slice(),
         [ChannelReply::new("以下 Agent 重置失败：codex-dev。")]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reset_treats_an_already_missing_backend_session_as_deleted() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'thread not found' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let agent = ConfiguredAgent::from_config(AgentConfig {
+        name: "codex-dev".to_string(),
+        isolate: IsolateMode::Session,
+        workspace: temp.path().to_string_lossy().into_owned(),
+        agent_type: AgentType::Codex,
+        path: script.to_string_lossy().into_owned(),
+        model: None,
+        effort: None,
+        agent_sandbox: None,
+        proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
+        subscribe: Vec::new(),
+    })
+    .unwrap();
+    let store = SessionStore::open(temp.path().join("store.db")).unwrap();
+    let dispatcher = AgentDispatcher::new(store.clone());
+    let store_key = agent.store_session_key(&command_channel_identity(), "chat-1");
+    store.observe(&store_key, None, "old-session").unwrap();
+    let replies = Arc::new(Mutex::new(Vec::new()));
+    let channel = CommandTestChannel::new(Arc::clone(&replies));
+    let mut runs = tokio::task::JoinSet::new();
+
+    Daemon::route_channel_task(
+        &channel,
+        std::slice::from_ref(&agent),
+        &dispatcher,
+        &command_runtime(&dispatcher),
+        CommandTestTask::new("reset", "chat-1", "/reset"),
+        &mut runs,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(store.get(&store_key).unwrap(), None);
+    assert_eq!(
+        replies.lock().unwrap().as_slice(),
+        [ChannelReply::new("重置成功。")]
     );
 }
 
@@ -193,8 +257,8 @@ async fn reset_removes_the_mapping_when_backend_deletion_is_unsupported() {
     .unwrap();
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
     let dispatcher = AgentDispatcher::new(store.clone());
-    let key = SessionKey::new(agent.name(), agent.isolation_scope("lark", "chat-1"));
-    store.save(&key, "custom-session").unwrap();
+    let store_key = agent.store_session_key(&command_channel_identity(), "chat-1");
+    store.observe(&store_key, None, "custom-session").unwrap();
     let replies = Arc::new(Mutex::new(Vec::new()));
     let channel = CommandTestChannel::new(Arc::clone(&replies));
     let mut runs = tokio::task::JoinSet::new();
@@ -210,7 +274,7 @@ async fn reset_removes_the_mapping_when_backend_deletion_is_unsupported() {
     .await
     .unwrap();
 
-    assert_eq!(store.get(&key).unwrap(), None);
+    assert_eq!(store.get(&store_key).unwrap(), None);
     assert_eq!(
         replies.lock().unwrap().as_slice(),
         [ChannelReply::new("重置成功。")]
@@ -227,7 +291,7 @@ async fn reset_succeeds_when_no_session_mapping_exists() {
 
     let outcome = runtime
         .handle(
-            "lark",
+            &command_channel_identity(),
             "chat-1",
             &[agent],
             &ChannelTaskInput::Message(TaskContent::new("/reset")),

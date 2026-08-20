@@ -3,7 +3,7 @@ use serde::de::Error as _;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 pub mod generate;
@@ -98,6 +98,13 @@ impl NodeConfig {
                 anyhow::bail!("agent max_output_bytes must be positive: {}", agent.name);
             }
             for subscription in &agent.subscribe {
+                if subscription.filter.is_some() {
+                    anyhow::bail!(
+                        "agent subscription filter is not implemented: {} -> {}",
+                        agent.name,
+                        subscription.channel
+                    );
+                }
                 if !channel_names.contains(subscription.channel.as_str()) {
                     anyhow::bail!(
                         "agent subscription references an unknown channel: {} -> {}",
@@ -142,6 +149,73 @@ impl NodeConfig {
             channel.proxy_mut().get_or_insert_with(|| proxy.clone());
         }
     }
+
+    pub(crate) fn validate_filesystem(&self) -> anyhow::Result<()> {
+        for agent in &self.agents {
+            validate_agent_executable(&agent.name, Path::new(&agent.path))?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_agent_executable(name: &str, configured_path: &Path) -> anyhow::Result<()> {
+    let path = resolve_executable(configured_path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "agent executable does not exist: {}: {}",
+            name,
+            configured_path.display()
+        )
+    })?;
+    let metadata = std::fs::metadata(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "inspect agent executable failed: {}: {}: {}",
+            name,
+            path.display(),
+            error
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "agent executable is not a regular file: {}: {}",
+            name,
+            path.display()
+        );
+    }
+    if !is_executable(&metadata) {
+        anyhow::bail!(
+            "agent executable is not executable: {}: {}",
+            name,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn resolve_executable(path: &Path) -> Option<PathBuf> {
+    let is_bare_name = !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        && path.components().count() == 1;
+    if !is_bare_name {
+        return path.exists().then(|| path.to_path_buf());
+    }
+    std::env::var_os("PATH").and_then(|search_path| {
+        std::env::split_paths(&search_path)
+            .map(|directory| directory.join(path))
+            .find(|candidate| candidate.exists())
+    })
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &std::fs::Metadata) -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -200,6 +274,30 @@ impl AgentConfig {
 
     pub fn workdir(&self) -> PathBuf {
         PathBuf::from(&self.workspace)
+    }
+}
+
+impl TelegramChannelConfig {
+    pub(crate) fn bot_id(&self) -> anyhow::Result<&str> {
+        let (bot_id, secret) = self.token.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!(
+                "telegram token must have the form <bot-id>:<secret>: {}",
+                self.name
+            )
+        })?;
+        let numeric_id = bot_id.parse::<u64>().map_err(|_| {
+            anyhow::anyhow!(
+                "telegram token has an invalid numeric bot id: {}",
+                self.name
+            )
+        })?;
+        if numeric_id == 0 || secret.trim().is_empty() {
+            anyhow::bail!(
+                "telegram token has an empty bot id or secret: {}",
+                self.name
+            );
+        }
+        Ok(bot_id)
     }
 }
 
@@ -292,6 +390,7 @@ impl ChannelConfig {
                 if config.token.trim().is_empty() {
                     anyhow::bail!("telegram token must not be empty: {}", config.name);
                 }
+                config.bot_id()?;
                 &config.permission
             }
             ChannelConfig::Local(config) => {
@@ -474,6 +573,17 @@ pub enum AgentType {
     Coco,
     ClaudeCode,
     Custom,
+}
+
+impl AgentType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Coco => "coco",
+            Self::ClaudeCode => "claude_code",
+            Self::Custom => "custom",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]

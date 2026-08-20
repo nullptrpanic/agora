@@ -211,6 +211,7 @@ fn telegram_rich_message_omits_oldest_process_phases_before_latest_output() {
     assert!(!rendered.contains("phase-000"));
     assert!(rendered.contains("phase-499"));
     assert!(rendered.contains("Final answer remains visible"));
+    assert!(content.process.len() <= 64);
 }
 
 #[test]
@@ -258,6 +259,28 @@ fn telegram_rich_message_splits_oversized_content_without_losing_output() {
             .unwrap()
             .ends_with("*2.0K tokens · Input 1.5K · 1.0K cached · Output 500 · Reasoning 250*")
     );
+}
+
+#[test]
+fn telegram_rich_message_bounds_retained_answer_on_a_utf8_boundary() {
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.apply(RunEvent::Output(OutputEvent::Answer {
+        text: format!("prefix{}tail", "界".repeat(100_000)),
+    }));
+
+    assert!(content.answer.starts_with(i18n::OUTPUT_TRUNCATED));
+    assert!(content.answer.ends_with("tail"));
+    assert!(content.answer.len() <= 256 * 1024);
+
+    let mut progress = TelegramRichContent::new("codex-dev".to_string());
+    for index in 0..100 {
+        progress.apply(RunEvent::Output(OutputEvent::Progress {
+            id: index.to_string(),
+            text: format!("progress-{index}"),
+            status: ProgressStatus::Running,
+        }));
+    }
+    assert!(progress.process.front().unwrap().progress.len() <= 64);
 }
 
 #[test]

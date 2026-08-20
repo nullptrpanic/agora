@@ -60,7 +60,7 @@ fn text_prompts_cover_defaults_retries_optional_values_and_eof() {
 fn generated_configs_cover_both_channels_and_secure_file_output() {
     let workspace = tempfile::tempdir().unwrap();
 
-    let mut lark_input = Cursor::new(b"\napp-id\nsecret\n\n\nmodel\n\n".as_slice());
+    let mut lark_input = Cursor::new(b"\napp-id\nsecret\nou_allowed\n\n\nmodel\n\n".as_slice());
     let mut output = Vec::new();
     let lark = collect_config(
         &mut lark_input,
@@ -73,10 +73,15 @@ fn generated_configs_cover_both_channels_and_secure_file_output() {
     .unwrap();
     let lark_json = serde_json::to_value(&lark).unwrap();
     assert_eq!(lark_json["channels"][0]["type"], "lark");
+    assert_eq!(
+        lark_json["channels"][0]["permission"]["users"][0]["id"],
+        "ou_allowed"
+    );
     assert_eq!(lark_json["agents"][0]["path"], "/usr/local/bin/codex");
     assert_eq!(lark_json["agents"][0]["effort"], "high");
 
-    let mut telegram_input = Cursor::new(b"2\ntoken\n\n/path/to/codex\nmodel\nlow\n".as_slice());
+    let mut telegram_input =
+        Cursor::new(b"2\ntoken\n42\n\n/path/to/codex\nmodel\nlow\n".as_slice());
     let telegram = collect_config(
         &mut telegram_input,
         &mut output,
@@ -89,9 +94,16 @@ fn generated_configs_cover_both_channels_and_secure_file_output() {
     let telegram_json = serde_json::to_value(&telegram).unwrap();
     assert_eq!(telegram_json["channels"][0]["type"], "telegram");
     assert_eq!(telegram_json["channels"][0]["token"], "token");
+    assert_eq!(
+        telegram_json["channels"][0]["permission"]["users"][0]["id"],
+        "42"
+    );
     assert_eq!(telegram_json["agents"][0]["model"], "model");
 
     let config_path = workspace.path().join("generated.json");
+    std::fs::write(&config_path, b"old").unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o666)).unwrap();
     write_config(&config_path, &telegram).unwrap();
     let stored: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
@@ -101,6 +113,53 @@ fn generated_configs_cover_both_channels_and_secure_file_output() {
         std::fs::metadata(config_path).unwrap().permissions().mode() & 0o777,
         0o600
     );
+}
+
+#[test]
+fn generated_config_reprompts_for_empty_credentials_and_allowed_user() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut input =
+        Cursor::new(b"2\n\nbot-token\n\nallowed-user\n\n/path/to/codex\nmodel\n\n".as_slice());
+    let mut output = Vec::new();
+
+    let config = collect_config(
+        &mut input,
+        &mut output,
+        workspace.path(),
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+
+    let document = serde_json::to_value(config).unwrap();
+    assert_eq!(document["channels"][0]["token"], "bot-token");
+    assert_eq!(
+        document["channels"][0]["permission"]["users"][0]["id"],
+        "allowed-user"
+    );
+    assert_eq!(
+        String::from_utf8(output)
+            .unwrap()
+            .matches("A value is required.")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn atomic_configuration_write_preserves_the_old_file_after_partial_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.json");
+    std::fs::write(&path, b"original").unwrap();
+
+    let result = atomic_write(&path, |writer| {
+        writer.write_all(b"partial")?;
+        anyhow::bail!("injected serialization failure")
+    });
+
+    assert!(result.unwrap_err().to_string().contains("injected"));
+    assert_eq!(std::fs::read(path).unwrap(), b"original");
 }
 
 #[test]

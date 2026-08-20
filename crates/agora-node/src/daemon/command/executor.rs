@@ -1,6 +1,7 @@
 use super::CommandArguments;
 use crate::agent::ConfiguredAgent;
 use crate::channel::ChannelReply;
+use crate::store::ChannelIdentity;
 use crate::task::TaskContent;
 use anyhow::Result;
 use std::fmt;
@@ -49,7 +50,7 @@ enum CommandSource {
 }
 
 pub(in crate::daemon) struct CommandContext {
-    channel_name: String,
+    channel: ChannelIdentity,
     session_id: String,
     agents: Vec<ConfiguredAgent>,
     source: CommandSource,
@@ -58,29 +59,29 @@ pub(in crate::daemon) struct CommandContext {
 
 impl CommandContext {
     pub(in crate::daemon) fn text(
-        channel_name: impl Into<String>,
+        channel: ChannelIdentity,
         session_id: impl Into<String>,
         agents: Vec<ConfiguredAgent>,
     ) -> Self {
-        Self::new(channel_name, session_id, agents, CommandSource::Text)
+        Self::new(channel, session_id, agents, CommandSource::Text)
     }
 
     pub(in crate::daemon) fn structured(
-        channel_name: impl Into<String>,
+        channel: ChannelIdentity,
         session_id: impl Into<String>,
         agents: Vec<ConfiguredAgent>,
     ) -> Self {
-        Self::new(channel_name, session_id, agents, CommandSource::Structured)
+        Self::new(channel, session_id, agents, CommandSource::Structured)
     }
 
     fn new(
-        channel_name: impl Into<String>,
+        channel: ChannelIdentity,
         session_id: impl Into<String>,
         agents: Vec<ConfiguredAgent>,
         source: CommandSource,
     ) -> Self {
         Self {
-            channel_name: channel_name.into(),
+            channel,
             session_id: session_id.into(),
             agents,
             source,
@@ -94,7 +95,11 @@ impl CommandContext {
     }
 
     pub(super) fn channel_name(&self) -> &str {
-        &self.channel_name
+        self.channel.configured_name()
+    }
+
+    pub(super) fn channel_identity(&self) -> &ChannelIdentity {
+        &self.channel
     }
 
     pub(super) fn session_id(&self) -> &str {

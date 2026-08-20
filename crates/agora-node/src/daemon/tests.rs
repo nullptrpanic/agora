@@ -8,7 +8,7 @@ use crate::config::{
     AgentConfig, AgentSubscription, AgentType, ChannelConfig, IsolateMode, IsolationScope,
     LarkChannelConfig, NamedChannelConfig, NodeConfig,
 };
-use crate::store::{SessionKey, SessionStore};
+use crate::store::{ChannelIdentity, SessionKey, SessionStore};
 use crate::task::{ChannelTaskInput, OutputEvent, TaskContent};
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
@@ -149,6 +149,10 @@ impl Channel for ReplyChannel {
         "reply"
     }
 
+    fn identity(&self) -> ChannelIdentity {
+        ChannelIdentity::new(self.name(), "test", self.name())
+    }
+
     async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
         Ok(None)
     }
@@ -180,6 +184,10 @@ impl Channel for RecordingChannel {
 
     fn name(&self) -> &str {
         "test"
+    }
+
+    fn identity(&self) -> ChannelIdentity {
+        ChannelIdentity::new(self.name(), "test", self.name())
     }
 
     async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
@@ -253,6 +261,10 @@ impl Channel for ScopedChannel {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn identity(&self) -> ChannelIdentity {
+        ChannelIdentity::new(self.name(), "test", self.name())
     }
 
     async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {

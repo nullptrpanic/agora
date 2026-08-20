@@ -1,4 +1,5 @@
 use crate::config::{AgentConfig, AgentType, HttpProxy, IsolationScope};
+use crate::store::{AgentIdentity, ChannelIdentity, StoreSessionKey};
 use crate::task::{OutputEvent, TaskContent};
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
@@ -141,11 +142,20 @@ pub struct ConfiguredAgent {
     config: AgentConfig,
     backend: AgentBackend,
     workspace_key: PathBuf,
+    identity: AgentIdentity,
 }
 
 impl ConfiguredAgent {
     pub fn from_config(config: AgentConfig) -> Result<Self> {
         let workspace_key = normalize_workspace_key(&config.workdir())?;
+        let canonical_workspace = workspace_key
+            .to_str()
+            .context("agent canonical workspace is not valid UTF-8")?;
+        let identity = AgentIdentity::new(
+            config.name.clone(),
+            config.agent_type.as_str(),
+            canonical_workspace,
+        );
         let env = Self::proxy_environment(config.proxy.as_ref());
         let limits = CommandLimits::new(
             std::time::Duration::from_secs(config.timeout_seconds),
@@ -177,6 +187,7 @@ impl ConfiguredAgent {
             config,
             backend,
             workspace_key,
+            identity,
         })
     }
 
@@ -208,6 +219,27 @@ impl ConfiguredAgent {
 
     pub fn workspace_key(&self) -> &Path {
         &self.workspace_key
+    }
+
+    pub fn identity(&self) -> &AgentIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn requires_session_id(&self) -> bool {
+        matches!(self.backend, AgentBackend::Codex(_))
+    }
+
+    pub fn store_session_key(
+        &self,
+        channel: &ChannelIdentity,
+        session_id: &str,
+    ) -> StoreSessionKey {
+        match self.config.isolate {
+            crate::config::IsolateMode::None => StoreSessionKey::shared(self.identity.clone()),
+            crate::config::IsolateMode::Session => {
+                StoreSessionKey::session(self.identity.clone(), channel.clone(), session_id)
+            }
+        }
     }
 
     pub async fn run<O>(

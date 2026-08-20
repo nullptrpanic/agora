@@ -38,6 +38,10 @@ impl Channel for BlockingTerminalChannel {
         "terminal"
     }
 
+    fn identity(&self) -> ChannelIdentity {
+        ChannelIdentity::new(self.name(), "test", self.name())
+    }
+
     async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
         Ok(None)
     }
@@ -288,6 +292,8 @@ async fn reports_nonzero_agent_exit_as_failed() {
 #[tokio::test]
 async fn daemon_rejects_unsupported_channels_even_without_constructor_validation() {
     let temp = tempfile::tempdir().unwrap();
+    let paths = crate::instance::StatePaths::from_home(temp.path());
+    let instance_guard = crate::instance::NodeInstanceGuard::acquire(paths).unwrap();
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
     let scheduler = super::super::ExecutionScheduler::default();
     let config = NodeConfig {
@@ -310,6 +316,7 @@ async fn daemon_rejects_unsupported_channels_even_without_constructor_validation
         agents: Vec::new(),
     };
     let daemon = Daemon {
+        instance_guard,
         config,
         dispatcher: AgentDispatcher::from_parts(store.clone(), scheduler.clone()),
         commands: Arc::new(CommandRuntime::new(store, scheduler).unwrap()),

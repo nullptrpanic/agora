@@ -3,9 +3,9 @@ use crate::agent::{ConfiguredAgent, DeleteSessionOutcome};
 use crate::channel::ChannelReply;
 use crate::daemon::ExecutionScheduler;
 use crate::i18n;
-use crate::store::{SessionKey, SessionStore};
+use crate::store::{SessionKey, SessionStore, StoreSessionKey};
 use agora_core::logger;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::collections::VecDeque;
 
 #[derive(Clone)]
@@ -36,7 +36,7 @@ impl ResetCommand {
     ) -> Result<Option<ChannelReply>> {
         let failed = self
             .reset_sessions(
-                context.channel_name(),
+                context.channel_identity(),
                 context.session_id(),
                 context.agents(),
             )
@@ -50,7 +50,7 @@ impl ResetCommand {
 
     async fn reset_sessions(
         &self,
-        channel_name: &str,
+        channel: &crate::store::ChannelIdentity,
         session_id: &str,
         agents: &[ConfiguredAgent],
     ) -> Vec<String> {
@@ -59,24 +59,25 @@ impl ResetCommand {
             .map(|agent| {
                 let key = SessionKey::new(
                     agent.name(),
-                    agent.isolation_scope(channel_name, session_id),
+                    agent.isolation_scope(channel.configured_name(), session_id),
                 );
+                let store_key = agent.store_session_key(channel, session_id);
                 let barrier = self.scheduler.barrier(&key);
-                (agent.clone(), key, barrier)
+                (agent.clone(), key, store_key, barrier)
             })
             .collect::<VecDeque<_>>();
         let keys = resets
             .iter()
-            .map(|(_, key, _)| key.clone())
+            .map(|(_, key, _, _)| key.clone())
             .collect::<Vec<_>>();
         self.scheduler.stop_session_keys(&keys);
 
         let mut failed = Vec::new();
-        while let Some((agent, key, barrier)) = resets.pop_front() {
+        while let Some((agent, key, store_key, barrier)) = resets.pop_front() {
             let result = async {
                 let mut barrier = barrier?;
                 barrier.wait_until_front().await?;
-                self.reset_agent_session(&key, &agent).await
+                self.reset_agent_session(&store_key, &agent).await
             }
             .await;
             if let Err(err) = result {
@@ -92,7 +93,11 @@ impl ResetCommand {
         failed
     }
 
-    async fn reset_agent_session(&self, key: &SessionKey, agent: &ConfiguredAgent) -> Result<()> {
+    async fn reset_agent_session(
+        &self,
+        key: &StoreSessionKey,
+        agent: &ConfiguredAgent,
+    ) -> Result<()> {
         let Some(session_id) = self.store.get(key)? else {
             return Ok(());
         };
@@ -100,19 +105,12 @@ impl ResetCommand {
         match agent.delete_session(&session_id).await? {
             DeleteSessionOutcome::Deleted => {}
             DeleteSessionOutcome::Unsupported => logger::info!(
-                "agent does not support backend session deletion agent={} isolation={}",
-                key.agent_name(),
-                key.isolation_scope().as_str()
+                "agent does not support backend session deletion agent={}",
+                agent.name()
             ),
         }
-        if !self.store.remove_if_matches(key, &session_id)? {
-            bail!("agent session mapping changed while reset was in progress");
-        }
-        logger::info!(
-            "agent session reset agent={} isolation={}",
-            key.agent_name(),
-            key.isolation_scope().as_str()
-        );
+        self.store.remove_if_matches(key, &session_id)?;
+        logger::info!("agent session reset agent={}", agent.name());
         Ok(())
     }
 }

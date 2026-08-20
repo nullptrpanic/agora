@@ -41,6 +41,7 @@ const LARK_PENDING_EVENT_TTL: Duration = Duration::from_secs(2 * 60);
 const LARK_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LARK_WS_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const LARK_WS_MINIMUM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const LARK_TENANT_TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
 
 #[derive(Clone)]
 struct LarkWebSocketTiming {
@@ -69,8 +70,15 @@ pub(super) struct LarkApi {
     client: Client,
     base_url: String,
     proxy: Option<crate::config::HttpProxy>,
+    token_cache: Arc<Mutex<Option<LarkCachedToken>>>,
     event_cache: Arc<Mutex<LarkEventCache>>,
+    event_slots: Arc<Semaphore>,
     websocket_timing: LarkWebSocketTiming,
+}
+
+struct LarkCachedToken {
+    value: String,
+    expires_at: Instant,
 }
 
 #[derive(Default)]
@@ -264,7 +272,9 @@ impl LarkApi {
             client,
             base_url,
             proxy: config.proxy,
+            token_cache: Arc::new(Mutex::new(None)),
             event_cache: Arc::new(Mutex::new(LarkEventCache::default())),
+            event_slots: Arc::new(Semaphore::new(LARK_MAX_IN_FLIGHT_EVENTS)),
             websocket_timing: LarkWebSocketTiming::default(),
         })
     }
@@ -363,7 +373,6 @@ impl LarkApi {
         let mut ping_interval = tokio::time::interval(ping_interval_duration);
         let inbound_idle = tokio::time::sleep(idle_timeout);
         tokio::pin!(inbound_idle);
-        let in_flight = Arc::new(Semaphore::new(LARK_MAX_IN_FLIGHT_EVENTS));
         let (acknowledgements, mut acknowledged) =
             mpsc::channel::<Result<LarkFrame>>(LARK_MAX_IN_FLIGHT_EVENTS);
 
@@ -395,7 +404,7 @@ impl LarkApi {
                             if frame.method == LARK_FRAME_TYPE_DATA
                                 && frame.header("type") == Some(LARK_MESSAGE_TYPE_EVENT)
                             {
-                                let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
+                                let Ok(permit) = Arc::clone(&self.event_slots).try_acquire_owned() else {
                                     let ack = frame.into_ack(500, 0)?;
                                     self.write_websocket(
                                         socket.send(WebSocketMessage::Binary(
@@ -610,6 +619,28 @@ impl LarkApi {
             .json::<TenantTokenResponse>()
             .await?;
         response.into_result()
+    }
+
+    pub(super) async fn cached_tenant_access_token(&self) -> Result<String> {
+        let mut cache = self.token_cache.lock().await;
+        if let Some(token) = cache.as_ref()
+            && token.expires_at > Instant::now()
+        {
+            return Ok(token.value.clone());
+        }
+        let value = self.tenant_access_token().await?;
+        *cache = Some(LarkCachedToken {
+            value: value.clone(),
+            expires_at: Instant::now() + LARK_TENANT_TOKEN_CACHE_TTL,
+        });
+        Ok(value)
+    }
+
+    pub(super) async fn invalidate_cached_tenant_access_token(&self, value: &str) {
+        let mut cache = self.token_cache.lock().await;
+        if cache.as_ref().is_some_and(|token| token.value == value) {
+            *cache = None;
+        }
     }
 
     pub(super) async fn bot_open_id(&self) -> Result<String> {

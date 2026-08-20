@@ -1,6 +1,6 @@
 use super::channel::{TelegramInterruptRegistration, TelegramReplyTarget};
 use super::telegram_api::TelegramApi;
-use crate::channel::{ChannelRun, RunEvent};
+use crate::channel::{ChannelRun, RunEvent, append_bounded_tail, bounded_tail};
 use crate::i18n::{self, RunStatus};
 use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
 use agora_core::logger;
@@ -18,6 +18,10 @@ const TELEGRAM_RICH_MESSAGE_MAX_CHARS: usize = 32_768;
 const TELEGRAM_RICH_MESSAGE_MAX_STRUCTURE_POINTS: usize = 400;
 const TELEGRAM_PROCESS_MAX_CHARS: usize = 20_000;
 const TELEGRAM_PROCESS_MAX_STRUCTURE_POINTS: usize = 240;
+const TELEGRAM_RETAINED_ANSWER_MAX_BYTES: usize = 256 * 1024;
+const TELEGRAM_RETAINED_PROCESS_PHASES: usize = 64;
+const TELEGRAM_RETAINED_PROGRESS_PER_PHASE: usize = 64;
+const TELEGRAM_RETAINED_PROCESS_TEXT_MAX_BYTES: usize = 8 * 1024;
 
 #[derive(Clone)]
 pub(super) struct TelegramRichMessage {
@@ -436,6 +440,7 @@ impl ChannelRun for TelegramRichMessage {
 pub(super) struct TelegramRichContent {
     agent_name: String,
     process: VecDeque<TelegramProcessPhase>,
+    process_truncated: bool,
     answer: String,
     usage: Option<TokenUsage>,
     state: TelegramRunState,
@@ -474,6 +479,7 @@ impl TelegramRichContent {
         Self {
             agent_name,
             process: VecDeque::new(),
+            process_truncated: false,
             answer: String::new(),
             usage: None,
             state: TelegramRunState::Running,
@@ -810,6 +816,16 @@ impl TelegramRichContent {
         match output {
             OutputEvent::Thinking { text } => {
                 if !text.trim().is_empty() {
+                    let (text, truncated) = bounded_tail(
+                        text,
+                        TELEGRAM_RETAINED_PROCESS_TEXT_MAX_BYTES,
+                        i18n::OUTPUT_TRUNCATED,
+                    );
+                    self.process_truncated |= truncated;
+                    if self.process.len() >= TELEGRAM_RETAINED_PROCESS_PHASES {
+                        self.process.pop_back();
+                        self.process_truncated = true;
+                    }
                     self.process.push_front(TelegramProcessPhase {
                         thinking: Some(text),
                         progress: VecDeque::new(),
@@ -833,7 +849,14 @@ impl TelegramRichContent {
                     exit_code,
                 );
             }
-            OutputEvent::Answer { text } => self.answer.push_str(&text),
+            OutputEvent::Answer { text } => {
+                append_bounded_tail(
+                    &mut self.answer,
+                    &text,
+                    TELEGRAM_RETAINED_ANSWER_MAX_BYTES,
+                    i18n::OUTPUT_TRUNCATED,
+                );
+            }
             OutputEvent::Usage(usage) => self.usage = Some(usage),
         }
     }
@@ -846,6 +869,12 @@ impl TelegramRichContent {
         kind: TelegramProgressKind,
         exit_code: Option<i32>,
     ) {
+        let (text, truncated) = bounded_tail(
+            text,
+            TELEGRAM_RETAINED_PROCESS_TEXT_MAX_BYTES,
+            i18n::OUTPUT_TRUNCATED,
+        );
+        self.process_truncated |= truncated;
         for phase in &mut self.process {
             if let Some(entry) = phase.progress.iter_mut().find(|entry| entry.id == id) {
                 entry.text = text;
@@ -861,17 +890,18 @@ impl TelegramRichContent {
                 progress: VecDeque::new(),
             });
         }
-        self.process
-            .front_mut()
-            .expect("process phase must exist")
-            .progress
-            .push_back(TelegramProgressEntry {
-                id,
-                text,
-                status,
-                kind,
-                exit_code,
-            });
+        let phase = self.process.front_mut().expect("process phase must exist");
+        if phase.progress.len() >= TELEGRAM_RETAINED_PROGRESS_PER_PHASE {
+            phase.progress.pop_front();
+            self.process_truncated = true;
+        }
+        phase.progress.push_back(TelegramProgressEntry {
+            id,
+            text,
+            status,
+            kind,
+            exit_code,
+        });
     }
 
     fn stop_running_progress(&mut self) {
@@ -964,6 +994,9 @@ impl TelegramRichContent {
         }
 
         let mut body = Vec::new();
+        if self.process_truncated {
+            body.push(format!("> {}", i18n::OUTPUT_TRUNCATED.trim()));
+        }
         if omitted > 0 {
             body.push(format!("> {}", i18n::truncated_phase_count(omitted)));
         }

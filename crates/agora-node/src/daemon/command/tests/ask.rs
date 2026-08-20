@@ -68,9 +68,17 @@ async fn ask_commands_persist_and_report_agent_status_for_the_current_session() 
         ))]
     );
 
-    let session = crate::store::ChannelSessionKey::new("lark", "chat-1");
-    assert!(!store.is_agent_enabled(&session, "codex-dev").unwrap());
-    assert!(store.is_agent_enabled(&session, "reviewer").unwrap());
+    let session = command_channel_session("chat-1");
+    assert!(
+        !store
+            .is_agent_enabled(&session, command_agent_identity(&agents, "codex-dev"))
+            .unwrap()
+    );
+    assert!(
+        store
+            .is_agent_enabled(&session, command_agent_identity(&agents, "reviewer"))
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -104,8 +112,12 @@ async fn ask_button_action_updates_status_and_returns_the_full_agent_list() {
             agent_status_with_button("reviewer", false),
         ])]
     );
-    let session = crate::store::ChannelSessionKey::new("lark", "chat-1");
-    assert!(!store.is_agent_enabled(&session, "reviewer").unwrap());
+    let session = command_channel_session("chat-1");
+    assert!(
+        !store
+            .is_agent_enabled(&session, command_agent_identity(&agents, "reviewer"))
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -116,8 +128,10 @@ async fn disabled_agents_do_not_receive_new_tasks_or_open_run_cards() {
         command_test_agent("reviewer", temp.path()),
     ];
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
-    let session = crate::store::ChannelSessionKey::new("lark", "chat-1");
-    store.disable_agent(&session, "codex-dev").unwrap();
+    let session = command_channel_session("chat-1");
+    store
+        .disable_agent(&session, command_agent_identity(&agents, "codex-dev"))
+        .unwrap();
     let dispatcher = AgentDispatcher::new(store);
     let contexts = Arc::new(Mutex::new(Vec::new()));
     let channel = CommandTestChannel {
@@ -152,8 +166,10 @@ async fn targeted_ask_runs_only_the_named_agent_even_when_it_is_disabled() {
         command_test_agent("reviewer", temp.path()),
     ];
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
-    let session = crate::store::ChannelSessionKey::new("lark", "chat-1");
-    store.disable_agent(&session, "codex-dev").unwrap();
+    let session = command_channel_session("chat-1");
+    store
+        .disable_agent(&session, command_agent_identity(&agents, "codex-dev"))
+        .unwrap();
     let dispatcher = AgentDispatcher::new(store.clone());
     let events = Arc::new(Mutex::new(Vec::new()));
     let contexts = Arc::new(Mutex::new(Vec::new()));
@@ -188,7 +204,11 @@ async fn targeted_ask_runs_only_the_named_agent_even_when_it_is_disabled() {
 
     assert_eq!(contexts.lock().unwrap().as_slice(), ["codex-dev"]);
     assert!(replies.lock().unwrap().is_empty());
-    assert!(!store.is_agent_enabled(&session, "codex-dev").unwrap());
+    assert!(
+        !store
+            .is_agent_enabled(&session, command_agent_identity(&agents, "codex-dev"))
+            .unwrap()
+    );
     assert!(events.lock().unwrap().iter().any(|event| {
         matches!(
             event,
@@ -243,8 +263,10 @@ async fn agent_input_gets_a_reply_when_every_agent_is_disabled() {
     let temp = tempfile::tempdir().unwrap();
     let agents = vec![command_test_agent("codex-dev", temp.path())];
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
-    let session = crate::store::ChannelSessionKey::new("lark", "chat-1");
-    store.disable_agent(&session, "codex-dev").unwrap();
+    let session = command_channel_session("chat-1");
+    store
+        .disable_agent(&session, command_agent_identity(&agents, "codex-dev"))
+        .unwrap();
     let dispatcher = AgentDispatcher::new(store);
     let replies = Arc::new(Mutex::new(Vec::new()));
     let channel = CommandTestChannel::new(Arc::clone(&replies));
@@ -279,7 +301,7 @@ async fn targeted_ask_preserves_message_attachments() {
     );
 
     let outcome = command_runtime(&dispatcher)
-        .handle("lark", "chat-1", &[agent], &input)
+        .handle(&command_channel_identity(), "chat-1", &[agent], &input)
         .await
         .unwrap();
     let CommandOutcome::Dispatch(dispatch) = outcome else {
@@ -302,7 +324,7 @@ async fn ask_status_updates_cover_unknown_and_enable_paths() {
     for input in ["/ask status missing", "/ask disable missing"] {
         let outcome = runtime
             .handle(
-                "lark",
+                &command_channel_identity(),
                 "chat-1",
                 &agents,
                 &ChannelTaskInput::Message(TaskContent::new(input)),
@@ -320,7 +342,7 @@ async fn ask_status_updates_cover_unknown_and_enable_paths() {
 
     let outcome = runtime
         .handle(
-            "lark",
+            &command_channel_identity(),
             "chat-1",
             &agents,
             &ChannelTaskInput::Message(TaskContent::new("/ask enable codex-dev")),

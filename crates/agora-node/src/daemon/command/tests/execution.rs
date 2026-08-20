@@ -79,7 +79,7 @@ async fn stop_reports_empty_session_and_named_agent_states() {
     ] {
         let outcome = runtime
             .handle(
-                "lark",
+                &command_channel_identity(),
                 "chat-1",
                 &[],
                 &ChannelTaskInput::Message(TaskContent::new(input)),

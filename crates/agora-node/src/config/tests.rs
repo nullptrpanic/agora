@@ -130,7 +130,7 @@ fn component_proxies_override_the_global_default() {
             "proxy":"global:8000",
             "channels":[
                 {"type":"lark","name":"lark","app_id":"id","secret":"secret"},
-                {"type":"telegram","name":"telegram","token":"token","proxy":"tg:8001"},
+                {"type":"telegram","name":"telegram","token":"123456:token","proxy":"tg:8001"},
                 {"type":"local","name":"local"},
                 {"type":"http","name":"http","proxy":"http:8002"}
             ],
@@ -202,7 +202,7 @@ fn config_accessors_preserve_names_paths_and_proxy_credentials() {
         r#"{
             "channels":[
                 {"type":"lark","name":"lark","app_id":"id","secret":"secret"},
-                {"type":"telegram","name":"telegram","token":"token"},
+                {"type":"telegram","name":"telegram","token":"123456:token"},
                 {"type":"local","name":"local"},
                 {"type":"http","name":"http"}
             ],
@@ -334,7 +334,7 @@ fn node_config_rejects_ambiguous_or_invalid_runtime_entries() {
             "channel name must not be empty",
         ),
         (
-            r#"{"channels":[{"type":"lark","name":"same","app_id":"id","secret":"secret"},{"type":"telegram","name":"same","token":"token"}],"agents":[]}"#,
+            r#"{"channels":[{"type":"lark","name":"same","app_id":"id","secret":"secret"},{"type":"telegram","name":"same","token":"123456:token"}],"agents":[]}"#,
             "duplicate channel name: same",
         ),
         (
@@ -350,7 +350,7 @@ fn node_config_rejects_ambiguous_or_invalid_runtime_entries() {
             "telegram token must not be empty: telegram",
         ),
         (
-            r#"{"channels":[{"type":"telegram","name":"telegram","token":"token","permission":{"users":[{"id":" "}]}}],"agents":[]}"#,
+            r#"{"channels":[{"type":"telegram","name":"telegram","token":"123456:token","permission":{"users":[{"id":" "}]}}],"agents":[]}"#,
             "channel user permission id must not be empty: telegram",
         ),
         (
@@ -415,4 +415,91 @@ fn node_config_accepts_unique_entries_and_existing_subscriptions() {
     .unwrap();
 
     config.validate().unwrap();
+}
+
+#[test]
+fn node_config_rejects_non_null_subscription_filters() {
+    let filtered: NodeConfig = serde_json::from_str(
+        r#"{
+            "channels":[{"type":"lark","name":"lark","app_id":"id","secret":"secret"}],
+            "agents":[{
+                "name":"agent",
+                "isolate":"none",
+                "workspace":"/tmp/work",
+                "type":"custom",
+                "path":"agent",
+                "subscribe":[{"channel":"lark","filter":{"kind":"future"}}]
+            }]
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        filtered.validate().unwrap_err().to_string(),
+        "agent subscription filter is not implemented: agent -> lark"
+    );
+
+    let null_filter: NodeConfig = serde_json::from_str(
+        r#"{
+            "channels":[{"type":"lark","name":"lark","app_id":"id","secret":"secret"}],
+            "agents":[{
+                "name":"agent",
+                "isolate":"none",
+                "workspace":"/tmp/work",
+                "type":"custom",
+                "path":"agent",
+                "subscribe":[{"channel":"lark","filter":null}]
+            }]
+        }"#,
+    )
+    .unwrap();
+    null_filter.validate().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn filesystem_validation_rejects_invalid_agent_executables_without_creating_workspace() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let regular = directory.path().join("regular");
+    let executable = directory.path().join("executable");
+    std::fs::write(&regular, b"regular").unwrap();
+    std::fs::write(&executable, b"executable").unwrap();
+    std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let missing_workspace = directory.path().join("new").join("workspace");
+
+    for (path, expected) in [
+        (directory.path().join("missing"), "does not exist"),
+        (directory.path().to_path_buf(), "not a regular file"),
+        (regular, "not executable"),
+    ] {
+        let config = node_config_with_agent_paths(&path, &missing_workspace);
+        let error = config.validate_filesystem().unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected validation error: {error:#}"
+        );
+    }
+
+    node_config_with_agent_paths(&executable, &missing_workspace)
+        .validate_filesystem()
+        .unwrap();
+    assert!(!missing_workspace.exists());
+}
+
+#[cfg(unix)]
+fn node_config_with_agent_paths(path: &Path, workspace: &Path) -> NodeConfig {
+    serde_json::from_value(serde_json::json!({
+        "channels": [],
+        "agents": [{
+            "name": "agent",
+            "isolate": "none",
+            "workspace": workspace,
+            "type": "custom",
+            "path": path,
+            "subscribe": []
+        }]
+    }))
+    .unwrap()
 }

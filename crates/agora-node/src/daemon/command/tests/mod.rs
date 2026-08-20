@@ -12,7 +12,9 @@ use crate::channel::{
     ChannelRun, ChannelRunContext, ChannelTask, InterruptCallback, RunEvent,
 };
 use crate::config::{AgentConfig, AgentType, IsolateMode, IsolationScope};
-use crate::store::{SessionKey, SessionStore};
+use crate::store::{
+    AgentIdentity, ChannelIdentity, SessionKey, SessionStore, StoreChannelSessionKey,
+};
 use crate::task::{ChannelTaskInput, CommandRequest, OutputEvent, TaskAttachment, TaskContent};
 use anyhow::Result;
 use std::collections::VecDeque;
@@ -75,6 +77,22 @@ fn command_test_agent(name: &str, workspace: &std::path::Path) -> ConfiguredAgen
         subscribe: Vec::new(),
     })
     .unwrap()
+}
+
+fn command_channel_identity() -> ChannelIdentity {
+    ChannelIdentity::new("lark", "test", "lark")
+}
+
+fn command_channel_session(session_id: &str) -> StoreChannelSessionKey {
+    StoreChannelSessionKey::new(command_channel_identity(), session_id)
+}
+
+fn command_agent_identity<'a>(agents: &'a [ConfiguredAgent], name: &str) -> &'a AgentIdentity {
+    agents
+        .iter()
+        .find(|agent| agent.name() == name)
+        .unwrap()
+        .identity()
 }
 
 fn agent_status_with_button(name: &str, enabled: bool) -> ChannelAgentStatus {
@@ -186,6 +204,10 @@ impl Channel for CommandTestChannel {
 
     fn name(&self) -> &str {
         "lark"
+    }
+
+    fn identity(&self) -> ChannelIdentity {
+        command_channel_identity()
     }
 
     async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {

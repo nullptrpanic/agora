@@ -10,6 +10,7 @@ use crate::channel::{
 use crate::config::ChannelPermissionConfig;
 use crate::config::TelegramChannelConfig;
 use crate::i18n;
+use crate::store::ChannelIdentity;
 use crate::task::{ChannelTaskInput, TaskAttachment, TaskContent};
 use agora_core::logger;
 use anyhow::{Context, Result};
@@ -29,6 +30,7 @@ const TELEGRAM_COMMANDS: &[TelegramBotCommand<'static>] = &[
 
 pub struct TelegramChannel {
     api: TelegramApi,
+    identity: ChannelIdentity,
     permission: PermissionGate,
     interrupts: TelegramInterruptCallbacks,
     pending_updates: VecDeque<Value>,
@@ -42,6 +44,7 @@ impl Clone for TelegramChannel {
     fn clone(&self) -> Self {
         Self {
             api: self.api.clone(),
+            identity: self.identity.clone(),
             permission: self.permission.clone(),
             interrupts: self.interrupts.clone(),
             pending_updates: VecDeque::new(),
@@ -93,13 +96,23 @@ impl ChannelRun for TelegramRun {
 
 impl TelegramChannel {
     pub fn new(config: TelegramChannelConfig) -> Result<Self> {
+        let identity = ChannelIdentity::new(config.name.clone(), "telegram", config.bot_id()?);
         let permission = PermissionGate::new(config.permission.clone());
-        Ok(Self::with_api_inner(TelegramApi::new(config)?, permission))
+        Ok(Self::with_api_inner(
+            TelegramApi::new(config)?,
+            permission,
+            identity,
+        ))
     }
 
-    fn with_api_inner(api: TelegramApi, permission: PermissionGate) -> Self {
+    fn with_api_inner(
+        api: TelegramApi,
+        permission: PermissionGate,
+        identity: ChannelIdentity,
+    ) -> Self {
         Self {
             api,
+            identity,
             permission,
             interrupts: TelegramInterruptCallbacks::default(),
             pending_updates: VecDeque::new(),
@@ -131,7 +144,8 @@ impl TelegramChannel {
         api: TelegramApi,
         permission: ChannelPermissionConfig,
     ) -> Self {
-        Self::with_api_inner(api, PermissionGate::new(permission))
+        let identity = ChannelIdentity::new(api.name(), "telegram", "test");
+        Self::with_api_inner(api, PermissionGate::new(permission), identity)
     }
 
     async fn next_delivery(&mut self) -> Result<ChannelDelivery<TelegramTask>> {
@@ -427,6 +441,10 @@ impl Channel for TelegramChannel {
 
     fn name(&self) -> &str {
         self.api.name()
+    }
+
+    fn identity(&self) -> ChannelIdentity {
+        self.identity.clone()
     }
 
     async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {

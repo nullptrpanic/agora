@@ -8,7 +8,7 @@ agora-core = { path = "../agora-core" }
 anyhow = { workspace = true }
 base64 = "0.23.0"
 clap = { workspace = true }
-dialoguer = { version = "0.12.0", default-features = false }
+dialoguer = { version = "0.12.0", default-features = false, features = ["password"] }
 futures-util = "0.3.33"
 libc = { workspace = true }
 prost = "0.14.4"

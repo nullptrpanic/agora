@@ -237,7 +237,7 @@ async fn command_registry_executes_a_registered_handler_without_central_dispatch
     let (handler, arguments) = invocation.into_parts();
     let execution = handler
         .execute(
-            CommandContext::text("test", "session", Vec::new()),
+            CommandContext::text(command_channel_identity(), "session", Vec::new()),
             arguments,
         )
         .await

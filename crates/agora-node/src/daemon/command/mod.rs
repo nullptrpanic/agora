@@ -7,6 +7,7 @@ mod stop;
 use crate::agent::ConfiguredAgent;
 use crate::channel::ChannelReply;
 use crate::daemon::ExecutionScheduler;
+use crate::store::ChannelIdentity;
 use crate::store::SessionStore;
 use crate::task::ChannelTaskInput;
 use anyhow::Result;
@@ -40,7 +41,7 @@ impl CommandRuntime {
 
     pub(super) async fn handle(
         &self,
-        channel_name: &str,
+        channel: &ChannelIdentity,
         session_id: &str,
         agents: &[ConfiguredAgent],
         input: &ChannelTaskInput,
@@ -48,12 +49,12 @@ impl CommandRuntime {
         let (resolution, context) = match input {
             ChannelTaskInput::Message(content) => (
                 self.registry.route_text(content.text()),
-                CommandContext::text(channel_name, session_id, agents.to_vec())
+                CommandContext::text(channel.clone(), session_id, agents.to_vec())
                     .with_message(content.clone()),
             ),
             ChannelTaskInput::Command(request) => (
                 self.registry.route_structured(request),
-                CommandContext::structured(channel_name, session_id, agents.to_vec()),
+                CommandContext::structured(channel.clone(), session_id, agents.to_vec()),
             ),
         };
 

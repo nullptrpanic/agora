@@ -8,7 +8,10 @@ use crate::channel::{
 };
 use crate::config::NodeConfig;
 use crate::i18n;
-use crate::store::{ChannelSessionKey, SessionKey, SessionStore};
+use crate::instance::{NodeInstanceGuard, StatePaths};
+use crate::store::{
+    ChannelIdentity, SessionKey, SessionStore, StoreChannelSessionKey, StoreSessionKey,
+};
 use crate::task::{OutputEvent, TaskContent};
 use agora_core::logger;
 use anyhow::{Result, bail};
@@ -82,7 +85,8 @@ impl AgentDispatcher {
         C::Task: Send + Sync + 'static,
         C::Run: Send + Sync + 'static,
     {
-        let agents = self.enabled_agents(channel.name(), task.session_id(), &agents)?;
+        let channel_identity = channel.identity();
+        let agents = self.enabled_agents(&channel_identity, task.session_id(), &agents)?;
         if agents.is_empty() {
             return channel
                 .reply(&task, ChannelReply::new(i18n::NO_ENABLED_AGENTS))
@@ -110,17 +114,19 @@ impl AgentDispatcher {
         C::Task: Send + Sync + 'static,
         C::Run: Send + Sync + 'static,
     {
+        let channel_identity = channel.identity();
         let planned = agents
             .into_iter()
             .map(|agent| {
                 let isolation_scope = agent.isolation_scope(channel.name(), task.session_id());
                 let key = SessionKey::new(agent.name(), isolation_scope);
-                (agent, key, AgentTask::new(content.clone()))
+                let store_key = agent.store_session_key(&channel_identity, task.session_id());
+                (agent, key, store_key, AgentTask::new(content.clone()))
             })
             .collect::<Vec<_>>();
         let scopes = planned
             .iter()
-            .map(|(agent, key, _)| {
+            .map(|(agent, key, _, _)| {
                 ExecutionScope::new(
                     channel.name(),
                     task.session_id(),
@@ -152,7 +158,7 @@ impl AgentDispatcher {
         };
         let mut prepared = Vec::with_capacity(admitted.len());
 
-        for ((agent, key, agent_task), admitted) in planned.into_iter().zip(admitted) {
+        for ((agent, _key, store_key, agent_task), admitted) in planned.into_iter().zip(admitted) {
             let (execution, completion) = admitted.into_parts();
             let control = execution.control();
             let interrupt_control = control.clone();
@@ -170,7 +176,7 @@ impl AgentDispatcher {
             let output =
                 AgentRunOutput::for_task(run, channel.name(), task.task_id(), agent.name());
             prepared.push((
-                agent, key, agent_task, execution, completion, control, output,
+                agent, store_key, agent_task, execution, completion, control, output,
             ));
         }
 
@@ -178,7 +184,9 @@ impl AgentDispatcher {
             output.initial_queued(execution.ahead()).await?;
         }
 
-        for (agent, key, agent_task, mut execution, completion, control, mut output) in prepared {
+        for (agent, store_key, agent_task, mut execution, completion, control, mut output) in
+            prepared
+        {
             let dispatcher = self.clone();
             runs.spawn(async move {
                 while execution.ahead() > 0 {
@@ -223,7 +231,7 @@ impl AgentDispatcher {
                     }
                 }
                 let result = dispatcher
-                    .execute_agent(&key, &agent, agent_task, control.clone(), &mut output)
+                    .execute_agent(&store_key, &agent, agent_task, control.clone(), &mut output)
                     .await;
                 drop(lease);
                 drop(execution);
@@ -256,11 +264,11 @@ impl AgentDispatcher {
 
     fn enabled_agents(
         &self,
-        channel_name: &str,
+        channel: &ChannelIdentity,
         session_id: &str,
         agents: &[ConfiguredAgent],
     ) -> Result<Vec<ConfiguredAgent>> {
-        let key = ChannelSessionKey::new(channel_name, session_id);
+        let key = StoreChannelSessionKey::new(channel.clone(), session_id);
         let disabled = self
             .store
             .disabled_agents(&key)?
@@ -268,7 +276,7 @@ impl AgentDispatcher {
             .collect::<HashSet<_>>();
         Ok(agents
             .iter()
-            .filter(|agent| !disabled.contains(agent.name()))
+            .filter(|agent| !disabled.contains(agent.identity()))
             .cloned()
             .collect())
     }
@@ -283,7 +291,7 @@ impl AgentDispatcher {
 
     async fn execute_agent<O>(
         &self,
-        key: &SessionKey,
+        key: &StoreSessionKey,
         agent: &ConfiguredAgent,
         task: AgentTask,
         control: AgentRunControl,
@@ -292,7 +300,7 @@ impl AgentDispatcher {
     where
         O: AgentOutput + Send,
     {
-        let session_id = self.store.get(key)?;
+        let mut session_id = self.store.get(key)?;
         let mut outcome = match agent
             .run(task.clone(), session_id.clone(), control.clone(), output)
             .await?
@@ -306,10 +314,10 @@ impl AgentDispatcher {
                 bail!("agent reported a missing session without a resume session");
             };
             self.store.remove_if_matches(key, &stale_session_id)?;
+            session_id = None;
             logger::info!(
-                "agent session missing; starting a new session agent={} isolation={}",
-                key.agent_name(),
-                key.isolation_scope().as_str()
+                "agent session missing; starting a new session agent={}",
+                agent.name()
             );
             outcome = match agent.run(task, None, control, output).await? {
                 AgentRunOutcome::Completed(outcome) => outcome,
@@ -320,14 +328,26 @@ impl AgentDispatcher {
             }
         }
 
-        if let AgentSessionUpdate::Set(session_id) = outcome.session_update() {
-            self.store.save(key, session_id)?;
+        match outcome.session_update() {
+            AgentSessionUpdate::Set(observed_session_id) => {
+                self.store
+                    .observe(key, session_id.as_deref(), observed_session_id)?;
+            }
+            AgentSessionUpdate::Unchanged
+                if session_id.is_none()
+                    && outcome.exit_code() == 0
+                    && agent.requires_session_id() =>
+            {
+                bail!("agent completed a fresh run without a session id")
+            }
+            AgentSessionUpdate::Unchanged | AgentSessionUpdate::NotFound => {}
         }
         Ok(AgentRunOutcome::Completed(outcome))
     }
 }
 
 pub struct Daemon {
+    instance_guard: NodeInstanceGuard,
     config: NodeConfig,
     dispatcher: AgentDispatcher,
     commands: Arc<CommandRuntime>,
@@ -361,13 +381,21 @@ impl DaemonShutdown {
 }
 
 impl Daemon {
-    pub fn new(mut config: NodeConfig) -> Result<Self> {
+    pub fn new(config: NodeConfig) -> Result<Self> {
+        let paths = StatePaths::from_environment()?;
+        Self::new_with_paths(config, paths)
+    }
+
+    pub fn new_with_paths(mut config: NodeConfig, paths: StatePaths) -> Result<Self> {
         config.validate()?;
         config.apply_proxy_defaults();
-        let store = SessionStore::open_default()?;
+        let instance_guard = NodeInstanceGuard::acquire(paths.clone())?;
+        let store = SessionStore::open(paths.store_path())?;
+        config.validate_filesystem()?;
         let scheduler = ExecutionScheduler::new(&config.runtime);
         let task_slots = TaskSlots::new(config.runtime.max_in_flight_tasks);
         Ok(Self {
+            instance_guard,
             config,
             dispatcher: AgentDispatcher::from_parts(store.clone(), scheduler.clone()),
             commands: Arc::new(CommandRuntime::new(store, scheduler)?),
@@ -384,11 +412,13 @@ impl Daemon {
 
     pub async fn run(self) -> Result<()> {
         let Self {
+            instance_guard,
             config,
             dispatcher,
             commands,
             task_slots,
         } = self;
+        let _instance_guard = instance_guard;
         let NodeConfig {
             proxy: _,
             runtime: _,
@@ -586,7 +616,7 @@ impl Daemon {
         C::Run: Send + Sync + 'static,
     {
         match commands
-            .handle(channel.name(), task.session_id(), agents, task.input())
+            .handle(&channel.identity(), task.session_id(), agents, task.input())
             .await?
         {
             CommandOutcome::PassThrough => {

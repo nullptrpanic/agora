@@ -64,7 +64,7 @@ fn node_config_generate_builds_a_telegram_config_without_detected_codex() {
         empty_path.path(),
         "-g",
         std::path::Path::new("config2.json"),
-        "9\n2\nbot-token\n\n/custom/bin/codex\n\ngpt-5.6\n\n",
+        "9\n2\nbot-token\nallowed-user\n\n/custom/bin/codex\n\ngpt-5.6\n\n",
     );
 
     assert!(
@@ -82,6 +82,7 @@ fn node_config_generate_builds_a_telegram_config_without_detected_codex() {
     };
     assert_eq!(channel.name, "telegram");
     assert_eq!(channel.token, "bot-token");
+    assert_eq!(channel.permission.users[0].id, "allowed-user");
     assert_generated_agent(
         &config,
         temp.path(),
@@ -124,7 +125,7 @@ fn node_config_generate_builds_a_lark_config_with_detected_codex_default() {
         executable_dir.path(),
         "--generate",
         &config_path,
-        "\napp-id\napp-secret\n\n\ngpt-5.6-codex\nxhigh\n",
+        "\napp-id\napp-secret\nou_allowed\n\n\ngpt-5.6-codex\nxhigh\n",
     );
 
     assert!(
@@ -142,6 +143,7 @@ fn node_config_generate_builds_a_lark_config_with_detected_codex_default() {
     assert_eq!(channel.name, "lark");
     assert_eq!(channel.app_id, "app-id");
     assert_eq!(channel.secret, "app-secret");
+    assert_eq!(channel.permission.users[0].id, "ou_allowed");
     assert_generated_agent(
         &config,
         temp.path(),
@@ -174,45 +176,32 @@ fn node_config_generate_supports_the_interactive_terminal_flow() {
     std::fs::set_permissions(&codex, permissions).unwrap();
     let config_path = output_dir.path().join("interactive.json");
 
-    let mut child = std::process::Command::new("/usr/bin/script")
-        .arg("-q")
-        .arg("/dev/null")
-        .arg(env!("CARGO_BIN_EXE_agora-node"))
-        .arg("config")
-        .arg("-g")
-        .arg(&config_path)
+    let script = r#"
+        set timeout 10
+        spawn -noecho $env(AGORA_NODE_BIN) config -g $env(AGORA_NODE_CONFIG)
+        expect "Select a channel"; send "\r"
+        expect "Lark App ID"; send "app-id\r"
+        expect "Lark App Secret"; send "secret\r"
+        expect "Allowed Lark user ID"; send "ou_allowed\r"
+        expect "Select an agent type"; send "\r"
+        expect "Codex path"; send "\r"
+        expect "Model"; send "gpt-5\r"
+        expect "Reasoning effort"; send "\r"
+        expect eof
+        catch wait result
+        exit [lindex $result 3]
+    "#;
+    let output = std::process::Command::new("/usr/bin/expect")
+        .args(["-c", script])
         .current_dir(workspace.path())
         .env("PATH", executable_dir.path())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+        .env("AGORA_NODE_BIN", env!("CARGO_BIN_EXE_agora-node"))
+        .env("AGORA_NODE_CONFIG", &config_path)
+        .output()
         .unwrap();
-    let mut input = child.stdin.take().unwrap();
-    let writer = std::thread::spawn(move || {
-        for answer in ["\r", "app-id\r", "secret\r", "\r", "\r", "gpt-5\r", "\r"] {
-            input.write_all(answer.as_bytes()).unwrap();
-            input.flush().unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    });
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if std::time::Instant::now() >= deadline {
-            child.kill().unwrap();
-            panic!("interactive config generation did not exit before the deadline");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    writer.join().unwrap();
-    let output = child.wait_with_output().unwrap();
 
     assert!(
-        status.success(),
+        output.status.success(),
         "stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -224,6 +213,8 @@ fn node_config_generate_supports_the_interactive_terminal_flow() {
     };
     assert_eq!(channel.app_id, "app-id");
     assert_eq!(channel.secret, "secret");
+    assert_eq!(channel.permission.users[0].id, "ou_allowed");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("secret"));
     assert_generated_agent(
         &config,
         workspace.path(),
@@ -246,7 +237,7 @@ fn node_config_generate_overwrites_an_existing_config() {
         empty_path.path(),
         "-g",
         &config_path,
-        "2\nreplacement-token\n\n/custom/bin/codex\ngpt-5.6\n\n",
+        "2\nreplacement-token\nallowed-user\n\n/custom/bin/codex\ngpt-5.6\n\n",
     );
 
     assert!(
@@ -271,12 +262,12 @@ fn node_config_generate_reports_the_underlying_write_error() {
         empty_path.path(),
         "-g",
         temp.path(),
-        "2\nbot-token\n\n/custom/bin/codex\ngpt-5.6\n\n",
+        "2\nbot-token\nallowed-user\n\n/custom/bin/codex\ngpt-5.6\n\n",
     );
 
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("open configuration file"));
+    assert!(stdout.contains("replace configuration file"));
     assert!(stdout.contains("os error"));
 }
 
