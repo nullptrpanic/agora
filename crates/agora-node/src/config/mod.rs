@@ -98,7 +98,10 @@ impl NodeConfig {
                 anyhow::bail!("agent max_output_bytes must be positive: {}", agent.name);
             }
             for subscription in &agent.subscribe {
-                if subscription.filter.is_some() {
+                let has_filter_conditions = subscription.filter.as_ref().is_some_and(
+                    |filter| !matches!(filter, Value::Object(fields) if fields.is_empty()),
+                );
+                if has_filter_conditions {
                     anyhow::bail!(
                         "agent subscription filter is not implemented: {} -> {}",
                         agent.name,

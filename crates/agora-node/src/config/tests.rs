@@ -418,7 +418,27 @@ fn node_config_accepts_unique_entries_and_existing_subscriptions() {
 }
 
 #[test]
-fn node_config_rejects_non_null_subscription_filters() {
+fn node_config_accepts_empty_subscription_filter_for_legacy_configs() {
+    let config: NodeConfig = serde_json::from_str(
+        r#"{
+            "channels":[{"type":"lark","name":"lark","app_id":"id","secret":"secret"}],
+            "agents":[{
+                "name":"agent",
+                "isolate":"none",
+                "workspace":"/tmp/work",
+                "type":"custom",
+                "path":"agent",
+                "subscribe":[{"channel":"lark","filter":{}}]
+            }]
+        }"#,
+    )
+    .unwrap();
+
+    config.validate().unwrap();
+}
+
+#[test]
+fn node_config_rejects_non_empty_subscription_filters() {
     let filtered: NodeConfig = serde_json::from_str(
         r#"{
             "channels":[{"type":"lark","name":"lark","app_id":"id","secret":"secret"}],
