@@ -58,8 +58,8 @@ async fn persists_and_serializes_session_by_channel_and_agent() {
     assert_eq!(
         invocations.lines().collect::<Vec<_>>(),
         vec![
-            "exec --json --color never --config model_reasoning_summary=concise -",
-            "exec resume --json --config model_reasoning_summary=concise thread-123 -",
+            "exec --json --color never --skip-git-repo-check --config model_reasoning_summary=concise -",
+            "exec resume --json --skip-git-repo-check --config model_reasoning_summary=concise thread-123 -",
         ]
     );
     assert_eq!(
@@ -183,8 +183,8 @@ async fn none_isolation_queues_and_resumes_across_channels() {
     assert_eq!(
         invocations.lines().collect::<Vec<_>>(),
         vec![
-            "exec --json --color never --config model_reasoning_summary=concise -",
-            "exec resume --json --config model_reasoning_summary=concise thread-shared -",
+            "exec --json --color never --skip-git-repo-check --config model_reasoning_summary=concise -",
+            "exec resume --json --skip-git-repo-check --config model_reasoning_summary=concise thread-shared -",
         ]
     );
     assert!(
@@ -266,8 +266,8 @@ async fn session_isolation_separates_backend_sessions_and_reuses_workspace() {
     assert_eq!(
         invocations.lines().collect::<Vec<_>>(),
         vec![
-            "exec --json --color never --config model_reasoning_summary=concise -",
-            "exec --json --color never --config model_reasoning_summary=concise -",
+            "exec --json --color never --skip-git-repo-check --config model_reasoning_summary=concise -",
+            "exec --json --color never --skip-git-repo-check --config model_reasoning_summary=concise -",
         ]
     );
     assert_eq!(
@@ -351,8 +351,8 @@ async fn replaces_a_missing_agent_session_with_a_new_session() {
     assert_eq!(
         invocations.lines().collect::<Vec<_>>(),
         vec![
-            "exec resume --json --config model_reasoning_summary=concise missing -",
-            "exec --json --color never --config model_reasoning_summary=concise -",
+            "exec resume --json --skip-git-repo-check --config model_reasoning_summary=concise missing -",
+            "exec --json --color never --skip-git-repo-check --config model_reasoning_summary=concise -",
         ]
     );
     assert_eq!(

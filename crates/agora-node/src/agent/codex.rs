@@ -61,6 +61,7 @@ impl CodexAgent {
                 "never".to_string(),
             ],
         };
+        args.push("--skip-git-repo-check".to_string());
         self.append_options(&mut args);
         for path in image_paths {
             args.push("--image".to_string());

@@ -70,8 +70,8 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
     assert_eq!(
         invocations.lines().collect::<Vec<_>>(),
         vec![
-            "exec --json --color never --model gpt-5.4 --config model_reasoning_effort=xhigh --config sandbox_mode=\"danger-full-access\" --config approval_policy=\"never\" --config model_reasoning_summary=concise -",
-            "exec resume --json --model gpt-5.4 --config model_reasoning_effort=xhigh --config sandbox_mode=\"danger-full-access\" --config approval_policy=\"never\" --config model_reasoning_summary=concise thread-123 -",
+            "exec --json --color never --skip-git-repo-check --model gpt-5.4 --config model_reasoning_effort=xhigh --config sandbox_mode=\"danger-full-access\" --config approval_policy=\"never\" --config model_reasoning_summary=concise -",
+            "exec resume --json --skip-git-repo-check --model gpt-5.4 --config model_reasoning_effort=xhigh --config sandbox_mode=\"danger-full-access\" --config approval_policy=\"never\" --config model_reasoning_summary=concise thread-123 -",
         ]
     );
     assert_eq!(
