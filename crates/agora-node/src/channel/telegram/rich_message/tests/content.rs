@@ -1,6 +1,59 @@
 use super::*;
 
 #[test]
+fn telegram_terminal_header_combines_agent_and_status() {
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.apply(RunEvent::Completed { exit_code: 0 });
+
+    assert_eq!(content.render(false), "## codex-dev · ✓ 已完成");
+}
+
+#[test]
+fn telegram_terminal_answer_uses_an_open_details_section() {
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.apply(RunEvent::Output(OutputEvent::Answer {
+        text: "**All checks passed.**".to_string(),
+    }));
+    content.apply(RunEvent::Completed { exit_code: 0 });
+
+    assert_eq!(
+        content.render(false),
+        "## codex-dev · ✓ 已完成\n\n<details open><summary>最终回答</summary>\n\n**All checks passed.**\n\n</details>"
+    );
+}
+
+#[test]
+fn telegram_answer_with_details_markup_uses_the_safe_unwrapped_fallback() {
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.apply(RunEvent::Output(OutputEvent::Answer {
+        text: "Treat </DETAILS> as literal text.".to_string(),
+    }));
+    content.apply(RunEvent::Completed { exit_code: 0 });
+
+    assert_eq!(
+        content.render(false),
+        "## codex-dev · ✓ 已完成\n\n### 最终回答\n\nTreat </DETAILS> as literal text."
+    );
+}
+
+#[test]
+fn telegram_terminal_usage_uses_a_two_line_footer() {
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.apply(RunEvent::Output(OutputEvent::Usage(TokenUsage {
+        input_tokens: 42_800,
+        cached_input_tokens: 31_600,
+        output_tokens: 3_200,
+        reasoning_output_tokens: 1_900,
+    })));
+    content.apply(RunEvent::Completed { exit_code: 0 });
+
+    assert_eq!(
+        content.render(false),
+        "## codex-dev · ✓ 已完成\n\n<footer>46.0K tokens · Input 42.8K · 31.6K cached\nOutput 3.2K · Reasoning 1.9K</footer>"
+    );
+}
+
+#[test]
 fn telegram_rich_message_groups_thinking_and_commands_into_ordered_phases() {
     let mut content = TelegramRichContent::new("codex-dev".to_string());
     content.apply(RunEvent::Output(OutputEvent::Thinking {
@@ -28,7 +81,7 @@ fn telegram_rich_message_groups_thinking_and_commands_into_ordered_phases() {
 
     let rendered = content.render(false);
 
-    assert!(rendered.starts_with("## codex-dev\n\n> **已完成**"));
+    assert!(rendered.starts_with("## codex-dev · ✓ 已完成"));
     assert!(rendered.contains("**01 · 思考过程**\n\n> ✦ Inspecting &lt;the project&gt;"));
     assert!(rendered.contains("**02 · 思考过程**\n\n> ✦ Checking the tests"));
     assert!(rendered.contains(
@@ -36,17 +89,17 @@ fn telegram_rich_message_groups_thinking_and_commands_into_ordered_phases() {
     ));
     assert!(rendered.find("Inspecting") < rendered.find("Checking"));
     assert!(rendered.find("Checking") < rendered.find("# SHELL"));
-    let answer = rendered.find("### 最终回答").unwrap();
+    let answer = rendered
+        .find("<details open><summary>最终回答</summary>")
+        .unwrap();
     let process = rendered.find("<details><summary>").unwrap();
-    let usage = rendered.find("*46.0K tokens").unwrap();
+    let usage = rendered.find("<footer>46.0K tokens").unwrap();
     assert!(answer < process);
     assert!(process < usage);
     assert!(rendered.contains("**All checks passed.**"));
-    assert!(
-        rendered.ends_with(
-            "*46.0K tokens · Input 42.8K · 31.6K cached · Output 3.2K · Reasoning 1.9K*"
-        )
-    );
+    assert!(rendered.ends_with(
+        "<footer>46.0K tokens · Input 42.8K · 31.6K cached\nOutput 3.2K · Reasoning 1.9K</footer>"
+    ));
 }
 
 #[test]
@@ -68,7 +121,7 @@ fn telegram_rich_message_expands_the_process_while_running() {
     let rendered = content.render(false);
     assert!(
         rendered.starts_with(
-            "## codex-dev\n\n> **运行中**\n\n<details open><summary>任务过程 · 2 个阶段 · ● 1 项进行中</summary>"
+            "## codex-dev · ● 运行中\n\n<details open><summary>任务过程 · 2 个阶段 · ● 1 项进行中</summary>"
         )
     );
     assert!(rendered.contains(
@@ -251,14 +304,11 @@ fn telegram_rich_message_splits_oversized_content_without_losing_output() {
         messages
             .first()
             .unwrap()
-            .starts_with("## codex-dev\n\n> **已完成**")
+            .starts_with("## codex-dev · ✓ 已完成")
     );
-    assert!(
-        messages
-            .last()
-            .unwrap()
-            .ends_with("*2.0K tokens · Input 1.5K · 1.0K cached · Output 500 · Reasoning 250*")
-    );
+    assert!(messages.last().unwrap().ends_with(
+        "<footer>2.0K tokens · Input 1.5K · 1.0K cached\nOutput 500 · Reasoning 250</footer>"
+    ));
 }
 
 #[test]
@@ -311,10 +361,7 @@ fn telegram_rich_message_uses_native_thinking_only_for_active_drafts() {
     );
     assert_eq!(
         content.render(false),
-        format!(
-            "## codex-dev\n\n> **运行中**\n\n> {}",
-            i18n::WAITING_FOR_AGENT
-        )
+        format!("## codex-dev · ● 运行中\n\n> {}", i18n::WAITING_FOR_AGENT)
     );
 
     content.apply(RunEvent::Output(OutputEvent::Thinking {
@@ -336,13 +383,15 @@ fn telegram_rich_message_uses_native_thinking_only_for_active_drafts() {
     content.apply(RunEvent::Completed { exit_code: 0 });
     assert!(!content.render(true).contains("<tg-thinking>"));
     let rendered = content.render(false);
-    assert!(rendered.starts_with(
-        "## codex-dev\n\n> **已完成**\n\n<details><summary>任务过程 · 1 个阶段</summary>"
-    ));
-    assert!(rendered.contains("**01 · 思考过程**\n\n> ✦ Reviewing the change"));
     assert!(
-        rendered.ends_with("*1.0K tokens · Input 800 · 600 cached · Output 200 · Reasoning 100*")
+        rendered.starts_with(
+            "## codex-dev · ✓ 已完成\n\n<details><summary>任务过程 · 1 个阶段</summary>"
+        )
     );
+    assert!(rendered.contains("**01 · 思考过程**\n\n> ✦ Reviewing the change"));
+    assert!(rendered.ends_with(
+        "<footer>1.0K tokens · Input 800 · 600 cached\nOutput 200 · Reasoning 100</footer>"
+    ));
 }
 
 #[test]
@@ -351,7 +400,7 @@ fn telegram_rich_message_renders_queue_stop_and_interruption_states() {
     queued.apply(RunEvent::Queued { ahead: 2 });
     assert_eq!(
         queued.render(false),
-        "## codex-dev\n\n> **排队中**\n\n> 正在排队，前面还有 2 个任务..."
+        "## codex-dev · ○ 排队中\n\n> 正在排队，前面还有 2 个任务..."
     );
 
     let mut stopped = TelegramRichContent::new("codex-dev".to_string());
@@ -360,13 +409,15 @@ fn telegram_rich_message_renders_queue_stop_and_interruption_states() {
     }));
     stopped.apply(RunEvent::Stopped);
     let stopped = stopped.render(false);
-    assert!(stopped.starts_with("## codex-dev\n\n> **已停止**\n\n**任务已停止**"));
-    assert!(stopped.contains("### 部分回答\n\nPartial work"));
+    assert!(stopped.starts_with("## codex-dev · ■ 已停止\n\n**任务已停止**"));
+    assert!(
+        stopped.contains("<details open><summary>部分回答</summary>\n\nPartial work\n\n</details>")
+    );
 
     let mut interrupted = TelegramRichContent::new("codex-dev".to_string());
     interrupted.apply(RunEvent::Interrupted);
     let interrupted = interrupted.render(false);
-    assert!(interrupted.starts_with("## codex-dev\n\n> **已中断**\n\n**任务已中断**"));
+    assert!(interrupted.starts_with("## codex-dev · ! 已中断\n\n**任务已中断**"));
     assert!(interrupted.contains("Agora Node 即将退出"));
 }
 
@@ -379,7 +430,7 @@ fn telegram_rich_message_hides_raw_failure_details() {
 
     let rendered = content.render(false);
 
-    assert!(rendered.starts_with("## codex-dev\n\n> **失败**\n\n**任务失败**"));
+    assert!(rendered.starts_with("## codex-dev · × 失败\n\n**任务失败**"));
     assert!(rendered.contains("Agent 进程在完成任务前退出。"));
     assert!(!rendered.contains("token=abc"));
 }
@@ -448,7 +499,7 @@ fn telegram_truncated_terminal_output_keeps_usage_and_partial_answer_state() {
     completed.apply(RunEvent::Output(OutputEvent::Usage(usage)));
     completed.apply(RunEvent::Completed { exit_code: 0 });
     let truncated = completed.render_truncated(false);
-    assert!(truncated.starts_with("## codex-dev\n\n> **已完成**"));
+    assert!(truncated.starts_with("## codex-dev · ✓ 已完成"));
     assert!(truncated.contains("1.0M tokens"));
     assert!(truncated.contains("Input 1.0M"));
 
@@ -461,9 +512,23 @@ fn telegram_truncated_terminal_output_keeps_usage_and_partial_answer_state() {
     });
     let truncated = failed.render_truncated(false);
     assert!(TelegramRichContent::within_limits(&truncated));
-    assert!(truncated.starts_with("## codex-dev\n\n> **失败**"));
+    assert!(truncated.starts_with("## codex-dev · × 失败"));
     assert!(truncated.contains(i18n::PARTIAL_ANSWER_TITLE));
     assert!(truncated.contains("&lt;&amp;&gt;"));
+}
+
+#[test]
+fn telegram_truncated_terminal_answer_keeps_an_open_details_section() {
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.apply(RunEvent::Output(OutputEvent::Answer {
+        text: "long answer\n".repeat(4_000),
+    }));
+    content.apply(RunEvent::Stopped);
+
+    let rendered = content.render_truncated(false);
+
+    assert!(rendered.contains("<details open><summary>部分回答</summary>\n\n<pre>"));
+    assert!(rendered.contains("</pre>\n\n</details>"));
 }
 
 #[test]

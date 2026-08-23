@@ -156,9 +156,11 @@ async fn private_run_streams_a_draft_and_persists_one_final_reply() {
     assert_eq!(final_body["reply_parameters"]["message_id"], 7);
     assert_eq!(final_body["message_thread_id"], 44);
     let final_markdown = final_body["rich_message"]["markdown"].as_str().unwrap();
-    assert!(final_markdown.starts_with(
-        "## codex-dev\n\n> **已完成**\n\n<details><summary>任务过程 · 3 个阶段</summary>"
-    ));
+    assert!(
+        final_markdown.starts_with(
+            "## codex-dev · ✓ 已完成\n\n<details><summary>任务过程 · 3 个阶段</summary>"
+        )
+    );
     assert!(final_markdown.contains("**01 · 思考过程**\n\n> ✦ Thinking 0"));
     assert!(final_markdown.contains("**03 · 思考过程**\n\n> ✦ Thinking 2"));
     assert!(final_markdown.ends_with("</details>"));

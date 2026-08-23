@@ -579,10 +579,22 @@ impl TelegramRichContent {
             TelegramRunState::Interrupted => RunStatus::Interrupted,
         };
         format!(
-            "## {}\n\n> **{}**",
+            "## {} · {} {}",
             Self::escape_structural_text(&self.agent_name),
+            Self::run_status_marker(status),
             i18n::run_status(status)
         )
+    }
+
+    fn run_status_marker(status: RunStatus) -> &'static str {
+        match status {
+            RunStatus::Queued => "○",
+            RunStatus::Running => "●",
+            RunStatus::Completed => "✓",
+            RunStatus::Failed => "×",
+            RunStatus::Stopped => "■",
+            RunStatus::Interrupted => "!",
+        }
     }
 
     fn answer_section(&self) -> Option<String> {
@@ -596,10 +608,28 @@ impl TelegramRichContent {
         } else {
             None
         };
-        Some(title.map_or_else(
-            || self.answer.clone(),
-            |title| format!("### {title}\n\n{}", self.answer),
-        ))
+        let Some(title) = title else {
+            return Some(self.answer.clone());
+        };
+        let details = format!(
+            "<details open><summary>{title}</summary>\n\n{}\n\n</details>",
+            self.answer
+        );
+        if !Self::contains_details_markup(&self.answer) && Self::within_limits(&details) {
+            Some(details)
+        } else {
+            Some(format!("### {title}\n\n{}", self.answer))
+        }
+    }
+
+    fn contains_details_markup(text: &str) -> bool {
+        const MARKERS: [&str; 4] = ["<details", "</details", "<summary", "</summary"];
+        let bytes = text.as_bytes();
+        MARKERS.iter().any(|marker| {
+            bytes
+                .windows(marker.len())
+                .any(|window| window.eq_ignore_ascii_case(marker.as_bytes()))
+        })
     }
 
     fn split_sections(sections: Vec<String>) -> Vec<String> {
@@ -733,17 +763,26 @@ impl TelegramRichContent {
             return sections.join("\n\n");
         }
 
-        let answer_heading = if self.has_partial_answer() {
-            format!("### {}\n\n", i18n::PARTIAL_ANSWER_TITLE)
+        let answer_title = if self.has_partial_answer() {
+            Some(i18n::PARTIAL_ANSWER_TITLE)
         } else if matches!(self.state, TelegramRunState::Completed) {
-            format!("### {}\n\n", i18n::FINAL_ANSWER_TITLE)
+            Some(i18n::FINAL_ANSWER_TITLE)
         } else {
-            String::new()
+            None
         };
-        let prefix = format!("{}\n\n{answer_heading}<pre>", sections.join("\n\n"));
+        let answer_opening = answer_title.map_or_else(
+            || "<pre>".to_string(),
+            |title| format!("<details open><summary>{title}</summary>\n\n<pre>"),
+        );
+        let answer_closing = if answer_title.is_some() {
+            "</pre>\n\n</details>"
+        } else {
+            "</pre>"
+        };
+        let prefix = format!("{}\n\n{answer_opening}", sections.join("\n\n"));
         let closing = usage
-            .map(|usage| format!("</pre>\n\n{usage}"))
-            .unwrap_or_else(|| "</pre>".to_string());
+            .map(|usage| format!("{answer_closing}\n\n{usage}"))
+            .unwrap_or_else(|| answer_closing.to_string());
         let answer_budget = TELEGRAM_RICH_MESSAGE_MAX_CHARS
             .saturating_sub(prefix.chars().count())
             .saturating_sub(closing.chars().count());
@@ -1117,7 +1156,7 @@ impl TelegramRichContent {
     fn usage_section(usage: TokenUsage) -> String {
         let total = usage.input_tokens.saturating_add(usage.output_tokens);
         format!(
-            "*{} {} · {} {} · {} · {} {} · {} {}*",
+            "<footer>{} {} · {} {} · {}\n{} {} · {} {}</footer>",
             Self::format_tokens(total),
             i18n::TOKENS,
             i18n::INPUT,
