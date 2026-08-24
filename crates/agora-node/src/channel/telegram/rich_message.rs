@@ -546,18 +546,11 @@ impl TelegramRichContent {
             sections.push(section);
         }
 
-        if self.is_terminal()
-            && let Some(section) = self.answer_section()
-        {
+        if let Some(section) = self.answer_section() {
             sections.push(section);
         }
         if (!draft || self.is_terminal())
             && let Some(section) = self.process_section()
-        {
-            sections.push(section);
-        }
-        if !self.is_terminal()
-            && let Some(section) = self.answer_section()
         {
             sections.push(section);
         }
@@ -579,7 +572,7 @@ impl TelegramRichContent {
             TelegramRunState::Interrupted => RunStatus::Interrupted,
         };
         format!(
-            "## {} · {} {}",
+            "**{}** · {} {}",
             Self::escape_structural_text(&self.agent_name),
             Self::run_status_marker(status),
             i18n::run_status(status)
@@ -1016,7 +1009,7 @@ impl TelegramRichContent {
     }
 
     fn render_process_section(&self, phases: &VecDeque<String>, omitted: usize) -> String {
-        let opening = if self.is_terminal() {
+        let opening = if self.is_terminal() || !self.answer.is_empty() {
             "<details>"
         } else {
             "<details open>"

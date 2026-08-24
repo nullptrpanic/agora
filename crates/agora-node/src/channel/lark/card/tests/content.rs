@@ -165,10 +165,6 @@ fn lark_card_uses_chinese_system_labels() {
     assert!(rendered.contains("1 个阶段"));
     assert!(rendered.contains("1 项已完成"));
     assert!(rendered.contains("**最终回答**"));
-    assert!(rendered.contains("<font color='grey'>Total</font>"));
-    assert!(rendered.contains("<font color='grey'>Input</font>"));
-    assert!(rendered.contains("<font color='grey'>Output</font>"));
-    assert!(rendered.contains("<font color='grey'>Reasoning</font>"));
 }
 
 #[test]
@@ -565,6 +561,32 @@ fn lark_card_groups_process_and_keeps_final_answer_separate() {
 }
 
 #[test]
+fn lark_card_promotes_a_streaming_answer_and_collapses_the_process() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::Thinking {
+        text: "Inspecting the channel".to_string(),
+    });
+    content.apply_output(OutputEvent::Answer {
+        text: "The answer has started.".to_string(),
+    });
+
+    let card = content.build_card();
+    let elements = card
+        .pointer("/body/elements")
+        .and_then(serde_json::Value::as_array)
+        .unwrap();
+
+    assert!(
+        elements[0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("The answer has started."))
+    );
+    assert_eq!(elements[1]["tag"], "hr");
+    assert_eq!(elements[2]["tag"], "collapsible_panel");
+    assert_eq!(elements[2]["expanded"], false);
+}
+
+#[test]
 fn lark_card_shows_a_placeholder_before_agent_output() {
     let content = LarkCardContent::new("codex-dev".to_string());
 
@@ -574,19 +596,22 @@ fn lark_card_shows_a_placeholder_before_agent_output() {
 }
 
 #[test]
-fn lark_card_shows_a_bottom_stop_button_only_while_the_task_is_active() {
+fn lark_card_shows_a_top_stop_button_only_while_the_task_is_active() {
     let mut content = LarkCardContent::with_interrupt(
         "codex-dev".to_string(),
         Some("interrupt-42".to_string()),
         LarkConversation::Private,
     );
+    content.apply_output(OutputEvent::Thinking {
+        text: "Inspecting the channel".to_string(),
+    });
 
     let running = content.build_card();
     let elements = running
         .pointer("/body/elements")
         .and_then(serde_json::Value::as_array)
         .unwrap();
-    let action_row = elements.last().unwrap();
+    let action_row = elements.first().unwrap();
     let button = action_row.pointer("/columns/0/elements/0").unwrap();
 
     assert_eq!(action_row["tag"], "column_set");
@@ -808,7 +833,7 @@ fn tagged_element_count(value: &serde_json::Value) -> usize {
 }
 
 #[test]
-fn lark_card_renders_token_usage_without_a_heading() {
+fn lark_card_renders_token_usage_in_four_columns() {
     let mut content = LarkCardContent::new("codex-dev".to_string());
     content.apply_output(OutputEvent::Answer {
         text: "All checks passed.".to_string(),

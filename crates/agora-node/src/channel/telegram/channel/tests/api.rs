@@ -810,7 +810,7 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
     assert_eq!(
         active["rich_message"]["markdown"],
         format!(
-            "## codex · ● 运行中\n\n> {}",
+            "**codex** · ● 运行中\n\n> {}",
             crate::i18n::WAITING_FOR_AGENT
         )
     );

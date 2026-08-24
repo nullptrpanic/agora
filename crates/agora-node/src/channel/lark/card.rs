@@ -481,6 +481,7 @@ impl LarkCardContent {
             &self.state,
             LarkRunState::Queued { .. } | LarkRunState::Running
         );
+        let answer_started = !self.answer.is_empty();
         let mut elements = Vec::new();
         let mut process_element = if self.process.is_empty() {
             None
@@ -497,11 +498,17 @@ impl LarkCardContent {
                     i18n::PROCESS_TITLE,
                     i18n::phase_count(self.process.len())
                 ),
-                !finished,
+                !finished && !answer_started,
                 self.process_elements(),
             ))
         };
-        if !finished && let Some(process) = process_element.take() {
+        if !finished && let Some(action_row) = self.action_row() {
+            elements.push(action_row);
+        }
+        if !finished
+            && !answer_started
+            && let Some(process) = process_element.take()
+        {
             elements.push(process);
         }
 
@@ -577,7 +584,9 @@ impl LarkCardContent {
             }));
         }
 
-        if finished && let Some(process) = process_element {
+        if (finished || answer_started)
+            && let Some(process) = process_element
+        {
             if !elements.is_empty() {
                 elements.push(json!({ "tag": "hr" }));
             }
@@ -591,7 +600,10 @@ impl LarkCardContent {
             elements.push(Self::usage_element(usage));
         }
 
-        if elements.is_empty() && !finished {
+        if self.process.is_empty() && self.answer.is_empty() && !finished {
+            if !elements.is_empty() {
+                elements.push(json!({ "tag": "hr" }));
+            }
             elements.push(json!({
                 "tag": "markdown",
                 "content": match &self.state {
@@ -601,15 +613,6 @@ impl LarkCardContent {
                     _ => format!("> {}", i18n::WAITING_FOR_AGENT),
                 }
             }));
-        }
-
-        if !finished && self.interrupt.is_some() {
-            if !elements.is_empty() {
-                elements.push(json!({ "tag": "hr" }));
-            }
-            if let Some(action_row) = self.action_row() {
-                elements.push(action_row);
-            }
         }
 
         let mut card = json!({
