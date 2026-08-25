@@ -18,6 +18,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -371,6 +372,123 @@ async fn test_upstream_roots_require_tls_interception() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn sandbox_spawn_returns_a_running_child() {
+    let root = std::env::temp_dir().join(format!("agora-spawn-run-{}", uuid::Uuid::new_v4()));
+    let config = SandboxConfig::new(built_hook_library())
+        .with_workdir(&root)
+        .with_encrypted_workspace("test-filesystem-key");
+
+    let mut child = Sandbox::new(config, NoopCallback)
+        .spawn(SandboxCommand::new("/bin/sleep").arg("30"))
+        .await
+        .unwrap();
+
+    assert!(child.id().is_some());
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().await.unwrap();
+    let outcome = child.wait().await.unwrap();
+    assert!(!outcome.status().success());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn sandbox_child_exposes_standard_piped_output_fields() {
+    let root = std::env::temp_dir().join(format!("agora-piped-run-{}", uuid::Uuid::new_v4()));
+    let config = SandboxConfig::new(built_hook_library())
+        .with_workdir(&root)
+        .with_encrypted_workspace("test-filesystem-key");
+    let command = SandboxCommand::new("/bin/sh")
+        .args(["-c", "printf stdout; printf stderr >&2; exit 7"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = Sandbox::new(config, NoopCallback)
+        .spawn(command)
+        .await
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let read_stdout = async move {
+        let mut output = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut output)
+            .await
+            .unwrap();
+        output
+    };
+    let read_stderr = async move {
+        let mut output = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut output)
+            .await
+            .unwrap();
+        output
+    };
+
+    let (stdout, stderr, outcome) = tokio::join!(read_stdout, read_stderr, child.wait());
+    let outcome = outcome.unwrap();
+    assert_eq!(outcome.status().code(), Some(7));
+    assert_eq!(stdout, b"stdout");
+    assert_eq!(stderr, b"stderr");
+    assert!(!outcome.sandbox_id().is_empty());
+    assert!(!outcome.run_id().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn sandbox_child_exposes_standard_piped_stdin_field() {
+    let root = std::env::temp_dir().join(format!("agora-piped-input-{}", uuid::Uuid::new_v4()));
+    let config = SandboxConfig::new(built_hook_library())
+        .with_workdir(&root)
+        .with_encrypted_workspace("test-filesystem-key");
+    let command = SandboxCommand::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+
+    let mut child = Sandbox::new(config, NoopCallback)
+        .spawn(command)
+        .await
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut stdin, b"input")
+        .await
+        .unwrap();
+    drop(stdin);
+    let mut output = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut output)
+        .await
+        .unwrap();
+
+    let outcome = child.wait().await.unwrap();
+    assert!(outcome.status().success());
+    assert_eq!(output, b"input");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn sandbox_child_wait_can_return_the_cached_status_again() {
+    let root = std::env::temp_dir().join(format!("agora-repeat-wait-{}", uuid::Uuid::new_v4()));
+    let config = SandboxConfig::new(built_hook_library())
+        .with_workdir(&root)
+        .with_encrypted_workspace("test-filesystem-key");
+
+    let mut child = Sandbox::new(config, NoopCallback)
+        .spawn(SandboxCommand::new("/usr/bin/true"))
+        .await
+        .unwrap();
+    let first = child.wait().await.unwrap();
+    let second = child.wait().await.unwrap();
+
+    assert_eq!(first.status(), second.status());
+    assert_eq!(first.sandbox_id(), second.sandbox_id());
+    assert_eq!(first.run_id(), second.run_id());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn sandbox_outcome_exposes_status_and_identifiers() {
     let status = std::process::Command::new("/usr/bin/true")
@@ -430,7 +548,7 @@ fn sandbox_config_and_command_builders_preserve_runtime_inputs() {
     assert_eq!(command.environment.get(OsStr::new("KEY")).unwrap(), "value");
     assert_eq!(command.current_dir.as_deref(), Some(Path::new("/tmp")));
     assert_eq!(
-        command.clone().into_command().as_std().get_current_dir(),
+        command.into_command().as_std().get_current_dir(),
         Some(Path::new("/tmp"))
     );
     assert_eq!(

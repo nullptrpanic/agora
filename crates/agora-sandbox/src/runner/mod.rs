@@ -47,10 +47,7 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
-#[cfg(target_os = "macos")]
-use std::process::Stdio;
-#[cfg(target_os = "macos")]
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 #[cfg(target_os = "macos")]
 use tokio::process::Command;
@@ -573,12 +570,15 @@ fn path_aliases_overlap(
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SandboxCommand {
     program: OsString,
     arguments: Vec<OsString>,
     environment: BTreeMap<OsString, OsString>,
     current_dir: Option<PathBuf>,
+    stdin: Option<Stdio>,
+    stdout: Option<Stdio>,
+    stderr: Option<Stdio>,
 }
 
 impl SandboxCommand {
@@ -588,6 +588,9 @@ impl SandboxCommand {
             arguments: Vec::new(),
             environment: BTreeMap::new(),
             current_dir: None,
+            stdin: None,
+            stdout: None,
+            stderr: None,
         }
     }
 
@@ -615,6 +618,30 @@ impl SandboxCommand {
         self
     }
 
+    pub fn stdin<T>(mut self, stdio: T) -> Self
+    where
+        T: Into<Stdio>,
+    {
+        self.stdin = Some(stdio.into());
+        self
+    }
+
+    pub fn stdout<T>(mut self, stdio: T) -> Self
+    where
+        T: Into<Stdio>,
+    {
+        self.stdout = Some(stdio.into());
+        self
+    }
+
+    pub fn stderr<T>(mut self, stdio: T) -> Self
+    where
+        T: Into<Stdio>,
+    {
+        self.stderr = Some(stdio.into());
+        self
+    }
+
     #[cfg(target_os = "macos")]
     fn into_command(self) -> Command {
         let mut command = Command::new(self.program);
@@ -622,6 +649,15 @@ impl SandboxCommand {
         command.envs(self.environment);
         if let Some(current_dir) = self.current_dir {
             command.current_dir(current_dir);
+        }
+        if let Some(stdin) = self.stdin {
+            command.stdin(stdin);
+        }
+        if let Some(stdout) = self.stdout {
+            command.stdout(stdout);
+        }
+        if let Some(stderr) = self.stderr {
+            command.stderr(stderr);
         }
         command
     }
@@ -680,6 +716,73 @@ impl SandboxCommand {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub struct SandboxChild {
+    pub stdin: Option<tokio::process::ChildStdin>,
+    pub stdout: Option<tokio::process::ChildStdout>,
+    pub stderr: Option<tokio::process::ChildStderr>,
+    command: RunningSandboxCommand,
+    runtime: Option<SandboxRuntime>,
+    shutdown: Option<tokio::task::JoinHandle<Result<()>>>,
+    status: Option<ExitStatus>,
+    failure: Option<String>,
+    sandbox_id: String,
+    run_id: String,
+}
+
+#[cfg(target_os = "macos")]
+impl SandboxChild {
+    pub fn id(&self) -> Option<u32> {
+        self.command.id()
+    }
+
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.command.try_wait()
+    }
+
+    pub async fn kill(&mut self) -> Result<()> {
+        self.command.kill().await
+    }
+
+    pub async fn wait(&mut self) -> Result<SandboxOutcome> {
+        if self.status.is_none() && self.failure.is_none() {
+            drop(self.stdin.take());
+            let runtime = self
+                .runtime
+                .as_mut()
+                .context("sandbox child runtime is unavailable")?;
+            match self.command.wait_or_failure(runtime.wait_failure()).await {
+                Ok(status) => self.status = Some(status),
+                Err(error) => self.failure = Some(error.to_string()),
+            }
+        }
+        if self.shutdown.is_none()
+            && let Some(runtime) = self.runtime.take()
+        {
+            self.shutdown = Some(tokio::spawn(runtime.shutdown()));
+        }
+        if let Some(shutdown) = self.shutdown.as_mut() {
+            let result = shutdown.await;
+            self.shutdown = None;
+            if let Err(error) = result
+                .context("sandbox runtime shutdown task failed")
+                .and_then(|result| result)
+            {
+                self.failure.get_or_insert_with(|| error.to_string());
+            }
+        }
+        if let Some(error) = &self.failure {
+            bail!("{error}");
+        }
+        let status = self.status.context("sandbox child status is unavailable")?;
+        Ok(SandboxOutcome {
+            status,
+            sandbox_id: self.sandbox_id.clone(),
+            run_id: self.run_id.clone(),
+        })
+    }
+}
+
 pub struct Sandbox<C>
 where
     C: Callback,
@@ -697,9 +800,18 @@ where
     }
 
     #[cfg(target_os = "macos")]
-    pub async fn run(self, command: SandboxCommand) -> Result<SandboxOutcome> {
+    pub async fn spawn(self, command: SandboxCommand) -> Result<SandboxChild> {
+        self.spawn_with_foreground(command, false).await
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn spawn_with_foreground(
+        self,
+        command: SandboxCommand,
+        foreground: bool,
+    ) -> Result<SandboxChild> {
         let executable = command.resolved_program()?;
-        let mut runtime = SandboxRuntime::start(self.config, self.callback).await?;
+        let runtime = SandboxRuntime::start(self.config, self.callback).await?;
         let sandbox_id = runtime.sandbox_id().to_owned();
         let run_id = runtime.run_id().to_owned();
         let launch = match runtime.prepare(executable).await {
@@ -709,22 +821,32 @@ where
                 return Err(error);
             }
         };
-        let mut child = match RunningSandboxCommand::spawn(command, &launch) {
+        let mut command = match RunningSandboxCommand::spawn(command, &launch, foreground) {
             Ok(child) => child,
             Err(error) => {
                 let _ = runtime.shutdown().await;
                 return Err(error);
             }
         };
-        let status = child.wait_or_failure(runtime.wait_failure()).await;
-        let shutdown = runtime.shutdown().await;
-        let status = status?;
-        shutdown?;
-        Ok(SandboxOutcome {
-            status,
+        let (stdin, stdout, stderr) = command.take_stdio();
+        Ok(SandboxChild {
+            stdin,
+            stdout,
+            stderr,
+            command,
+            runtime: Some(runtime),
+            shutdown: None,
+            status: None,
+            failure: None,
             sandbox_id,
             run_id,
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn run(self, command: SandboxCommand) -> Result<SandboxOutcome> {
+        let mut child = self.spawn_with_foreground(command, true).await?;
+        child.wait().await
     }
 
     #[cfg(not(target_os = "macos"))]

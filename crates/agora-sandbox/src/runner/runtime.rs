@@ -530,17 +530,17 @@ pub(crate) struct RunningSandboxCommand {
 }
 
 impl RunningSandboxCommand {
-    pub(crate) fn spawn(mut command: SandboxCommand, launch: &PreparedLaunch) -> Result<Self> {
+    pub(crate) fn spawn(
+        mut command: SandboxCommand,
+        launch: &PreparedLaunch,
+        foreground: bool,
+    ) -> Result<Self> {
         let inherited_libraries = command.effective_environment("DYLD_INSERT_LIBRARIES");
         let inherited_java_options = command.effective_environment(JAVA_TOOL_OPTIONS_ENVIRONMENT);
         let inherited_java_store = command.effective_environment(JAVA_TRUST_STORE_ENVIRONMENT);
         command.apply_prepared(launch);
         let mut child = command.into_command();
-        child
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
+        child.kill_on_drop(true);
         launch.environment.apply(&mut child);
         if let Some(java_store) = launch
             .environment
@@ -577,7 +577,11 @@ impl RunningSandboxCommand {
                 .env(HOOK_LIBRARIES, libraries);
         }
         child.as_std_mut().process_group(0);
-        let mut terminal = ForegroundTerminal::capture()?;
+        let mut terminal = if foreground {
+            ForegroundTerminal::capture()?
+        } else {
+            None
+        };
         let child = child.spawn().context("failed to start sandbox child")?;
         let process_group = child
             .id()
@@ -594,6 +598,39 @@ impl RunningSandboxCommand {
             process_group: Some(process_group),
             terminal,
         })
+    }
+
+    pub(crate) fn take_stdio(
+        &mut self,
+    ) -> (
+        Option<tokio::process::ChildStdin>,
+        Option<tokio::process::ChildStdout>,
+        Option<tokio::process::ChildStderr>,
+    ) {
+        (
+            self.child.stdin.take(),
+            self.child.stdout.take(),
+            self.child.stderr.take(),
+        )
+    }
+
+    pub(crate) fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    pub(crate) async fn kill(&mut self) -> Result<()> {
+        let process_group = self
+            .process_group
+            .context("running sandbox command has no process group")?;
+        signal_process_group(process_group, libc::SIGKILL)?;
+        if self.child.try_wait()?.is_none() {
+            self.child.wait().await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn wait_or_failure<F>(&mut self, failure: F) -> Result<ExitStatus>

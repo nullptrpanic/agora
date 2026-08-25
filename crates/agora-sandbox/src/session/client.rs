@@ -180,7 +180,7 @@ async fn run_prepared(
     command: SandboxCommand,
     mut prepared: PreparedConnection,
 ) -> Result<SandboxOutcome> {
-    let mut child = match RunningSandboxCommand::spawn(command, &prepared.launch) {
+    let mut child = match RunningSandboxCommand::spawn(command, &prepared.launch, true) {
         Ok(child) => child,
         Err(error) => {
             let _ = cancel_launch(&mut prepared).await;
