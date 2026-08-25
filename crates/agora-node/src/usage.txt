@@ -1,0 +1,110 @@
+CONFIGURATION FILE (JSON)
+
+QUICK START
+  Generate a configuration:
+    agora-node config --generate config.json
+
+  Start the daemon:
+    agora-node daemon --config config.json
+
+  Relative paths use the current directory. Absolute paths are accepted.
+  Existing files are overwritten. Generated channels deny all incoming messages
+  until permission.users and, for groups, permission.groups are configured.
+
+MINIMAL CONFIGURATION
+  {
+    "channels": [
+      {
+        "type": "lark",
+        "name": "lark1",
+        "app_id": "xxx",
+        "secret": "xxx",
+        "permission": {
+          "users": [
+            { "id": "ou_user_1" }
+          ],
+          "groups": [
+            { "id": "oc_group_1", "require_mention": true }
+          ]
+        }
+      }
+    ],
+    "agents": [
+      {
+        "name": "codex",
+        "isolate": "session",
+        "type": "codex",
+        "path": "/opt/homebrew/bin/codex",
+        "subscribe": [
+          { "channel": "lark1" }
+        ]
+      }
+    ]
+  }
+
+CHANNEL PERMISSIONS
+  Private messages require the sender to match permission.users.
+  Group messages require both permission.users and permission.groups to match.
+  Empty or omitted permission lists deny all access.
+  Use "*" as an id to explicitly allow every user or group.
+  require_mention defaults to false. An exact group policy takes precedence over
+  the "*" group policy.
+
+FIELD REFERENCE
+  Top level
+    proxy                    Optional default HTTP proxy for agents and channels.
+    runtime                  Optional process-local capacity and concurrency limits.
+    channels                 Reusable channel definitions.
+    agents                   Local agent definitions.
+
+  Runtime fields
+    max_in_flight_tasks      Maximum accepted channel tasks; defaults to 32.
+    max_in_flight_runs       Maximum admitted agent runs; defaults to 64 and must
+                             fit every channel's complete subscribed-agent fan-out.
+    max_concurrent_runs      Maximum concurrently executing agent backends; defaults
+                             to 4 and cannot exceed max_in_flight_runs.
+
+  Channel fields
+    type                     Active types: "lark" and "telegram". "local" and
+                             "http" are reserved and not active yet.
+    name                     Unique name referenced by agent subscriptions.
+    permission               Optional access policy; omission means deny all.
+    proxy                    Optional channel-specific HTTP proxy.
+
+  Lark fields
+    app_id                   Lark application ID.
+    secret                   Lark application secret; do not commit it.
+
+  Telegram fields
+    token                    Telegram bot token; do not commit it.
+
+  Channel permission fields
+    permission.users         Allowed sender policies.
+    permission.users[].id    Channel-native sender ID, or "*" for every sender.
+    permission.groups        Allowed group policies.
+    permission.groups[].id   Channel-native group ID, or "*" for every group.
+    require_mention          Optional group flag; defaults to false.
+
+  Agent fields
+    name                     Unique local agent name.
+    isolate                  Backend session isolation: "none" or "session".
+    workspace                Optional workdir; defaults to ~/.agora/workspace.
+    type                     "codex" or "custom".
+    path                     Backend executable path.
+    model                    Optional Codex model override.
+    effort                   Optional Codex reasoning effort override.
+    agent_sandbox            Optional Codex sandbox: "read-only",
+                             "workspace-write", or "danger-full-access".
+    timeout_seconds          Optional positive execution timeout; defaults to 3600.
+    max_output_bytes         Optional positive combined stdout/stderr limit; defaults
+                             to 67108864 (64 MiB).
+    proxy                    Optional agent-specific HTTP proxy. Injected as
+                             HTTP_PROXY/HTTPS_PROXY in upper and lower case.
+    subscribe                Channel subscriptions for this agent.
+    subscribe[].channel      Name of a configured channel.
+    subscribe[].filter       Reserved channel filter; currently ignored.
+
+  Proxy format
+    proxy                    address:port or user:password@address:port. An optional
+                             http:// prefix is accepted. Component-level values
+                             override the top-level default.

@@ -1,0 +1,19 @@
+[Unit]
+Description=Agora Node
+
+[Service]
+Type=simple
+WorkingDirectory=/home/openclaw/bin/agora
+Environment=HOME=/home/openclaw
+Environment=NVM_DIR=/opt/nvm
+ExecStart=/bin/bash -c 'source /opt/nvm/nvm.sh && exec /home/openclaw/bin/agora/agora-node daemon -c /home/openclaw/bin/agora/config.json'
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agora-node
+Restart=always
+RestartSec=3s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=default.target

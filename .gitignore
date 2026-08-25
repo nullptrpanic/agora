@@ -1,0 +1,12 @@
+/target
+.*
+!.cargo/
+!.cargo/config.toml
+!.gitignore
+Cargo.lock
+*.profraw
+config.json
+sandbox.json
+AGENTS.md
+/docs/
+/spec/
