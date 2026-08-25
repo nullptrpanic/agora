@@ -89,7 +89,7 @@ FIELD REFERENCE
     name                     Unique local agent name.
     isolate                  Backend session isolation: "none" or "session".
     workspace                Optional workdir; defaults to ~/.agora/workspace.
-    type                     "codex", "coco", "claude_code", or "custom".
+    type                     "codex" or "custom".
     path                     Backend executable path.
     model                    Optional Codex model override.
     effort                   Optional Codex reasoning effort override.
