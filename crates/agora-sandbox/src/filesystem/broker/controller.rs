@@ -1,7 +1,7 @@
 use super::protocol::{
     PROTOCOL_VERSION, Request, RequestEnvelope, Response, ResponseEnvelope, valid_request_id,
 };
-use super::service::{LocalBroker, WRITEBACK_DELAY};
+use super::service::{LocalBroker, MAPPED_WRITEBACK_INTERVAL, WRITEBACK_DELAY};
 use crate::filesystem::FileCipher;
 use crate::ipc;
 use anyhow::{Context, Result};
@@ -218,6 +218,11 @@ impl Server {
         expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut writeback = tokio::time::interval(WRITEBACK_DELAY);
         writeback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut mapped_writeback = tokio::time::interval_at(
+            tokio::time::Instant::now() + MAPPED_WRITEBACK_INTERVAL,
+            MAPPED_WRITEBACK_INTERVAL,
+        );
+        mapped_writeback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
@@ -243,6 +248,10 @@ impl Server {
                         let broker = Arc::clone(&self.state.broker);
                         writebacks.spawn_blocking(move || broker.flush_due(Instant::now()));
                     }
+                },
+                _ = mapped_writeback.tick(), if writebacks.is_empty() => {
+                    let broker = Arc::clone(&self.state.broker);
+                    writebacks.spawn_blocking(move || broker.flush_mapped_changed());
                 },
                 Some(attached_connection) = self.attached_rx.recv() => {
                     let AttachedConnection { stream, permit } = attached_connection;

@@ -16,6 +16,7 @@ use uuid::Uuid;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const LAZY_PLAINTEXT_THRESHOLD: u64 = 1024 * 1024;
 pub(super) const WRITEBACK_DELAY: Duration = Duration::from_millis(10);
+pub(super) const MAPPED_WRITEBACK_INTERVAL: Duration = Duration::from_secs(10);
 const CLOSED_HANDLE_TTL: Duration = Duration::from_secs(120);
 const CLOSED_HANDLE_CAPACITY: usize = 128;
 const REQUEST_CACHE_TTL: Duration = Duration::from_secs(120);
@@ -86,7 +87,6 @@ enum CacheDecision {
 
 struct LocalHandle {
     writable: bool,
-    potentially_dirty: ByteRangeSet,
     active_writes: HashMap<String, ActiveWrite>,
     references: usize,
     closed_at: Option<Instant>,
@@ -113,6 +113,8 @@ struct SharedFile {
     encrypted: EncryptedFile,
     resident: ByteRangeSet,
     baseline: PlaintextIdentity,
+    mapped_baseline: PlaintextIdentity,
+    potentially_dirty: ByteRangeSet,
     pending_writes: ByteRangeSet,
     pending_since: Option<Instant>,
     needs_durable_sync: bool,
@@ -386,6 +388,30 @@ impl LocalBroker {
         Ok(())
     }
 
+    pub(crate) fn flush_mapped_changed(&self) -> std::io::Result<()> {
+        let mapped = lock(&self.handles)
+            .iter()
+            .filter_map(|(id, handle)| {
+                let handle = lock(handle);
+                (handle.references != 0 && handle.writable && handle.shared.is_healthy())
+                    .then(|| (id.clone(), Arc::clone(&handle.shared)))
+            })
+            .collect::<Vec<_>>();
+        for (id, shared) in Self::unique_files(mapped) {
+            let changed = {
+                let shared_file = lock(&shared.inner);
+                let metadata = shared_file.plaintext.metadata()?;
+                !shared_file.potentially_dirty.is_empty()
+                    && PlaintextIdentity::from_metadata(&metadata) != shared_file.mapped_baseline
+            };
+            if changed {
+                self.sync_handle(&id, Vec::new(), false, true, false)
+                    .map_err(BrokerError::into_io)?;
+            }
+        }
+        Ok(())
+    }
+
     fn active_handles(&self) -> Vec<(String, Arc<SharedPlaintext>)> {
         lock(&self.handles)
             .iter()
@@ -463,16 +489,15 @@ impl LocalBroker {
                 let local = self.lookup_handle(&handle)?;
                 let shared = Arc::clone(&lock(&local).shared);
                 shared.ensure_healthy()?;
-                let _file_guard = lock(&shared.inner);
-                shared.ensure_healthy()?;
-                let mut handle = lock(&local);
-                if !handle.writable {
+                if !lock(&local).writable {
                     return Err(BrokerError::new(
                         libc::EBADF,
                         "local filesystem handle is not writable",
                     ));
                 }
-                handle.potentially_dirty.insert(range);
+                let mut shared_file = lock(&shared.inner);
+                shared.ensure_healthy()?;
+                shared_file.potentially_dirty.insert(range);
                 Ok(Response::Success)
             }
             Request::BeginWrite {
@@ -799,7 +824,9 @@ impl LocalBroker {
                     })?;
                     shared.encrypted = replacement;
                     shared.resident = ByteRangeSet::default();
-                    shared.baseline = PlaintextIdentity::from_metadata(&metadata);
+                    let baseline = PlaintextIdentity::from_metadata(&metadata);
+                    shared.baseline = baseline;
+                    shared.mapped_baseline = baseline;
                     shared.needs_durable_sync = true;
                 }
                 file
@@ -824,11 +851,14 @@ impl LocalBroker {
                 let plaintext_metadata = plaintext.metadata().map_err(|error| {
                     BrokerError::io("failed to inspect local plaintext file", error)
                 })?;
+                let baseline = PlaintextIdentity::from_metadata(&plaintext_metadata);
                 let mut shared_file = SharedFile {
                     plaintext,
                     encrypted,
                     resident: ByteRangeSet::default(),
-                    baseline: PlaintextIdentity::from_metadata(&plaintext_metadata),
+                    baseline,
+                    mapped_baseline: baseline,
+                    potentially_dirty: ByteRangeSet::default(),
                     pending_writes: ByteRangeSet::default(),
                     pending_since: None,
                     needs_durable_sync: truncated,
@@ -861,7 +891,6 @@ impl LocalBroker {
             id.clone(),
             Arc::new(Mutex::new(LocalHandle {
                 writable: access != libc::O_RDONLY,
-                potentially_dirty: ByteRangeSet::default(),
                 active_writes: HashMap::new(),
                 references: 1,
                 closed_at: None,
@@ -918,7 +947,9 @@ impl LocalBroker {
             .plaintext
             .metadata()
             .map_err(|error| BrokerError::io("failed to inspect local plaintext file", error))?;
-        let baseline_clean = PlaintextIdentity::from_metadata(&before) == shared.baseline;
+        let before = PlaintextIdentity::from_metadata(&before);
+        let baseline_clean = before == shared.baseline;
+        let mapped_baseline_clean = before == shared.mapped_baseline;
         let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
         let result = (|| {
             for range in missing {
@@ -947,11 +978,19 @@ impl LocalBroker {
             }
             Ok(())
         })();
-        let refreshed = if baseline_clean {
+        let refreshed = if baseline_clean || mapped_baseline_clean {
             shared
                 .plaintext
                 .metadata()
-                .map(|metadata| shared.baseline = PlaintextIdentity::from_metadata(&metadata))
+                .map(|metadata| {
+                    let refreshed = PlaintextIdentity::from_metadata(&metadata);
+                    if baseline_clean {
+                        shared.baseline = refreshed;
+                    }
+                    if mapped_baseline_clean {
+                        shared.mapped_baseline = refreshed;
+                    }
+                })
                 .map_err(|error| BrokerError::io("failed to inspect local plaintext file", error))
         } else {
             Ok(())
@@ -1004,10 +1043,12 @@ impl LocalBroker {
             .metadata()
             .map_err(|error| BrokerError::io("failed to inspect local plaintext file", error))?;
         let current = PlaintextIdentity::from_metadata(&metadata);
+        let mapping_changed = current != shared_file.mapped_baseline;
         if include_potential
             && !handle.writable
             && shared_file.pending_writes.is_empty()
             && current != shared_file.baseline
+            && (shared_file.potentially_dirty.is_empty() || !mapping_changed)
         {
             return Err(BrokerError::new(
                 libc::EBADF,
@@ -1028,8 +1069,8 @@ impl LocalBroker {
             shared_file.pending_since.get_or_insert_with(Instant::now);
         }
         let mut candidates = shared_file.pending_writes.clone();
-        if include_potential && current != shared_file.baseline {
-            for range in handle.potentially_dirty.iter() {
+        if include_potential && mapping_changed {
+            for range in shared_file.potentially_dirty.iter() {
                 candidates.insert(*range);
             }
         }
@@ -1046,12 +1087,6 @@ impl LocalBroker {
         }
         let ranges = candidates.to_vec();
         let length = current.length;
-        if include_potential && !handle.potentially_dirty.is_empty() && !handle.writable {
-            return Err(BrokerError::new(
-                libc::EBADF,
-                "local filesystem handle is not writable",
-            ));
-        }
         let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
         let mut mutated = false;
         for range in ranges {
@@ -1093,6 +1128,9 @@ impl LocalBroker {
         shared_file.pending_writes.clear();
         shared_file.pending_since = None;
         shared_file.baseline = current;
+        if include_potential {
+            shared_file.mapped_baseline = current;
+        }
         Ok(())
     }
 

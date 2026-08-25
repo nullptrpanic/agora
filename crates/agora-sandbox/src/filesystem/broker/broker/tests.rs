@@ -1230,6 +1230,154 @@ fn final_flush_persists_ranges_registered_by_writable_mappings() {
 }
 
 #[test]
+fn periodic_mapping_flush_persists_changed_registered_ranges() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("mapped-periodic", b"abcdef");
+    let (handle, plaintext) = fixture.open(&path, true);
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::PotentiallyDirty {
+                    handle,
+                    range: ByteRange::new(0, 6).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    write_all_at(&plaintext, b"mapped", 0).unwrap();
+
+    fixture.broker.flush_mapped_changed().unwrap();
+
+    assert_eq!(fixture.decrypt(&path), b"mapped");
+}
+
+#[test]
+fn periodic_mapping_flush_combines_ranges_from_shared_plaintext_handles() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("mapped-shared", b"abcdefgh");
+    let (left_handle, left_plaintext) = fixture.open(&path, true);
+    let (right_handle, right_plaintext) = fixture.open(&path, true);
+    for (handle, range) in [
+        (left_handle, ByteRange::new(0, 4).unwrap()),
+        (right_handle, ByteRange::new(4, 8).unwrap()),
+    ] {
+        assert_eq!(
+            fixture
+                .broker
+                .handle(Request::PotentiallyDirty { handle, range }, None)
+                .response,
+            Response::Success
+        );
+    }
+    write_all_at(&left_plaintext, b"left", 0).unwrap();
+    write_all_at(&right_plaintext, b"rght", 4).unwrap();
+
+    fixture.broker.flush_mapped_changed().unwrap();
+
+    assert_eq!(fixture.decrypt(&path), b"leftrght");
+}
+
+#[test]
+fn ordinary_writeback_does_not_hide_a_pending_mapping_change() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("mapped-and-written", b"abcdefgh");
+    let (handle, plaintext) = fixture.open(&path, true);
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::PotentiallyDirty {
+                    handle: handle.clone(),
+                    range: ByteRange::new(0, 4).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    write_all_at(&plaintext, b"mmap", 0).unwrap();
+    let write_id = "11111111111111111111111111111111";
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: handle.clone(),
+                    write_id: write_id.to_string(),
+                    range: ByteRange::new(4, 8).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    write_all_at(&plaintext, b"writ", 4).unwrap();
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::FinishWrite {
+                    handle: handle.clone(),
+                    write_id: write_id.to_string(),
+                    range: ByteRange::new(4, 8).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+
+    fixture
+        .broker
+        .flush_due(Instant::now() + WRITEBACK_DELAY)
+        .unwrap();
+    assert_eq!(fixture.decrypt(&path), b"abcdwrit");
+    fixture.broker.flush_mapped_changed().unwrap();
+
+    assert_eq!(fixture.decrypt(&path), b"mmapwrit");
+}
+
+#[test]
+fn closing_a_read_only_peer_flushes_authorized_shared_mapping_changes() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("mapped-with-reader", b"before");
+    let (writer, plaintext) = fixture.open(&path, true);
+    let (reader, _read_only_plaintext) = fixture.open(&path, false);
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::PotentiallyDirty {
+                    handle: writer,
+                    range: ByteRange::new(0, 6).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    write_all_at(&plaintext, b"mapped", 0).unwrap();
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Close {
+                    handle: reader,
+                    ranges: Vec::new(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(fixture.decrypt(&path), b"mapped");
+}
+
+#[test]
 fn explicit_sync_persists_changes_from_registered_writable_mappings() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("mapped-sync", b"abcdef");
