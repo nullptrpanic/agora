@@ -14,9 +14,11 @@ fn metadata_store_creates_and_validates_directory_markers() {
     let store = MetadataStore::new(&root).unwrap();
 
     assert!(root.join(".metadata").is_file());
-    store.ensure_marker(Path::new("/Users/bytedance")).unwrap();
-    assert!(root.join("Users/bytedance/.metadata").is_file());
-    assert!(store.has_marker(Path::new("/Users/bytedance")).unwrap());
+    store
+        .ensure_marker(Path::new("/workspace/project"))
+        .unwrap();
+    assert!(root.join("workspace/project/.metadata").is_file());
+    assert!(store.has_marker(Path::new("/workspace/project")).unwrap());
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -228,13 +230,13 @@ fn metadata_cache_evicts_old_missing_directories_at_its_capacity() {
 fn cached_marker_removal_is_observed_without_a_sandbox_publication() {
     let root = tempfile();
     let store = MetadataStore::new(&root).unwrap();
-    let directory = Path::new("/Users/bytedance");
+    let directory = Path::new("/workspace/project");
     let entry = directory.join("entry");
     store.ensure_marker(directory).unwrap();
     store.set(&entry, EntryState::Cow).unwrap();
 
     assert_eq!(store.state(&entry).unwrap(), Some(EntryState::Cow));
-    std::fs::remove_file(root.join("Users/bytedance/.metadata")).unwrap();
+    std::fs::remove_file(root.join("workspace/project/.metadata")).unwrap();
     assert!(!store.has_marker(directory).unwrap());
     assert_eq!(store.state(&entry).unwrap(), None);
 
