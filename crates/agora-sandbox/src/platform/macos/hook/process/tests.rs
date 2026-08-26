@@ -1,10 +1,10 @@
 use super::{
     ChildArguments, ChildEnvironment, INSIDE_PROCESS_HOOK, MAX_RECORDED_ARGUMENT_BYTES,
-    PrepareError, PreparedExecutable, ProcessHookGuard, ProcessHookRuntime, TRUNCATED_ARGUMENTS,
-    agora_sandbox_execv, agora_sandbox_execve, agora_sandbox_execvp, agora_sandbox_posix_spawn,
-    agora_sandbox_posix_spawnp, current_environment, execute, io_errno, prepared_executable,
-    process_event_request, requested_executable, resolve_current_directory, search_path_executable,
-    with_test_runtime,
+    PendingProcessEvent, PrepareError, PreparedExecutable, ProcessHookGuard, ProcessHookRuntime,
+    TRUNCATED_ARGUMENTS, agora_sandbox_execv, agora_sandbox_execve, agora_sandbox_execvp,
+    agora_sandbox_posix_spawn, agora_sandbox_posix_spawnp, current_environment, execute, io_errno,
+    pending_process_event, prepared_executable, process_event_request, requested_executable,
+    resolve_current_directory, search_path_executable, with_test_runtime,
 };
 use crate::audit::AuditEventRequest;
 use crate::callback::ProcessOperation;
@@ -93,6 +93,20 @@ fn config_with_tls_bundle() -> HookConfig {
 
 fn child_trace() -> TraceContext {
     TraceContext::parse("trace-root").unwrap().child()
+}
+
+fn pending_process_environment() -> CString {
+    let arguments = [c"/bin/true".as_ptr(), std::ptr::null()];
+    let pending = unsafe {
+        pending_process_event(
+            Path::new("/bin/true"),
+            arguments.as_ptr(),
+            ProcessOperation::PosixSpawn,
+            &child_trace(),
+        )
+    }
+    .unwrap();
+    pending.environment_entry().unwrap()
 }
 
 fn response(status: u8, content: &[u8]) -> Vec<u8> {
@@ -229,8 +243,16 @@ fn child_environment_restores_runtime_values_after_the_caller_clears_them() {
     let path = CString::new("PATH=/usr/bin:/bin").unwrap();
     let values = [path.as_ptr(), std::ptr::null()];
 
-    let environment =
-        unsafe { ChildEnvironment::new(values.as_ptr(), &config(), &child_trace(), None) }.unwrap();
+    let environment = unsafe {
+        ChildEnvironment::new(
+            values.as_ptr(),
+            &config(),
+            &child_trace(),
+            pending_process_environment().as_c_str(),
+            None,
+        )
+    }
+    .unwrap();
     let entries = environment
         .values
         .iter()
@@ -251,12 +273,19 @@ fn child_environment_restores_runtime_values_after_the_caller_clears_them() {
 
 #[test]
 fn child_environment_accepts_a_null_source_environment() {
-    let environment =
-        unsafe { ChildEnvironment::new(std::ptr::null(), &config(), &child_trace(), None) }
-            .unwrap();
+    let environment = unsafe {
+        ChildEnvironment::new(
+            std::ptr::null(),
+            &config(),
+            &child_trace(),
+            pending_process_environment().as_c_str(),
+            None,
+        )
+    }
+    .unwrap();
 
     assert!(!environment.as_exec_ptr().is_null());
-    assert_eq!(environment.values.len(), 13);
+    assert_eq!(environment.values.len(), 14);
 }
 
 #[test]
@@ -320,12 +349,25 @@ fn child_environment_replaces_untrusted_runtime_values() {
     let stale = [
         CString::new("AGORA_SANDBOX_TOKEN=stale").unwrap(),
         CString::new("DYLD_INSERT_LIBRARIES=/tmp/untrusted.dylib").unwrap(),
+        CString::new("AGORA_SANDBOX_PENDING_PROCESS_EVENT=untrusted").unwrap(),
     ];
-    let pointers = [stale[0].as_ptr(), stale[1].as_ptr(), std::ptr::null()];
+    let pointers = [
+        stale[0].as_ptr(),
+        stale[1].as_ptr(),
+        stale[2].as_ptr(),
+        std::ptr::null(),
+    ];
 
-    let environment =
-        unsafe { ChildEnvironment::new(pointers.as_ptr(), &config(), &child_trace(), None) }
-            .unwrap();
+    let environment = unsafe {
+        ChildEnvironment::new(
+            pointers.as_ptr(),
+            &config(),
+            &child_trace(),
+            pending_process_environment().as_c_str(),
+            None,
+        )
+    }
+    .unwrap();
     let entries = unsafe {
         let mut current = environment.as_exec_ptr();
         let mut entries = Vec::new();
@@ -338,8 +380,49 @@ fn child_environment_replaces_untrusted_runtime_values() {
 
     assert!(!entries.contains(&"AGORA_SANDBOX_TOKEN=stale"));
     assert!(!entries.contains(&"DYLD_INSERT_LIBRARIES=/tmp/untrusted.dylib"));
+    assert!(!entries.contains(&"AGORA_SANDBOX_PENDING_PROCESS_EVENT=untrusted"));
     assert!(entries.contains(&"AGORA_SANDBOX_TOKEN=token"));
     assert!(entries.contains(&"DYLD_INSERT_LIBRARIES=/tmp/hook.dylib"));
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.starts_with("AGORA_SANDBOX_PENDING_PROCESS_EVENT="))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn pending_process_environment_round_trips_and_rejects_invalid_values() {
+    let pending = PendingProcessEvent {
+        version: 1,
+        trace_id: "trace-root, trace-child".to_string(),
+        command: crate::callback::CommandContext {
+            executable: "/usr/bin/curl".to_string(),
+            arguments: vec!["curl".to_string(), "https://example.com".to_string()],
+            current_dir: "/Users/example".to_string(),
+            operation: ProcessOperation::PosixSpawn,
+        },
+    };
+    let entry = pending.environment_entry().unwrap();
+    let value = entry
+        .to_str()
+        .unwrap()
+        .strip_prefix("AGORA_SANDBOX_PENDING_PROCESS_EVENT=")
+        .unwrap();
+
+    assert_eq!(PendingProcessEvent::decode(value).unwrap(), pending);
+    assert!(PendingProcessEvent::decode("not-json").is_err());
+
+    let mut unsupported = pending.clone();
+    unsupported.version = 2;
+    let unsupported = serde_json::to_string(&unsupported).unwrap();
+    assert!(PendingProcessEvent::decode(&unsupported).is_err());
+
+    let mut relative = pending;
+    relative.command.current_dir = "relative".to_string();
+    let relative = serde_json::to_string(&relative).unwrap();
+    assert!(PendingProcessEvent::decode(&relative).is_err());
 }
 
 #[test]
@@ -352,6 +435,7 @@ fn child_environment_propagates_only_the_tracked_remote_current_directory() {
             values.as_ptr(),
             &config(),
             &child_trace(),
+            pending_process_environment().as_c_str(),
             Some(Path::new("/remote/team/docs")),
         )
     }
@@ -365,8 +449,16 @@ fn child_environment_propagates_only_the_tracked_remote_current_directory() {
     assert!(!entries.contains(&"AGORA_SANDBOX_REMOTE_CURRENT_DIRECTORY=/remote/stale"));
     assert!(entries.contains(&"AGORA_SANDBOX_REMOTE_CURRENT_DIRECTORY=/remote/team/docs"));
 
-    let environment =
-        unsafe { ChildEnvironment::new(values.as_ptr(), &config(), &child_trace(), None) }.unwrap();
+    let environment = unsafe {
+        ChildEnvironment::new(
+            values.as_ptr(),
+            &config(),
+            &child_trace(),
+            pending_process_environment().as_c_str(),
+            None,
+        )
+    }
+    .unwrap();
     assert!(environment.values.iter().all(|value| {
         !value
             .to_bytes()
@@ -384,6 +476,7 @@ fn child_environment_restores_tls_trust_after_the_caller_clears_it() {
             values.as_ptr(),
             &config_with_tls_bundle(),
             &child_trace(),
+            pending_process_environment().as_c_str(),
             None,
         )
     }
@@ -413,6 +506,7 @@ fn child_environment_adds_java_trust_without_discarding_other_options() {
             values.as_ptr(),
             &config_with_tls_bundle(),
             &child_trace(),
+            pending_process_environment().as_c_str(),
             None,
         )
     }
@@ -445,6 +539,7 @@ fn child_environment_preserves_an_explicit_java_trust_store() {
             values.as_ptr(),
             &config_with_tls_bundle(),
             &child_trace(),
+            pending_process_environment().as_c_str(),
             None,
         )
     }
@@ -480,6 +575,7 @@ fn child_environment_preserves_a_quoted_explicit_java_trust_store() {
             values.as_ptr(),
             &config_with_tls_bundle(),
             &child_trace(),
+            pending_process_environment().as_c_str(),
             None,
         )
     }
@@ -663,8 +759,8 @@ fn command_request_records_process_context_and_bounds_argument_count() {
     ];
     let trace = TraceContext::parse("trace-root, trace-child").unwrap();
 
-    let request = unsafe {
-        process_event_request(
+    let pending = unsafe {
+        pending_process_event(
             Path::new("/usr/bin/curl"),
             pointers.as_ptr(),
             ProcessOperation::Execve,
@@ -672,6 +768,7 @@ fn command_request_records_process_context_and_bounds_argument_count() {
         )
     }
     .unwrap();
+    let request = process_event_request(&pending).unwrap();
 
     let AuditEventRequest::Process {
         trace_id,
@@ -696,8 +793,8 @@ fn command_request_records_process_context_and_bounds_argument_count() {
     let argument = CString::new("secret").unwrap();
     let mut pointers = vec![argument.as_ptr(); 257];
     pointers.push(std::ptr::null());
-    let request = unsafe {
-        process_event_request(
+    let pending = unsafe {
+        pending_process_event(
             Path::new("/bin/true"),
             pointers.as_ptr(),
             ProcessOperation::Execv,
@@ -705,6 +802,7 @@ fn command_request_records_process_context_and_bounds_argument_count() {
         )
     }
     .unwrap();
+    let request = process_event_request(&pending).unwrap();
     let AuditEventRequest::Process { command, .. } = request else {
         panic!("expected process audit event");
     };
@@ -718,8 +816,8 @@ fn command_request_records_process_context_and_bounds_argument_count() {
 
     let oversized = CString::new("x".repeat(MAX_RECORDED_ARGUMENT_BYTES + 1)).unwrap();
     let pointers = [oversized.as_ptr(), std::ptr::null()];
-    let request = unsafe {
-        process_event_request(
+    let pending = unsafe {
+        pending_process_event(
             Path::new("/bin/true"),
             pointers.as_ptr(),
             ProcessOperation::Execv,
@@ -727,6 +825,7 @@ fn command_request_records_process_context_and_bounds_argument_count() {
         )
     }
     .unwrap();
+    let request = process_event_request(&pending).unwrap();
     let AuditEventRequest::Process { command, .. } = request else {
         panic!("expected process audit event");
     };

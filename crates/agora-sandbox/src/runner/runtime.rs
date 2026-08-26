@@ -23,6 +23,7 @@ impl ProtectedEnvironment {
                 TLS_TRUST_ANCHOR_DER.into(),
                 TLS_TRUST_BUNDLE.into(),
                 JAVA_TRUST_STORE_ENVIRONMENT.into(),
+                PENDING_PROCESS_EVENT_ENVIRONMENT.into(),
             ],
         }
     }

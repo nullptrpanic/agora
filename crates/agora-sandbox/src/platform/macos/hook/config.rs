@@ -1,3 +1,4 @@
+use crate::audit::PENDING_PROCESS_EVENT_ENVIRONMENT;
 use crate::network::client_trust::JAVA_TRUST_STORE_ENVIRONMENT;
 use crate::trace::{TRACE_ID_ENVIRONMENT, TraceContext};
 use base64::Engine;
@@ -43,7 +44,7 @@ const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 6] = [
     "GIT_SSL_CAINFO",
 ];
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 34] = [
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 35] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
@@ -71,6 +72,7 @@ pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 34] = [
     TLS_TRUST_ANCHOR_DER,
     TLS_TRUST_BUNDLE,
     JAVA_TRUST_STORE_ENVIRONMENT,
+    PENDING_PROCESS_EVENT_ENVIRONMENT,
     TRACE_ID_ENVIRONMENT,
     TLS_CLIENT_TRUST_ENVIRONMENT[0],
     TLS_CLIENT_TRUST_ENVIRONMENT[1],

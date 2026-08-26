@@ -8,6 +8,8 @@ pub(crate) use runtime::{
 
 #[cfg(target_os = "macos")]
 use crate::audit::AuditController;
+#[cfg(target_os = "macos")]
+use crate::audit::PENDING_PROCESS_EVENT_ENVIRONMENT;
 use crate::callback::Callback;
 #[cfg(target_os = "macos")]
 use crate::execution::{ExecutionController, resolve_executable, resolve_shebang};
