@@ -90,6 +90,72 @@ struct Fixture {
 }
 
 #[test]
+fn positioned_read_releases_the_logical_offset_lock_before_native_io() {
+    use crate::filesystem::broker::{LocalFileIdentity, LocalOpenState};
+    let fixture = Fixture::new();
+    let path = Fixture::c_path(&fixture.lower.join("positioned"));
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600);
+        assert!(descriptor >= 0);
+        assert_eq!(libc::pwrite(descriptor, b"x".as_ptr().cast(), 1, 0), 1);
+        let (registered, _) = fixture.runtime.take_descriptor(descriptor).unwrap();
+        let mut open = Arc::try_unwrap(registered).ok().unwrap();
+        open.content = super::content::ManagedContent::encrypted(
+            super::content::EncryptedContent {
+                handle: "unused-hot-read-handle".to_owned(),
+                lazy: false,
+                state: LocalOpenState::create(libc::O_RDWR).unwrap(),
+                lock: tempfile::tempfile().unwrap(),
+                identity: LocalFileIdentity {
+                    device: 1,
+                    inode: 1,
+                    links: 1,
+                },
+            },
+            true,
+        );
+        fixture.runtime.register(descriptor, open);
+        let open = fixture.runtime.tracked_open(descriptor).unwrap();
+        let (started, start) = std::sync::mpsc::channel();
+        let (completed, completion) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            start.recv().unwrap();
+            open.local_inheritance()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .set_offset(123)
+                .unwrap();
+            let _ = completed.send(());
+        });
+        let mut independent = false;
+        let mut byte = 0_u8;
+        let result = super::content::managed_read_io(
+            descriptor,
+            super::content::ContentIoOffset::Positioned(0),
+            || Ok(1),
+            |_, _| unreachable!(),
+            |offset| {
+                started.send(()).unwrap();
+                independent = completion.recv_timeout(Duration::from_secs(1)).is_ok();
+                libc::pread(descriptor, (&mut byte as *mut u8).cast(), 1, offset)
+            },
+            || unreachable!(),
+        );
+        worker.join().unwrap();
+        fixture.runtime.take_descriptor(descriptor);
+        libc::close(descriptor);
+        assert_eq!(result, Some(1));
+        assert_eq!(byte, b'x');
+        assert!(
+            independent,
+            "pread retained the unrelated shared-offset lock during native I/O"
+        );
+    });
+}
+
+#[test]
 fn truncate_reservations_cover_the_changed_extent() {
     assert_eq!(truncate_reservation(8, 3), LocalByteRange::new(3, 8).ok());
     assert_eq!(truncate_reservation(3, 8), LocalByteRange::new(3, 8).ok());
@@ -1312,6 +1378,33 @@ fn nfs_entries_override_overlay_entries_and_missing_entries_fall_back() {
             -1
         );
         assert_eq!(*libc::__error(), libc::ENOENT);
+    });
+}
+
+#[test]
+fn nfs_write_only_stdio_preserves_existing_bytes_and_descriptor_permissions() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "append.txt", b"before");
+    let path = Fixture::c_path(&nfs.logical_root.join("append.txt"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        for (mode, bytes) in [(c"a", b"AFTER".as_slice()), (c"w", b"new".as_slice())] {
+            let stream = sandbox_fopen(path.as_ptr(), mode.as_ptr());
+            assert!(!stream.is_null(), "{}", std::io::Error::last_os_error());
+            let descriptor = libc::fileno(stream);
+            assert_eq!(
+                libc::fcntl(descriptor, libc::F_GETFL) & libc::O_ACCMODE,
+                libc::O_WRONLY
+            );
+            assert_eq!(
+                libc::fwrite(bytes.as_ptr().cast(), 1, bytes.len(), stream),
+                bytes.len()
+            );
+            assert_eq!(sandbox_fclose(stream), 0);
+            let expected: &[u8] = if mode == c"a" { b"beforeAFTER" } else { b"new" };
+            assert_eq!(nfs.storage.data(0, "append.txt").unwrap(), expected);
+        }
     });
 }
 
@@ -4250,15 +4343,27 @@ fn native_blocking_open_is_interruptible_after_managed_path_preparation() {
     with_test_runtime(&fixture.runtime, || unsafe {
         let opener = libc::pthread_self() as usize;
         let release_path = fifo_path.clone();
+        let (finished, completion) = std::sync::mpsc::channel();
         let interrupter = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(20));
-            assert_eq!(
-                libc::pthread_kill(opener as libc::pthread_t, libc::SIGUSR2),
-                0
-            );
-            thread::sleep(Duration::from_millis(100));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match completion.recv_timeout(Duration::from_millis(10)) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                assert_eq!(
+                    libc::pthread_kill(opener as libc::pthread_t, libc::SIGUSR2),
+                    0
+                );
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+            // Keep the fallback writer alive until open returns: a briefly
+            // opened writer can disappear before a loaded test reaches open.
             let release = libc::open(release_path.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK);
             assert!(release >= 0);
+            let _ = completion.recv_timeout(Duration::from_secs(5));
             libc::close(release);
         });
 
@@ -4267,6 +4372,7 @@ fn native_blocking_open_is_interruptible_after_managed_path_preparation() {
         if result >= 0 {
             libc::close(result);
         }
+        finished.send(()).unwrap();
         interrupter.join().unwrap();
 
         assert_eq!(result, -1);

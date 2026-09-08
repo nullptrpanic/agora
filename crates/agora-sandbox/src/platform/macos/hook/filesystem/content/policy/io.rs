@@ -14,6 +14,32 @@ pub(crate) enum ContentIoOffset {
     Positioned(libc::off_t),
 }
 
+struct LogicalIoState<'a> {
+    flags: libc::c_int,
+    sequential: Option<LocalOpenStateGuard<'a>>,
+}
+
+impl<'a> LogicalIoState<'a> {
+    fn acquire(content: &'a ManagedContent, offset: ContentIoOffset) -> Result<Option<Self>> {
+        content
+            .backend
+            .logical_open_state()
+            .map(|state| {
+                let guard = state.lock()?;
+                let flags = guard.flags()?;
+                // Positioned I/O never changes the shared cursor. Snapshot status
+                // flags, then release both the process and record locks before IPC
+                // or native I/O; sequential operations retain the cursor guard.
+                let sequential = match offset {
+                    ContentIoOffset::Sequential => Some(guard),
+                    ContentIoOffset::Positioned(_) => None,
+                };
+                Ok(Self { flags, sequential })
+            })
+            .transpose()
+    }
+}
+
 pub(in super::super) struct ReadOperations<'a> {
     pub(in super::super) requested_length:
         &'a mut dyn FnMut() -> std::result::Result<usize, libc::c_int>,
@@ -89,12 +115,7 @@ where
     let open = runtime.tracked_open(descriptor)?;
     let content = open.managed();
     let _mutation = content.mutation_guard();
-    let logical = content
-        .backend
-        .logical_open_state()
-        .map(|state| state.lock())
-        .transpose()
-        .map_err(anyhow::Error::from);
+    let logical = LogicalIoState::acquire(content, requested_offset);
     let mut operations = ReadOperations {
         requested_length: &mut requested_length,
         copy_from_payload: &mut payload,
@@ -142,12 +163,7 @@ where
     let open = runtime.tracked_open(descriptor)?;
     let content = open.managed();
     let _mutation = content.mutation_guard();
-    let logical = content
-        .backend
-        .logical_open_state()
-        .map(|state| state.lock())
-        .transpose()
-        .map_err(anyhow::Error::from);
+    let logical = LogicalIoState::acquire(content, requested_offset);
     let mut operations = WriteOperations {
         requested_length: &mut requested_length,
         copy_to_payload: &mut payload,
@@ -180,7 +196,7 @@ fn read_with_policy(
     runtime: &FilesystemHookRuntime,
     descriptor: libc::c_int,
     requested_offset: ContentIoOffset,
-    logical: Option<&LocalOpenStateGuard<'_>>,
+    logical: Option<&LogicalIoState<'_>>,
     operations: &mut ReadOperations<'_>,
 ) -> Result<libc::ssize_t> {
     let mode = content.backend.read_mode();
@@ -231,7 +247,7 @@ fn write_with_policy(
     descriptor: libc::c_int,
     open: &OpenFile,
     request: WriteRequest,
-    logical: Option<&LocalOpenStateGuard<'_>>,
+    logical: Option<&LogicalIoState<'_>>,
     operations: &mut WriteOperations<'_>,
 ) -> Result<libc::ssize_t> {
     if let ContentWriteMode::Native { track_snapshot } = content.backend.write_mode() {
@@ -335,10 +351,10 @@ fn native_write_with_policy(
 
 fn status_flags(
     descriptor: libc::c_int,
-    logical: Option<&LocalOpenStateGuard<'_>>,
+    logical: Option<&LogicalIoState<'_>>,
 ) -> Result<libc::c_int> {
     if let Some(logical) = logical {
-        return logical.flags().map_err(Into::into);
+        return Ok(logical.flags);
     }
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
     if flags < 0 {
@@ -351,7 +367,7 @@ fn status_flags(
 fn resolve_offset(
     descriptor: libc::c_int,
     requested: ContentIoOffset,
-    logical: Option<&LocalOpenStateGuard<'_>>,
+    logical: Option<&LogicalIoState<'_>>,
 ) -> Result<libc::off_t> {
     let offset = match requested {
         ContentIoOffset::Sequential => current_offset(descriptor, logical),
@@ -366,9 +382,9 @@ fn resolve_offset(
 
 fn current_offset(
     descriptor: libc::c_int,
-    logical: Option<&LocalOpenStateGuard<'_>>,
+    logical: Option<&LogicalIoState<'_>>,
 ) -> Result<libc::off_t> {
-    match logical {
+    match logical.and_then(|state| state.sequential.as_ref()) {
         Some(logical) => logical.offset().map_err(Into::into),
         None => native_offset(descriptor),
     }
@@ -385,7 +401,7 @@ fn native_offset(descriptor: libc::c_int) -> Result<libc::off_t> {
 
 fn set_offset_after_io(
     descriptor: libc::c_int,
-    logical: Option<&LocalOpenStateGuard<'_>>,
+    logical: Option<&LogicalIoState<'_>>,
     start: u64,
     length: u64,
 ) -> Result<()> {
@@ -393,7 +409,7 @@ fn set_offset_after_io(
         .checked_add(length)
         .and_then(|next| libc::off_t::try_from(next).ok())
         .ok_or_else(|| errno_error(libc::EOVERFLOW))?;
-    match logical {
+    match logical.and_then(|state| state.sequential.as_ref()) {
         Some(logical) => logical.set_offset(next).map_err(Into::into),
         None if unsafe { libc::lseek(descriptor, next, libc::SEEK_SET) } < 0 => {
             Err(std::io::Error::last_os_error().into())

@@ -1049,6 +1049,10 @@ impl LocalBroker {
             && shared_file.pending_writes.is_empty()
             && current != shared_file.baseline
             && (shared_file.potentially_dirty.is_empty() || !mapping_changed)
+            && (current.length != shared_file.encrypted.len()
+                || current.modified_seconds != shared_file.baseline.modified_seconds
+                || current.modified_nanoseconds != shared_file.baseline.modified_nanoseconds
+                || !shared_file.resident_matches_ciphertext()?)
         {
             return Err(BrokerError::new(
                 libc::EBADF,
@@ -1490,6 +1494,35 @@ impl PlaintextIdentity {
 }
 
 impl SharedFile {
+    fn resident_matches_ciphertext(&mut self) -> Result<bool, BrokerError> {
+        // A ctime-only change does not prove a write through a read-only
+        // handle. With size and mtime unchanged, check resident bytes without
+        // filling lazy holes or publishing anything to disk.
+        let mut expected = vec![0_u8; COPY_BUFFER_SIZE];
+        let mut actual = vec![0_u8; COPY_BUFFER_SIZE];
+        for range in self.resident.iter() {
+            let end = range.end.min(self.encrypted.len());
+            let mut offset = range.start;
+            while offset < end {
+                let count = ((end - offset).min(COPY_BUFFER_SIZE as u64)) as usize;
+                let read = self
+                    .encrypted
+                    .read_at(&mut expected[..count], offset)
+                    .map_err(|error| {
+                        BrokerError::anyhow("failed to verify read-only plaintext", error)
+                    })?;
+                read_exact_at(&self.plaintext, &mut actual[..count], offset).map_err(|error| {
+                    BrokerError::io("failed to inspect read-only plaintext", error)
+                })?;
+                if read != count || actual[..count] != expected[..count] {
+                    return Ok(false);
+                }
+                offset += count as u64;
+            }
+        }
+        Ok(true)
+    }
+
     fn fully_resident(&self) -> bool {
         let length = self.encrypted.len();
         length == 0

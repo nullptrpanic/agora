@@ -560,6 +560,77 @@ fn encrypted_writes_to_special_files_remain_passthrough() {
 }
 
 #[test]
+fn encrypted_long_names_round_trip_through_content_and_namespace_operations() {
+    use std::os::unix::ffi::OsStrExt;
+    let (root, filesystem) = fixture("long-names");
+    let directory = Path::new("/tmp/agora-long-names");
+    filesystem.create_directory(directory, 0o700).unwrap();
+    for name in [
+        "x".repeat(146),
+        "x".repeat(147),
+        "x".repeat(160),
+        "x".repeat(161),
+        "x".repeat(255),
+        "汉".repeat(85),
+        format!("enc_{}", "x".repeat(251)),
+    ] {
+        let logical = directory.join(&name);
+        let mut prepared = filesystem
+            .prepare_open(&logical, libc::O_CREAT | libc::O_RDWR, 0o600)
+            .unwrap();
+        let OpenTarget::Descriptor(file) = prepared.target_mut() else {
+            panic!("expected encrypted descriptor")
+        };
+        file.write_all(b"contents").unwrap();
+        filesystem.commit_open(&mut prepared).unwrap();
+        let (_, writeback, _) = prepared.into_parts();
+        filesystem.commit_writeback(&writeback.unwrap()).unwrap();
+        let backing = filesystem.prepare_read(&logical).unwrap();
+        assert_eq!(
+            filesystem
+                .directory_view(directory)
+                .unwrap()
+                .aliases()
+                .get(backing.file_name().unwrap())
+                .map(|name| name.as_os_str()),
+            logical.file_name()
+        );
+        assert!(backing.file_name().unwrap().as_bytes().len() <= 255);
+        let metadata = std::fs::read(backing.parent().unwrap().join(".metadata")).unwrap();
+        assert!(
+            !metadata
+                .windows(name.len())
+                .any(|bytes| bytes == name.as_bytes())
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
+        assert!(
+            metadata["entries"]
+                .get(backing.file_name().unwrap().to_str().unwrap())
+                .is_some()
+        );
+        let mut reopened = filesystem
+            .prepare_open(&logical, libc::O_RDONLY, 0)
+            .unwrap();
+        let OpenTarget::Descriptor(file) = reopened.target_mut() else {
+            panic!("expected encrypted descriptor")
+        };
+        let mut content = Vec::new();
+        file.read_to_end(&mut content).unwrap();
+        assert_eq!(content, b"contents");
+        drop(reopened);
+        let renamed = directory.join("renamed");
+        filesystem.rename(&logical, &renamed).unwrap();
+        assert!(filesystem.prepare_read(&logical).is_err());
+        filesystem.rename(&renamed, &logical).unwrap();
+        assert!(filesystem.prepare_read(&logical).is_ok());
+        filesystem.remove(&logical, false).unwrap();
+        assert!(filesystem.prepare_read(&logical).is_err());
+    }
+    drop(filesystem);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn encrypted_writeback_publishes_ciphertext_and_restores_the_next_open() {
     let (root, filesystem) = fixture("write");
     let logical = Path::new("/tmp/agora-vfs-created");

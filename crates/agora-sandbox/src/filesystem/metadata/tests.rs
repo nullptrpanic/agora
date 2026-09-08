@@ -401,6 +401,50 @@ fn encrypted_metadata_uses_the_physical_name_as_an_opaque_record_key() {
 }
 
 #[test]
+fn long_encrypted_metadata_survives_reopen_and_rejects_substituted_names() {
+    let root = tempfile();
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let store = MetadataStore::encrypted(&root, cipher.clone()).unwrap();
+    let path = Path::new("/tmp").join("x".repeat(255));
+    store.set_whiteout(&path, true).unwrap();
+    let physical = store.encrypted_name(&path).unwrap().unwrap();
+    let marker = store.path(Path::new("/tmp")).unwrap();
+    drop(store);
+    let reopened = MetadataStore::encrypted(&root, cipher.clone()).unwrap();
+    assert_eq!(reopened.state(&path).unwrap(), Some(EntryState::Whiteout));
+    assert_eq!(
+        reopened.encrypted_name(&path).unwrap(),
+        Some(physical.clone())
+    );
+    drop(reopened);
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    let mut value = original.clone();
+    let records = value["entries"].as_object_mut().unwrap();
+    let mut record = records.remove(physical.to_str().unwrap()).unwrap();
+    let ciphertext = record
+        .as_object_mut()
+        .unwrap()
+        .remove("encrypted_name")
+        .unwrap();
+    records.insert(ciphertext.as_str().unwrap().to_owned(), record);
+    std::fs::write(&marker, serde_json::to_vec(&value).unwrap()).unwrap();
+    let reopened = MetadataStore::encrypted(&root, cipher.clone()).unwrap();
+    assert!(
+        reopened.state(&path).is_err(),
+        "an oversized physical name must be rejected"
+    );
+    drop(reopened);
+    let mut value = original;
+    value["entries"][physical.to_str().unwrap()]["encrypted_name"] =
+        cipher.encrypt_name(&vec![b'y'; 255]).unwrap().into();
+    std::fs::write(&marker, serde_json::to_vec(&value).unwrap()).unwrap();
+    let reopened = MetadataStore::encrypted(&root, cipher).unwrap();
+    assert!(reopened.state(&path).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn unchanged_metadata_is_parsed_once() {
     let root = tempfile();
     let store = MetadataStore::new(&root).unwrap();

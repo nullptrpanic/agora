@@ -41,6 +41,19 @@ pub(crate) struct ExecutionController {
     tasks: JoinSet<Result<()>>,
 }
 
+/// Preparation owns the shared store, not the controller's task lifecycle.
+#[derive(Clone)]
+pub(crate) struct ExecutionPreparer(Arc<Mutex<ExecutableStore>>);
+
+impl ExecutionPreparer {
+    pub(crate) async fn prepare(&self, executable: PathBuf) -> Result<PathBuf> {
+        let store = Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || lock(&store).prepare(&executable))
+            .await
+            .context("sandbox executable preparation task failed")?
+    }
+}
+
 impl ExecutionController {
     pub(crate) async fn start(directory: PathBuf) -> Result<Self> {
         Self::start_with_cipher(directory, None).await
@@ -79,11 +92,8 @@ impl ExecutionController {
         &self.runtime
     }
 
-    pub(crate) async fn prepare(&self, executable: PathBuf) -> Result<PathBuf> {
-        let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || lock(&store).prepare(&executable))
-            .await
-            .context("sandbox executable preparation task failed")?
+    pub(crate) fn preparer(&self) -> ExecutionPreparer {
+        ExecutionPreparer(Arc::clone(&self.store))
     }
 
     pub(crate) async fn wait_failure(&mut self) -> anyhow::Error {

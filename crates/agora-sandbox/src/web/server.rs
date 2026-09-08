@@ -2,7 +2,9 @@ use super::audit::{CursorItem, LogCursor, TraceEvent};
 use super::protocol::{
     AccessToken, ClientControl, ServerControl, SessionStatus, parse_control, validate_auth,
 };
-use super::terminal::{TerminalEvent, TerminalSession, TerminalSize, TerminalSpec};
+use super::terminal::{
+    MAX_INPUT_BYTES, TerminalEvent, TerminalSession, TerminalSize, TerminalSpec,
+};
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
@@ -29,7 +31,8 @@ const DIAGNOSTIC_LIMIT: usize = 100;
 const HUB_CHANNEL_CAPACITY: usize = 256;
 const TAIL_INTERVAL: Duration = Duration::from_millis(100);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 64 * 1024;
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_WEBSOCKET_MESSAGE_BYTES: usize = MAX_INPUT_BYTES;
 
 #[derive(Clone, Debug)]
 pub(super) enum HubEvent {
@@ -72,6 +75,7 @@ struct EventHubInner {
 }
 
 struct HubState {
+    generation: u64,
     terminal_replay: VecDeque<u8>,
     terminal_truncated: bool,
     traces: VecDeque<TraceEvent>,
@@ -95,6 +99,7 @@ impl EventHub {
         Self {
             inner: Arc::new(EventHubInner {
                 state: Mutex::new(HubState {
+                    generation: 0,
                     terminal_replay: VecDeque::new(),
                     terminal_truncated: false,
                     traces: VecDeque::new(),
@@ -116,8 +121,9 @@ impl EventHub {
         }
     }
 
-    pub(super) fn begin_session(&self) {
+    pub(super) fn begin_session(&self) -> u64 {
         let mut state = self.lock_state();
+        state.generation += 1;
         state.terminal_replay.clear();
         state.terminal_truncated = false;
         state.active_root_trace_id = None;
@@ -129,10 +135,33 @@ impl EventHub {
             exit_code: None,
             message: None,
         });
+        state.generation
     }
 
-    pub(super) fn push_terminal(&self, bytes: &[u8]) {
+    fn terminal_event(&self, generation: u64, event: TerminalEvent) -> bool {
         let mut state = self.lock_state();
+        if generation != state.generation {
+            return false;
+        }
+        match event {
+            TerminalEvent::Output(bytes) => self.push_terminal_locked(&mut state, &bytes),
+            TerminalEvent::Exited { exit_code, signal } => {
+                self.set_status_locked(&mut state, SessionStatus::Exited, exit_code, signal)
+            }
+            TerminalEvent::Error(message) => {
+                self.push_diagnostic_locked(&mut state, message.clone());
+                self.set_status_locked(&mut state, SessionStatus::Error, None, Some(message));
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn push_terminal(&self, bytes: &[u8]) {
+        self.push_terminal_locked(&mut self.lock_state(), bytes);
+    }
+
+    fn push_terminal_locked(&self, state: &mut HubState, bytes: &[u8]) {
         state.terminal_replay.extend(bytes.iter().copied());
         while state.terminal_replay.len() > self.inner.terminal_limit {
             state.terminal_replay.pop_front();
@@ -185,7 +214,10 @@ impl EventHub {
     }
 
     pub(super) fn push_diagnostic(&self, message: String) {
-        let mut state = self.lock_state();
+        self.push_diagnostic_locked(&mut self.lock_state(), message);
+    }
+
+    fn push_diagnostic_locked(&self, state: &mut HubState, message: String) {
         state.diagnostics.push_back(message.clone());
         while state.diagnostics.len() > self.inner.diagnostic_limit {
             state.diagnostics.pop_front();
@@ -199,7 +231,16 @@ impl EventHub {
         exit_code: Option<i32>,
         message: Option<String>,
     ) {
-        let mut state = self.lock_state();
+        self.set_status_locked(&mut self.lock_state(), status, exit_code, message);
+    }
+
+    fn set_status_locked(
+        &self,
+        state: &mut HubState,
+        status: SessionStatus,
+        exit_code: Option<i32>,
+        message: Option<String>,
+    ) {
         state.status = status;
         state.exit_code = exit_code;
         state.status_message.clone_from(&message);
@@ -344,28 +385,20 @@ impl SessionManager {
         }
         let cursor = LogCursor::at_end(self.log_path.clone())
             .with_context(|| format!("failed to open audit log {}", self.log_path.display()))?;
-        self.hub.begin_session();
+        let generation = self.hub.begin_session();
         let (terminal, mut events) = TerminalSession::spawn(self.terminal_spec.clone(), size)?;
+        let tail = TailWorker::spawn(cursor, self.hub.clone())?;
+        self.hub.set_status(SessionStatus::Running, None, None);
         let event_hub = self.hub.clone();
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                match event {
-                    TerminalEvent::Output(bytes) => event_hub.push_terminal(&bytes),
-                    TerminalEvent::Exited { exit_code, signal } => {
-                        event_hub.set_status(SessionStatus::Exited, exit_code, signal)
-                    }
-                    TerminalEvent::Error(message) => {
-                        event_hub.push_diagnostic(message.clone());
-                        event_hub.set_status(SessionStatus::Error, None, Some(message));
-                    }
+                if !event_hub.terminal_event(generation, event) {
+                    break;
                 }
             }
         });
-        let tail = TailWorker::spawn(cursor, self.hub.clone())?;
         state.terminal = Some(terminal);
         state.tail = Some(tail);
-        drop(state);
-        self.hub.set_status(SessionStatus::Running, None, None);
         Ok(())
     }
 
@@ -552,7 +585,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     }
 
     let (mut events, snapshot) = state.hub.subscribe_with_snapshot();
-    if send_replay_socket(&mut socket, &snapshot).await.is_err() {
+    if send_replay(&mut socket, &snapshot).await.is_err() {
         return;
     }
     let (mut sender, mut receiver) = socket.split();
@@ -594,7 +627,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let snapshot = recover_subscription(&state.hub, &mut events);
-                        if send_replay_sink(&mut sender, &snapshot).await.is_err() {
+                        if send_replay(&mut sender, &snapshot).await.is_err() {
                             break;
                         }
                     }
@@ -602,7 +635,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 }
             }
             _ = shutdown.recv() => {
-                let _ = sender.send(Message::Close(Some(CloseFrame {
+                let _ = send_message(&mut sender, Message::Close(Some(CloseFrame {
                     code: 1001,
                     reason: "viewer shutting down".into(),
                 }))).await;
@@ -656,12 +689,14 @@ fn handle_control(
 }
 
 async fn close_socket(socket: &mut WebSocket, reason: &'static str) {
-    let _ = socket
-        .send(Message::Close(Some(CloseFrame {
+    let _ = send_message(
+        socket,
+        Message::Close(Some(CloseFrame {
             code: 1008,
             reason: reason.into(),
-        })))
-        .await;
+        })),
+    )
+    .await;
 }
 
 type SocketSink = futures_util::stream::SplitSink<WebSocket, Message>;
@@ -672,10 +707,7 @@ async fn send_diagnostic(sender: &mut SocketSink, message: String) -> Result<()>
 
 async fn send_hub_event(sender: &mut SocketSink, event: HubEvent) -> Result<()> {
     match event {
-        HubEvent::Terminal(bytes) => sender
-            .send(Message::Binary(bytes.into()))
-            .await
-            .context("failed to send terminal output"),
+        HubEvent::Terminal(bytes) => send_message(sender, Message::Binary(bytes.into())).await,
         HubEvent::TraceBatch(events) => {
             send_control(sender, ServerControl::TraceBatch { events }).await
         }
@@ -701,30 +733,11 @@ async fn send_hub_event(sender: &mut SocketSink, event: HubEvent) -> Result<()> 
     }
 }
 
-async fn send_replay_socket(socket: &mut WebSocket, snapshot: &HubSnapshot) -> Result<()> {
-    socket
-        .send(control_message(ServerControl::ReplayStart {
-            truncated: snapshot.terminal_truncated,
-        })?)
-        .await
-        .context("failed to begin terminal replay")?;
-    if !snapshot.terminal_replay.is_empty() {
-        socket
-            .send(Message::Binary(snapshot.terminal_replay.clone().into()))
-            .await
-            .context("failed to send terminal replay")?;
-    }
-    socket
-        .send(control_message(ServerControl::ReplayEnd)?)
-        .await
-        .context("failed to finish terminal replay")?;
-    socket
-        .send(control_message(snapshot_control(snapshot))?)
-        .await
-        .context("failed to send trace snapshot")
-}
-
-async fn send_replay_sink(sender: &mut SocketSink, snapshot: &HubSnapshot) -> Result<()> {
+async fn send_replay<S>(sender: &mut S, snapshot: &HubSnapshot) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     send_control(
         sender,
         ServerControl::ReplayStart {
@@ -733,10 +746,11 @@ async fn send_replay_sink(sender: &mut SocketSink, snapshot: &HubSnapshot) -> Re
     )
     .await?;
     if !snapshot.terminal_replay.is_empty() {
-        sender
-            .send(Message::Binary(snapshot.terminal_replay.clone().into()))
-            .await
-            .context("failed to send terminal replay")?;
+        send_message(
+            sender,
+            Message::Binary(snapshot.terminal_replay.clone().into()),
+        )
+        .await?;
     }
     send_control(sender, ServerControl::ReplayEnd).await?;
     send_control(sender, snapshot_control(snapshot)).await
@@ -755,11 +769,23 @@ fn snapshot_control(snapshot: &HubSnapshot) -> ServerControl {
     }
 }
 
-async fn send_control(sender: &mut SocketSink, control: ServerControl) -> Result<()> {
-    sender
-        .send(control_message(control)?)
+async fn send_control<S>(sender: &mut S, control: ServerControl) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    send_message(sender, control_message(control)?).await
+}
+
+async fn send_message<S>(sender: &mut S, message: Message) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    tokio::time::timeout(SOCKET_WRITE_TIMEOUT, sender.send(message))
         .await
-        .context("failed to send viewer control message")
+        .context("viewer client is not reading output")?
+        .context("failed to send viewer message")
 }
 
 fn control_message(control: ServerControl) -> Result<Message> {
@@ -840,6 +866,57 @@ mod tests {
             detail: json!({ "id": id }),
             source_bytes: 1,
         }
+    }
+
+    #[test]
+    fn retired_terminal_events_cannot_change_a_new_session() {
+        use super::TerminalEvent;
+        let hub = EventHub::new();
+        let old = hub.begin_session();
+        let current = hub.begin_session();
+        hub.set_status(SessionStatus::Running, None, None);
+        hub.terminal_event(old, TerminalEvent::Output(b"old".to_vec()));
+        hub.terminal_event(
+            old,
+            TerminalEvent::Exited {
+                exit_code: Some(7),
+                signal: None,
+            },
+        );
+        hub.terminal_event(old, TerminalEvent::Error("old error".to_string()));
+        hub.terminal_event(current, TerminalEvent::Output(b"current".to_vec()));
+        let snapshot = hub.snapshot();
+        assert_eq!(snapshot.terminal_replay, b"current");
+        assert_eq!(snapshot.status, SessionStatus::Running);
+        assert!(snapshot.diagnostics.is_empty());
+        hub.terminal_event(
+            current,
+            TerminalEvent::Exited {
+                exit_code: Some(0),
+                signal: None,
+            },
+        );
+        assert_eq!(hub.snapshot().status, SessionStatus::Exited);
+    }
+
+    #[tokio::test]
+    async fn nonreading_viewer_has_a_bounded_send_deadline() {
+        let mut sink = Box::pin(futures_util::sink::unfold(
+            (),
+            |(), _: axum::extract::ws::Message| {
+                std::future::pending::<Result<(), std::io::Error>>()
+            },
+        ));
+        let result = tokio::time::timeout(
+            super::SOCKET_WRITE_TIMEOUT + std::time::Duration::from_secs(2),
+            super::send_message(
+                &mut sink,
+                axum::extract::ws::Message::Binary(vec![1].into()),
+            ),
+        )
+        .await
+        .expect("socket write never reached its deadline");
+        assert!(result.unwrap_err().to_string().contains("not reading"));
     }
 
     #[test]

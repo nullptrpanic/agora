@@ -414,25 +414,31 @@ impl SandboxRuntime {
         &self.run_id
     }
 
-    pub(crate) async fn prepare(&self, executable: PathBuf) -> Result<PreparedLaunch> {
-        let prepared = self.execution.prepare(executable).await?;
-        let (program, argument_prefix) = if let Some(shebang) = resolve_shebang(&prepared)? {
-            let interpreter = self.execution.prepare(shebang.interpreter).await?;
-            let mut arguments = Vec::with_capacity(2);
-            arguments.extend(shebang.argument);
-            arguments.push(prepared.into_os_string());
-            (interpreter, arguments)
-        } else {
-            (prepared, Vec::new())
-        };
+    pub(crate) fn prepare(
+        &self,
+        executable: PathBuf,
+    ) -> impl std::future::Future<Output = Result<PreparedLaunch>> + Send + use<> {
+        let execution = self.execution.preparer();
         let mut environment = self.environment.clone();
-        environment.insert(TRACE_ID_ENVIRONMENT, TraceContext::root().encode());
-        Ok(PreparedLaunch::new(
-            program,
-            argument_prefix,
-            environment,
-            Uuid::new_v4().to_string(),
-        ))
+        async move {
+            let prepared = execution.prepare(executable).await?;
+            let (program, argument_prefix) = if let Some(shebang) = resolve_shebang(&prepared)? {
+                let interpreter = execution.prepare(shebang.interpreter).await?;
+                let mut arguments = Vec::with_capacity(2);
+                arguments.extend(shebang.argument);
+                arguments.push(prepared.into_os_string());
+                (interpreter, arguments)
+            } else {
+                (prepared, Vec::new())
+            };
+            environment.insert(TRACE_ID_ENVIRONMENT, TraceContext::root().encode());
+            Ok(PreparedLaunch::new(
+                program,
+                argument_prefix,
+                environment,
+                Uuid::new_v4().to_string(),
+            ))
+        }
     }
 
     async fn wait_event(&mut self) -> RuntimeEvent {

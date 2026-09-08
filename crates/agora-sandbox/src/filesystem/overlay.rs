@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
 const LOCK_DESCRIPTOR_POOL_CAPACITY: usize = 16;
+const TREE_CHECKSUM_CACHE_CAPACITY: usize = 64;
 // Increment when executable or loader preparation can produce different bytes
 // for the same source and target platform.
 const PREPARED_FILE_CACHE_VERSION: u32 = 2;
@@ -44,6 +45,7 @@ pub(crate) struct OverlayStore {
     lock_path: PathBuf,
     lock_pool: Mutex<LockDescriptorPool>,
     cipher: Option<FileCipher>,
+    tree_checksums: Mutex<HashMap<PathBuf, (String, String)>>,
     #[cfg(test)]
     lock_open_count: AtomicUsize,
     #[cfg(test)]
@@ -52,6 +54,8 @@ pub(crate) struct OverlayStore {
     reconciliation_count: AtomicUsize,
     #[cfg(test)]
     resolution_count: AtomicUsize,
+    #[cfg(test)]
+    tree_read_bytes: AtomicUsize,
 }
 
 struct LockDescriptorPool {
@@ -460,6 +464,7 @@ impl OverlayStore {
                 files: Vec::new(),
             }),
             cipher,
+            tree_checksums: Mutex::new(HashMap::new()),
             #[cfg(test)]
             lock_open_count: AtomicUsize::new(1),
             #[cfg(test)]
@@ -468,6 +473,8 @@ impl OverlayStore {
             reconciliation_count: AtomicUsize::new(0),
             #[cfg(test)]
             resolution_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            tree_read_bytes: AtomicUsize::new(0),
         };
         let unlock = Self::flock(&lock, libc::LOCK_UN);
         if unlock.is_ok() {
@@ -734,7 +741,7 @@ impl OverlayStore {
             if !self.is_internal(&destination) {
                 return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
             }
-            let lease_path = Self::write_lease_path(&destination)?;
+            let lease_path = namespace::write_lease_path(&destination)?;
             let mut options = OpenOptions::new();
             options.read(true);
             let current_lease =
@@ -838,7 +845,7 @@ impl OverlayStore {
             }
             let destination = self.plain_destination(&source)?;
             let source_identity = SourceIdentity::from_metadata(&source_metadata);
-            let source_checksum = Self::tree_checksum(&source)?;
+            let source_checksum = self.tree_checksum(&source)?;
             let (cached, cow_ancestor) = self.reconciled_entry_locked(&source)?;
             if cow_ancestor {
                 bail!(
@@ -869,7 +876,8 @@ impl OverlayStore {
                 && cached_variant.as_ref() == Some(&Self::loader_variant())
                 && cached_checksum == &source_checksum
                 && *cached_destination == Some(SourceIdentity::from_metadata(&destination_metadata))
-                && Self::tree_checksum(&destination)
+                && self
+                    .tree_checksum(&destination)
                     .is_ok_and(|checksum| checksum == source_checksum)
             {
                 return Ok(destination);
@@ -899,7 +907,9 @@ impl OverlayStore {
             ));
             let result = (|| {
                 Self::copy_plain_tree(&source, &temporary)?;
-                if Self::tree_checksum(&temporary)? != source_checksum {
+                if self.tree_checksum(&temporary)? != source_checksum
+                    || self.tree_checksum(&source)? != source_checksum
+                {
                     bail!("loader tree changed while it was being prepared");
                 }
                 Self::remove_existing(&destination)?;
@@ -1036,7 +1046,38 @@ impl OverlayStore {
         Ok(Self::hex_digest(digest.finalize().as_slice()))
     }
 
-    fn tree_checksum(root: &Path) -> Result<String> {
+    fn tree_checksum(&self, root: &Path) -> Result<String> {
+        let identity = self.tree_digest(root, false)?;
+        {
+            let cached = self
+                .tree_checksums
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some((previous, checksum)) = cached.get(root)
+                && previous == &identity
+            {
+                return Ok(checksum.clone());
+            }
+        }
+        let checksum = self.tree_digest(root, true)?;
+        if self.tree_digest(root, false)? != identity {
+            bail!("loader tree changed while it was being checked");
+        }
+        let mut cached = self
+            .tree_checksums
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if cached.len() >= TREE_CHECKSUM_CACHE_CAPACITY {
+            cached.clear();
+        }
+        cached.insert(root.to_path_buf(), (identity, checksum.clone()));
+        Ok(checksum)
+    }
+
+    // Both traversals include the complete entry set and symlink targets.
+    // Identity mode additionally includes dev/inode/size/mtime/ctime/mode for
+    // every entry: a directory timestamp alone misses edits to a child's body.
+    fn tree_digest(&self, root: &Path, contents: bool) -> Result<String> {
         let root_metadata = root.symlink_metadata()?;
         if !root_metadata.is_dir() {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR).into());
@@ -1044,6 +1085,11 @@ impl OverlayStore {
         let mut digest = Md5::new();
         digest.update(b"loader-tree-v1");
         digest.update((root_metadata.mode() | 0o700).to_le_bytes());
+        if !contents {
+            digest.update(serde_json::to_vec(&SourceIdentity::from_metadata(
+                &root_metadata,
+            ))?);
+        }
         let mut pending = vec![root.to_path_buf()];
         while let Some(directory) = pending.pop() {
             let mut entries = fs::read_dir(&directory)?.collect::<std::io::Result<Vec<_>>>()?;
@@ -1054,6 +1100,11 @@ impl OverlayStore {
                     .strip_prefix(root)
                     .context("loader tree entry escaped its root")?;
                 let metadata = path.symlink_metadata()?;
+                if !contents {
+                    digest.update(serde_json::to_vec(&SourceIdentity::from_metadata(
+                        &metadata,
+                    ))?);
+                }
                 let file_type = metadata.file_type();
                 let kind = if file_type.is_dir() {
                     b'd'
@@ -1079,10 +1130,15 @@ impl OverlayStore {
                     Self::update_digest_bytes(&mut digest, target.as_os_str().as_bytes());
                 } else {
                     digest.update(metadata.len().to_le_bytes());
+                    if !contents {
+                        continue;
+                    }
                     let mut file = File::open(path)?;
                     let mut buffer = [0_u8; 64 * 1024];
                     loop {
                         let read = file.read(&mut buffer)?;
+                        #[cfg(test)]
+                        self.tree_read_bytes.fetch_add(read, Ordering::Relaxed);
                         if read == 0 {
                             break;
                         }
@@ -1182,6 +1238,9 @@ impl OverlayStore {
         let destination = self.destination(path)?;
         let (state, cow_ancestor) = self.reconciled_entry_locked(path)?;
         if cow_ancestor {
+            if self.unreserved_long_encrypted_leaf(path, &destination) {
+                return Self::not_found(path);
+            }
             return destination
                 .symlink_metadata()
                 .map(|_| destination)
@@ -1735,7 +1794,7 @@ impl OverlayStore {
             return Err(std::io::Error::from_raw_os_error(libc::EISDIR).into());
         }
         let lease = (!metadata.is_dir())
-            .then(|| Self::write_lease_path(&destination))
+            .then(|| namespace::write_lease_path(&destination))
             .transpose()?;
         self.metadata.set_whiteout(path, !metadata.is_dir())?;
         Self::remove_existing(&destination)?;
@@ -2117,6 +2176,9 @@ impl OverlayStore {
         }
         let state = self.metadata.state(path)?;
         let destination = self.destination(path)?;
+        if state.is_none() && self.unreserved_long_encrypted_leaf(path, &destination) {
+            return Ok(None);
+        }
         let upper = match destination.symlink_metadata() {
             Ok(metadata) => Some(metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -2161,7 +2223,7 @@ impl OverlayStore {
     }
 
     fn write_lease_is_active(&self, destination: &Path) -> Result<bool> {
-        let path = Self::write_lease_path(destination)?;
+        let path = namespace::write_lease_path(destination)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true);
         let lease = match crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600)) {
@@ -2225,7 +2287,7 @@ impl OverlayStore {
         clear_metadata: bool,
     ) -> Result<()> {
         if self.cipher.is_some()
-            && let Ok(lease) = Self::write_lease_path(destination)
+            && let Ok(lease) = namespace::write_lease_path(destination)
         {
             Self::remove_existing(&lease)?;
         }
@@ -2235,6 +2297,19 @@ impl OverlayStore {
         } else {
             self.metadata.invalidate()
         }
+    }
+
+    fn unreserved_long_encrypted_leaf(&self, logical: &Path, physical: &Path) -> bool {
+        // Before filename reservation, a control-like logical name may have an
+        // oversized *plain* escape. It cannot exist at that physical leaf; an
+        // encrypted create will instead reserve a bounded ciphertext token.
+        self.cipher.is_some()
+            && logical
+                .file_name()
+                .is_some_and(|name| name.as_bytes().len() <= namespace::NAME_MAX)
+            && physical
+                .file_name()
+                .is_some_and(|name| name.as_bytes().len() > namespace::NAME_MAX)
     }
 
     fn destination(&self, path: &Path) -> Result<PathBuf> {
@@ -2273,8 +2348,8 @@ impl OverlayStore {
         if self.cipher.is_none() {
             return Ok(());
         }
-        let from_lease = Self::write_lease_path(from)?;
-        let to_lease = Self::write_lease_path(to)?;
+        let from_lease = namespace::write_lease_path(from)?;
+        let to_lease = namespace::write_lease_path(to)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true);
         let lease =
@@ -2345,15 +2420,6 @@ impl OverlayStore {
         Ok(())
     }
 
-    fn write_lease_path(destination: &Path) -> Result<PathBuf> {
-        let name = destination
-            .file_name()
-            .context("filesystem destination has no file name")?;
-        let mut lease = namespace::WRITE_LEASE_PREFIX.to_vec();
-        lease.extend_from_slice(name.as_bytes());
-        Ok(destination.with_file_name(OsString::from_vec(lease)))
-    }
-
     fn read_write_lease_destination(lease: &File) -> Result<Option<PathBuf>> {
         let length = lease.metadata()?.len();
         if length > super::MAX_CONTROL_PATH_BYTES as u64 {
@@ -2414,7 +2480,7 @@ impl OverlayStore {
         if !self.is_internal(destination) {
             return Ok(None);
         }
-        let path = Self::write_lease_path(destination)?;
+        let path = namespace::write_lease_path(destination)?;
         let mut options = OpenOptions::new();
         options
             .read(true)

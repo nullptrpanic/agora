@@ -434,13 +434,6 @@ impl PreparedOpenFile {
         }
     }
 
-    fn target_mut(&mut self) -> &mut OpenTarget {
-        match self {
-            Self::Local(prepared) => prepared.target_mut(),
-            Self::Remote(prepared) => prepared.target_mut(),
-        }
-    }
-
     fn into_parts(self) -> (OpenTarget, Option<ManagedContent>, FileLayer) {
         match self {
             Self::Local(prepared) => {
@@ -958,31 +951,7 @@ impl FilesystemHookRuntime {
         self.prepare_open_request(requested, OpenIntent::new(flags, mode.into())?)
     }
 
-    fn prepare_materialized_open(
-        &self,
-        path: *const libc::c_char,
-        directory: libc::c_int,
-        flags: libc::c_int,
-        mode: libc::mode_t,
-    ) -> Result<OpenRequest> {
-        let requested = unsafe { self.logical_path(path, directory) }?;
-        self.prepare_open_request_with_broker(
-            requested,
-            OpenIntent::new(flags, mode.into())?,
-            false,
-        )
-    }
-
     fn prepare_open_request(&self, requested: PathBuf, intent: OpenIntent) -> Result<OpenRequest> {
-        self.prepare_open_request_with_broker(requested, intent, true)
-    }
-
-    fn prepare_open_request_with_broker(
-        &self,
-        requested: PathBuf,
-        intent: OpenIntent,
-        broker_managed: bool,
-    ) -> Result<OpenRequest> {
         let flags = intent.flags();
         let allowlisted = self.native_passthrough_path(&requested)?;
         let allowlisted_passthrough = allowlisted.is_some();
@@ -1031,7 +1000,7 @@ impl FilesystemHookRuntime {
                 let mut plan_path = requested.clone();
                 let mut synchronized = None;
                 loop {
-                    let plan = if self.local.is_some() && broker_managed {
+                    let plan = if self.local.is_some() {
                         self.filesystem.prepare_authorized_broker_open(
                             &plan_path,
                             intent,

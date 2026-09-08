@@ -494,6 +494,25 @@ impl HookConfig {
 }
 
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+pub(super) unsafe fn clear_startup_variable(key: &str) {
+    // Only used by the pre-main initializer. unsetenv compacts the original
+    // envp array, displacing the following Apple vector for runtimes such as Go
+    // that locate it through argv. Empty (non-null) slots hide the key without
+    // changing that layout or exposing it through a copied original envp.
+    let mut entry = unsafe { *libc::_NSGetEnviron() };
+    while !unsafe { *entry }.is_null() {
+        let bytes = unsafe { std::ffi::CStr::from_ptr(*entry) }.to_bytes();
+        if bytes
+            .strip_prefix(key.as_bytes())
+            .is_some_and(|suffix| suffix.starts_with(b"="))
+        {
+            unsafe { *entry = c"".as_ptr().cast_mut() };
+        }
+        entry = unsafe { entry.add(1) };
+    }
+}
+
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
 pub(super) fn initialize() -> Result<(), String> {
     if global_result()?.is_some() {
         for key in [
@@ -514,7 +533,7 @@ pub(super) fn initialize() -> Result<(), String> {
             LOCAL_CONTROL_DESCRIPTOR,
             REMOTE_CONTROL_DESCRIPTOR,
         ] {
-            unsafe { std::env::remove_var(key) };
+            unsafe { clear_startup_variable(key) };
         }
     }
     Ok(())

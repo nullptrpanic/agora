@@ -766,6 +766,42 @@ async fn a_second_open_sees_writes_from_a_live_encrypted_descriptor() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn encrypted_path_truncate_updates_existing_descriptors_and_inode() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let workdir = directory.path().join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let script = r#"
+import os
+fd = os.open('file', os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+os.write(fd, b'abcdefgh')
+os.fsync(fd)
+identity = os.fstat(fd).st_ino
+for length, contents in [(3, b'abc'), (9, b'abc' + b'\0' * 6), (0, b''), (4, b'\0' * 4)]:
+    os.truncate('file', length)
+    by_fd, by_path = os.fstat(fd), os.stat('file')
+    assert by_fd.st_size == by_path.st_size == length, (by_fd.st_size, by_path.st_size, length)
+    assert by_fd.st_ino == by_path.st_ino == identity
+    assert os.pread(fd, 16, 0) == contents
+os.close(fd)
+assert open('file', 'rb').read() == b'\0' * 4
+"#;
+    let outcome = tokio::time::timeout(
+        sandbox_lifecycle_timeout(20),
+        Sandbox::new(sandbox_config_in(&workdir), NoopCallback).run(
+            SandboxCommand::new(python3())
+                .args(["-c", script])
+                .current_dir(&source),
+        ),
+    )
+    .await
+    .expect("path truncation timed out")
+    .unwrap();
+    assert!(outcome.status().success());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn sqlite_wal_transactions_survive_encrypted_reopen() {
     let directory = std::env::temp_dir().join(format!(
         "agora-sandbox-sqlite-wal-test-{}",
@@ -3664,6 +3700,87 @@ async fn injected_hook_routes_a_real_child_connection_through_the_proxy() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn hook_initialization_preserves_the_darwin_startup_environment_layout() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("startup.c");
+    let executable = directory.path().join("startup");
+    std::fs::write(
+        &source,
+        br#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    /* Go reads the original env/Apple vector through argv, not environ. */
+    char **entry = argv + argc + 1;
+    for (; *entry; ++entry) {
+        if (strncmp(*entry, "AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY=",
+                    sizeof("AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY=") - 1) == 0 ||
+            strncmp(*entry, "AGORA_SANDBOX_PENDING_PROCESS_EVENT=",
+                    sizeof("AGORA_SANDBOX_PENDING_PROCESS_EVENT=") - 1) == 0) {
+            fputs("internal startup variable is still visible\n", stderr);
+            return 1;
+        }
+    }
+    if (!entry[1] || strncmp(entry[1], "executable_path=/", 17) != 0) {
+        fputs("original Apple executable_path vector was displaced\n", stderr);
+        return 2;
+    }
+    if (getenv("AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY") ||
+        getenv("AGORA_SANDBOX_PENDING_PROCESS_EVENT")) {
+        fputs("internal libc environment variable is still visible\n", stderr);
+        return 3;
+    }
+    if (!getenv("AGORA_SANDBOX_TEST_STARTUP_KEEP") ||
+        strcmp(getenv("AGORA_SANDBOX_TEST_STARTUP_KEEP"), "kept") != 0 ||
+        setenv("AGORA_SANDBOX_TEST_STARTUP_NEW", "after", 1) != 0 ||
+        strcmp(getenv("AGORA_SANDBOX_TEST_STARTUP_NEW"), "after") != 0 ||
+        unsetenv("AGORA_SANDBOX_TEST_STARTUP_NEW") != 0) {
+        fputs("ordinary environment access failed\n", stderr);
+        return 4;
+    }
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let architecture = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        "arm64"
+    };
+    let output = Command::new("/usr/bin/xcrun")
+        .args(["clang", "-arch", architecture, "-o"])
+        .arg(&executable)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "clang failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for command in [
+        SandboxCommand::new(&executable),
+        SandboxCommand::new("/bin/sh")
+            .arg("-c")
+            .arg("exec \"$1\"")
+            .arg("startup-fixture")
+            .arg(&executable),
+    ] {
+        let outcome = Sandbox::new(
+            sandbox_config_in(directory.path().join("cache")),
+            NoopCallback,
+        )
+        .run(command.env("AGORA_SANDBOX_TEST_STARTUP_KEEP", "kept"))
+        .await
+        .unwrap();
+        assert!(outcome.status().success(), "child: {:?}", outcome.status());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn runner_keeps_an_unrestricted_executable_at_its_original_path() {
     let directory = std::env::temp_dir().join(format!(
         "agora-sandbox-executable-test-{}",
@@ -4083,10 +4200,23 @@ async fn runner_posix_spawn_audit_uses_the_spawned_child_identity() {
     std::fs::write(&spawnp_marker, b"spawnp\n").unwrap();
     std::fs::write(&node_marker, b"node\n").unwrap();
     std::fs::write(&exec_marker, b"exec\n").unwrap();
+    let architecture = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        "arm64"
+    };
     let node = ["/opt/homebrew/bin/node", "/usr/local/bin/node"]
         .into_iter()
         .map(PathBuf::from)
-        .find(|path| path.is_file());
+        .find(|path| {
+            // A Rosetta test process cannot inject its x86 Hook into ARM-only Node.
+            path.is_file()
+                && Command::new("/usr/bin/lipo")
+                    .args(["-verify_arch", architecture])
+                    .arg(path)
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+        });
 
     let events = Arc::new(Mutex::new(Vec::<Event>::new()));
     let callback = {

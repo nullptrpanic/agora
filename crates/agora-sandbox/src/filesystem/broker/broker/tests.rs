@@ -1758,6 +1758,49 @@ fn broker_rejects_invalid_descriptors_paths_and_handle_operations() {
 }
 
 #[test]
+fn read_only_sync_accepts_metadata_changes_but_rejects_restored_mtime_writes() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("readonly-metadata", &vec![b'x'; 2 * 1024 * 1024]);
+    let original_ciphertext = std::fs::read(&path).unwrap();
+    let (handle, plaintext) = fixture.open(&path, false);
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Materialize {
+                    handle: handle.clone(),
+                    range: Some(ByteRange::new(0, 32).unwrap()),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    let modified = plaintext.metadata().unwrap().modified().unwrap();
+    assert_eq!(unsafe { libc::fchmod(plaintext.as_raw_fd(), 0o400) }, 0);
+    let sync = Request::Sync {
+        handle: handle.clone(),
+        ranges: Vec::new(),
+        durable: false,
+    };
+    assert_eq!(
+        fixture.broker.handle(sync.clone(), None).response,
+        Response::Success
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original_ciphertext);
+    let mut cold = [1_u8; 32];
+    read_exact_at(&plaintext, &mut cold, 1024 * 1024).unwrap();
+    assert_eq!(cold, [0; 32], "read-only sync must not eagerly decrypt");
+
+    write_all_at(&plaintext, b"changed", 0).unwrap();
+    plaintext
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert_error(fixture.broker.handle(sync, None).response, libc::EBADF);
+    assert_eq!(std::fs::read(&path).unwrap(), original_ciphertext);
+}
+
+#[test]
 fn read_only_handles_reject_dirty_ranges_and_changed_snapshots() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("readonly", b"before");

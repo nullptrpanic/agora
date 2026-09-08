@@ -73,6 +73,7 @@ struct RemoteHandle<H> {
     created: bool,
     pending_truncate: bool,
     backend_dirty: bool,
+    readable: bool,
     writable: bool,
     snapshot: bool,
     unlinked: bool,
@@ -659,6 +660,7 @@ where
                 created,
                 pending_truncate: flags & libc::O_TRUNC != 0 && !created,
                 backend_dirty: false,
+                readable,
                 writable,
                 snapshot: false,
                 unlinked: false,
@@ -701,6 +703,7 @@ where
                 created: false,
                 pending_truncate: false,
                 backend_dirty: false,
+                readable: true,
                 writable: false,
                 snapshot: false,
                 unlinked: false,
@@ -1026,6 +1029,18 @@ where
                 .await?;
                 (current, checksum)
             } else {
+                // A stdio snapshot needs the old bytes even when the application's
+                // descriptor is write-only. Acquire that capability separately;
+                // never broaden the permissions of ordinary remote open/write.
+                let mut reader = if handle.readable {
+                    None
+                } else {
+                    Some(
+                        self.storage
+                            .open_file(&handle.path, libc::O_RDONLY, 0)
+                            .await?,
+                    )
+                };
                 let RemoteHandle { backend, file, .. } = &mut *handle;
                 let backend = backend.as_mut().ok_or_else(|| {
                     StorageError::new(libc::EISDIR, "remote handle is a directory")
@@ -1033,10 +1048,28 @@ where
                 let file = file.as_mut().ok_or_else(|| {
                     StorageError::new(libc::EBADF, "remote placeholder is unavailable")
                 })?;
-                let metadata = self
-                    .storage
-                    .read_into(backend, file, self.limits.max_file_bytes)
-                    .await?;
+                let snapshot = async {
+                    let backend = if let Some((reader, metadata, _)) = &mut reader {
+                        ensure_same_snapshot(&baseline, metadata)?;
+                        reader
+                    } else {
+                        backend
+                    };
+                    let metadata = self
+                        .storage
+                        .read_into(backend, file, self.limits.max_file_bytes)
+                        .await?;
+                    ensure_same_snapshot(&baseline, &metadata)?;
+                    Ok::<_, StorageError>(metadata)
+                }
+                .await;
+                let closed = if let Some((reader, _, _)) = &mut reader {
+                    self.storage.close_file(reader).await
+                } else {
+                    Ok(())
+                };
+                let metadata = snapshot?;
+                closed?;
                 file.flush()
                     .map_err(|error| storage_io("failed to flush remote mmap snapshot", error))?;
                 let checksum = checksum_file(
@@ -1494,6 +1527,9 @@ where
     }
 
     async fn retarget_handles(&self, from: &RemotePath, to: &RemotePath) {
+        if from == to {
+            return;
+        }
         let handles = self
             .handles
             .lock()

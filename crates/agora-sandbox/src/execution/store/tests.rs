@@ -79,6 +79,43 @@ fn code_signatures_are_cached_for_an_unchanged_executable() {
 }
 
 #[test]
+fn signature_cache_rechecks_an_in_place_edit_even_when_mtime_is_restored() {
+    let root = TestDirectory::new();
+    let executable = root.path().join("executable");
+    fs::write(&executable, b"first").unwrap();
+    let before = executable.metadata().unwrap();
+    ExecutableStore::cached_code_signature(&before, || {
+        Ok(CodeSignature {
+            flags: 7,
+            ..CodeSignature::default()
+        })
+    })
+    .unwrap();
+    fs::write(&executable, b"other").unwrap();
+    fs::File::open(&executable)
+        .unwrap()
+        .set_modified(before.modified().unwrap())
+        .unwrap();
+    let after = executable.metadata().unwrap();
+    assert_eq!(
+        (before.ino(), before.len(), before.modified().unwrap()),
+        (after.ino(), after.len(), after.modified().unwrap())
+    );
+    assert_ne!(
+        (before.ctime(), before.ctime_nsec()),
+        (after.ctime(), after.ctime_nsec())
+    );
+    let signature = ExecutableStore::cached_code_signature(&after, || {
+        Ok(CodeSignature {
+            flags: 9,
+            ..CodeSignature::default()
+        })
+    })
+    .unwrap();
+    assert_eq!(signature.flags, 9);
+}
+
+#[test]
 fn executable_store_prepares_and_caches_a_native_copy() {
     let root = TestDirectory::new();
     let directory = root.path().join("prepared");

@@ -915,7 +915,7 @@ pub(super) fn publish_pending_event() -> Result<(), String> {
     let Some(value) = std::env::var_os(PENDING_PROCESS_EVENT_ENVIRONMENT) else {
         return Ok(());
     };
-    unsafe { std::env::remove_var(PENDING_PROCESS_EVENT_ENVIRONMENT) };
+    unsafe { config::clear_startup_variable(PENDING_PROCESS_EVENT_ENVIRONMENT) };
     let value = value
         .into_string()
         .map_err(|_| "pending process event is not valid UTF-8".to_string())?;
