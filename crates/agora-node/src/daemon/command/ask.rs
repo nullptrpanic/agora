@@ -34,6 +34,10 @@ impl AskCommand {
                 let command = command.clone();
                 async move { command.ask(context, arguments) }
             }))
+    }
+
+    pub(super) fn management_command(&self) -> CommandNode<CommandHandler> {
+        CommandNode::new("agent", i18n::AGENT_COMMAND_DESCRIPTION)
             .subcommand(self.list_command())
             .subcommand(self.agent_command("status", i18n::ASK_STATUS_DESCRIPTION, Self::status))
             .subcommand(self.agent_command("disable", i18n::ASK_DISABLE_DESCRIPTION, Self::disable))
@@ -71,12 +75,13 @@ impl AskCommand {
 
     fn list_command(&self) -> CommandNode<CommandHandler> {
         let command = self.clone();
-        CommandNode::new("list", i18n::ASK_LIST_DESCRIPTION).handler(CommandHandler::new(
-            move |context, arguments| {
+        CommandNode::new("list", i18n::ASK_LIST_DESCRIPTION).handler(
+            CommandHandler::new(move |context, arguments| {
                 let command = command.clone();
                 async move { command.list(context, arguments).await }
-            },
-        ))
+            })
+            .control(),
+        )
     }
 
     fn agent_command(
@@ -91,10 +96,13 @@ impl AskCommand {
                 "agent_name",
                 i18n::AGENT_NAME_ARGUMENT_DESCRIPTION,
             ))
-            .handler(CommandHandler::new(move |context, arguments| {
-                let command = command.clone();
-                async move { handler(&command, context, arguments) }
-            }))
+            .handler(
+                CommandHandler::new(move |context, arguments| {
+                    let command = command.clone();
+                    async move { handler(&command, context, arguments) }
+                })
+                .control(),
+            )
     }
 
     async fn list(
@@ -227,7 +235,7 @@ impl AskCommand {
         ChannelButton::new(
             text,
             style,
-            CommandRequest::new(["ask", command]).with_argument("agent_name", agent_name),
+            CommandRequest::new(["agent", command]).with_argument("agent_name", agent_name),
         )
     }
 

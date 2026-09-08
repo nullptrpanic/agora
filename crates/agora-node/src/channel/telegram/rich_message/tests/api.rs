@@ -1,4 +1,195 @@
 use super::*;
+use std::sync::Arc;
+
+#[tokio::test]
+async fn telegram_worker_delivers_updates_received_during_http_without_another_event() {
+    let server = HttpMockServer::start(|request| {
+        let response = MockResponse::json(r#"{"ok":true,"result":{"message_id":100}}"#);
+        if request.endpoint() == "editMessageText" {
+            response.with_delay(Duration::from_millis(100))
+        } else {
+            response
+        }
+    })
+    .await;
+    let message = TelegramRichMessage::with_timing(
+        group_target(),
+        "agent".into(),
+        telegram_api(&server),
+        TelegramRichTiming::new(Duration::ZERO, Duration::from_secs(3600)),
+    );
+    message
+        .publish(RunEvent::Queued { ahead: 0 })
+        .await
+        .unwrap();
+    message
+        .publish(RunEvent::Output(OutputEvent::Answer {
+            text: "first".into(),
+        }))
+        .await
+        .unwrap();
+    server.wait_for_endpoint_count("editMessageText", 1).await;
+    message
+        .publish(RunEvent::Output(OutputEvent::Answer {
+            text: "second".into(),
+        }))
+        .await
+        .unwrap();
+    server.wait_for_endpoint_count("editMessageText", 2).await;
+    assert!(
+        server
+            .requests()
+            .await
+            .last()
+            .unwrap()
+            .body
+            .contains("firstsecond")
+    );
+    message
+        .publish(RunEvent::Completed { exit_code: 0 })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn telegram_slow_delivery_has_one_retry_worker() {
+    let server = rich_message_server().await;
+    let message = TelegramRichMessage::with_timing(
+        group_target(),
+        "agent".into(),
+        telegram_api(&server),
+        TelegramRichTiming::new(Duration::ZERO, Duration::from_secs(3600)),
+    );
+    message
+        .publish(RunEvent::Queued { ahead: 0 })
+        .await
+        .unwrap();
+    message.inner.state.lock().await.version += 1;
+    let delivery = message.inner.delivery_lock.lock().await;
+    for _ in 0..32 {
+        message
+            .handle_flush_failure("test", &anyhow::anyhow!("transport failure"))
+            .await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            Arc::strong_count(&message.inner) <= 2,
+            "retries queued extra worker owners"
+        );
+    }
+    drop(delivery);
+    message
+        .publish(RunEvent::Completed { exit_code: 0 })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn telegram_slow_delivery_has_one_update_worker_and_keeps_latest_snapshot() {
+    let server = rich_message_server().await;
+    let message = TelegramRichMessage::with_timing(
+        group_target(),
+        "agent".into(),
+        telegram_api(&server),
+        TelegramRichTiming::new(Duration::ZERO, Duration::from_secs(3600)),
+    );
+    message
+        .publish(RunEvent::Queued { ahead: 0 })
+        .await
+        .unwrap();
+    let delivery = message.inner.delivery_lock.lock().await;
+    for index in 0..32 {
+        message
+            .publish(RunEvent::Output(OutputEvent::Thinking {
+                text: format!("newest-{index}"),
+            }))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            Arc::strong_count(&message.inner) <= 2,
+            "updates queued extra worker owners"
+        );
+    }
+    drop(delivery);
+    message
+        .publish(RunEvent::Completed { exit_code: 0 })
+        .await
+        .unwrap();
+    assert!(
+        server
+            .requests()
+            .await
+            .last()
+            .unwrap()
+            .body
+            .contains("newest-31")
+    );
+}
+
+#[tokio::test]
+async fn multipart_retry_survives_unchanged_primary() {
+    let sends = std::sync::atomic::AtomicUsize::new(0);
+    let edits = std::sync::atomic::AtomicUsize::new(0);
+    let server = HttpMockServer::start(move |request| match request.endpoint() {
+        "sendRichMessage" => match sends.fetch_add(1, Ordering::SeqCst) {
+            0 => MockResponse::json(r#"{"ok":true,"result":{"message_id":100}}"#),
+            1 => MockResponse::json(
+                r#"{"ok":false,"error_code":500,"description":"temporary failure on second part"}"#,
+            ),
+            _ => MockResponse::json(r#"{"ok":true,"result":{"message_id":101}}"#),
+        },
+        "editMessageText" => {
+            if edits.fetch_add(1, Ordering::SeqCst) == 0 {
+                MockResponse::json(r#"{"ok":true,"result":{"message_id":100}}"#)
+            } else {
+                MockResponse::json(
+                    r#"{"ok":false,"error_code":400,"description":"Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"}"#,
+                )
+                .with_status(400)
+            }
+        }
+        other => panic!("unexpected endpoint {other}"),
+    })
+    .await;
+    let message = TelegramRichMessage::with_timing(
+        group_target(),
+        "agent".to_string(),
+        telegram_api(&server),
+        TelegramRichTiming {
+            update_interval: Duration::from_secs(3600),
+            heartbeat_interval: Duration::from_secs(3600),
+            retry_interval: Duration::from_secs(3600),
+        },
+    );
+    message
+        .publish(RunEvent::Queued { ahead: 0 })
+        .await
+        .unwrap();
+    message
+        .publish(RunEvent::Output(OutputEvent::Answer {
+            text: "x".repeat(40_000),
+        }))
+        .await
+        .unwrap();
+
+    assert!(
+        message
+            .publish(RunEvent::Completed { exit_code: 0 })
+            .await
+            .is_err()
+    );
+    message
+        .publish(RunEvent::Completed { exit_code: 0 })
+        .await
+        .unwrap();
+
+    assert_eq!(server.endpoint_count("sendRichMessage").await, 3);
+    assert!(message.inner.state.lock().await.terminal_sent);
+}
 
 #[tokio::test]
 async fn default_rich_message_timing_persists_a_complete_private_run() {

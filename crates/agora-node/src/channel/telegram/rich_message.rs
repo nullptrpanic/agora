@@ -179,17 +179,26 @@ impl TelegramRichMessage {
     fn schedule_flush(&self, delay: Duration) {
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            let Some(inner) = weak.upgrade() else {
-                return;
-            };
-            let message = TelegramRichMessage { inner };
-            {
+            let mut delay = delay;
+            loop {
+                tokio::time::sleep(delay).await;
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let message = TelegramRichMessage { inner };
+                let attempted_version = message.inner.state.lock().await.version;
+                if let Err(err) = message.flush_latest(false).await {
+                    message.handle_flush_failure("update", &err).await;
+                }
                 let mut state = message.inner.state.lock().await;
-                state.flush_scheduled = false;
-            }
-            if let Err(err) = message.flush_latest(false).await {
-                message.handle_flush_failure("update", &err).await;
+                if state.version == state.sent_version
+                    || state.version == attempted_version
+                    || state.content.is_terminal()
+                {
+                    state.flush_scheduled = false;
+                    return;
+                }
+                delay = message.inner.timing.update_interval;
             }
         });
     }
@@ -380,6 +389,11 @@ impl TelegramRichMessage {
             } else if !state.retry_scheduled {
                 state.delivery_failures = state.delivery_failures.saturating_add(1);
                 if state.delivery_failures > TELEGRAM_DELIVERY_MAX_FAILURES {
+                    logger::error!(
+                        "telegram delivery retry budget exhausted chat_id={} terminal={}",
+                        self.inner.target.chat_id,
+                        terminal
+                    );
                     None
                 } else {
                     state.retry_scheduled = true;
@@ -391,7 +405,7 @@ impl TelegramRichMessage {
             }
         };
         logger::error!(
-            "telegram rich message {} failed chat_id={} retry_scheduled={} error={}",
+            "telegram rich message {} failed chat_id={} retry_newly_scheduled={} error={}",
             operation,
             self.inner.target.chat_id,
             retry.is_some(),
@@ -406,11 +420,12 @@ impl TelegramRichMessage {
         let message = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
+            let result = message.flush_latest(false).await;
             {
                 let mut state = message.inner.state.lock().await;
                 state.retry_scheduled = false;
             }
-            if let Err(err) = message.flush_latest(false).await {
+            if let Err(err) = result {
                 message.handle_flush_failure("retry", &err).await;
             }
         });
@@ -688,11 +703,16 @@ impl TelegramRichContent {
             };
             let width = escaped_character.chars().count();
             let lines = usize::from(character == '\n');
-            if !escaped.is_empty()
-                && (character_count.saturating_add(width) > character_budget
-                    || line_count.saturating_add(lines) > line_budget)
+            if character_count.saturating_add(width) > character_budget
+                || line_count.saturating_add(lines) > line_budget
             {
-                Self::push_safe_chunk(&mut chunks, &mut first_prefix, &escaped);
+                if !escaped.is_empty() {
+                    Self::push_safe_chunk(&mut chunks, &mut first_prefix, &escaped);
+                } else if let Some(prefix) = first_prefix.take() {
+                    // The prefix fits on its own, but leaves no room for a
+                    // wrapped first character. Do not exceed either budget.
+                    chunks.push(prefix);
+                }
                 character_budget = TELEGRAM_RICH_MESSAGE_MAX_CHARS
                     .saturating_sub(OPENING.chars().count())
                     .saturating_sub(CLOSING.chars().count());
@@ -1150,26 +1170,16 @@ impl TelegramRichContent {
         let total = usage.input_tokens.saturating_add(usage.output_tokens);
         format!(
             "<footer>{} {} · {} {} · {}\n{} {} · {} {}</footer>",
-            Self::format_tokens(total),
+            i18n::format_tokens(total),
             i18n::TOKENS,
             i18n::INPUT,
-            Self::format_tokens(usage.input_tokens),
-            i18n::cached_tokens(Self::format_tokens(usage.cached_input_tokens)),
+            i18n::format_tokens(usage.input_tokens),
+            i18n::cached_tokens(i18n::format_tokens(usage.cached_input_tokens)),
             i18n::OUTPUT,
-            Self::format_tokens(usage.output_tokens),
+            i18n::format_tokens(usage.output_tokens),
             i18n::REASONING,
-            Self::format_tokens(usage.reasoning_output_tokens)
+            i18n::format_tokens(usage.reasoning_output_tokens)
         )
-    }
-
-    fn format_tokens(tokens: u64) -> String {
-        if tokens < 1_000 {
-            tokens.to_string()
-        } else if tokens < 1_000_000 {
-            format!("{:.1}K", tokens as f64 / 1_000.0)
-        } else {
-            format!("{:.1}M", tokens as f64 / 1_000_000.0)
-        }
     }
 
     fn failure_section(message: &str) -> String {

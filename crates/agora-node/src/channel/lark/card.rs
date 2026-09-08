@@ -1,6 +1,6 @@
 use super::LarkReplyTarget;
 use super::channel::LarkConversation;
-use super::lark_api::{LarkApi, LarkHttpStatusError};
+use super::lark_api::{LarkApi, LarkApiError};
 use crate::channel::permission::PermissionDenial;
 use crate::channel::{
     ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun,
@@ -15,6 +15,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+mod budget;
 
 const MAX_ANSWER_BYTES: usize = 20 * 1024;
 const MAX_PROCESS_ELEMENTS: usize = 160;
@@ -100,33 +102,13 @@ impl LarkReplyCard {
             i18n::PERMISSION_DENIED_SUBTITLE.to_string(),
             vec![json!({
                 "tag": "markdown",
-                "content": Self::permission_denied_markdown(denial)
+                "content": denial.markdown()
             })],
         )
     }
 
-    fn permission_denied_markdown(denial: &PermissionDenial) -> String {
-        let mut identifiers = vec![
-            format!("- Channel：`{}`", denial.channel_name()),
-            format!("- User ID：`{}`", denial.user_id()),
-        ];
-        if let Some(group_id) = denial.group_id() {
-            identifiers.push(format!("- Group ID：`{group_id}`"));
-        }
-        let configuration = denial.configuration_example();
-        format!(
-            "**{}**\n\n> {}\n\n**{}**\n{}\n\n**{}**\n```jsonc\n{}\n```",
-            i18n::PERMISSION_DENIED_TITLE,
-            denial.reason(),
-            i18n::PERMISSION_IDENTIFIERS_TITLE,
-            identifiers.join("\n"),
-            i18n::PERMISSION_CONFIG_EXAMPLE_TITLE,
-            configuration
-        )
-    }
-
     pub(super) fn build(reply: &ChannelReply, conversation: LarkConversation) -> Value {
-        match reply {
+        let card = match reply {
             ChannelReply::Text(text) => Self::card(
                 i18n::AGENT_STATUS_TITLE,
                 i18n::CURRENT_CONVERSATION.to_string(),
@@ -137,7 +119,15 @@ impl LarkReplyCard {
             ),
             ChannelReply::AgentList(agents) => Self::agent_list(agents, conversation),
             ChannelReply::AgentStatus(agent) => Self::agent_status(agent),
+        };
+        if card.to_string().len() > super::lark_api::LARK_CARD_MAX_BYTES {
+            return Self::card(
+                i18n::AGENT_STATUS_TITLE,
+                i18n::CURRENT_CONVERSATION.to_string(),
+                vec![json!({"tag":"markdown", "content": i18n::AGENT_REPLY_TOO_LARGE})],
+            );
         }
+        card
     }
 
     fn agent_list(agents: &[ChannelAgentStatus], conversation: LarkConversation) -> Value {
@@ -483,6 +473,7 @@ impl LarkCardContent {
         );
         let answer_started = !self.answer.is_empty();
         let mut elements = Vec::new();
+        let mut process_index = None;
         let mut process_element = if self.process.is_empty() {
             None
         } else {
@@ -509,6 +500,7 @@ impl LarkCardContent {
             && !answer_started
             && let Some(process) = process_element.take()
         {
+            process_index = Some(elements.len());
             elements.push(process);
         }
 
@@ -590,6 +582,7 @@ impl LarkCardContent {
             if !elements.is_empty() {
                 elements.push(json!({ "tag": "hr" }));
             }
+            process_index = Some(elements.len());
             elements.push(process);
         }
 
@@ -650,6 +643,7 @@ impl LarkCardContent {
         if !elements.is_empty() {
             card["body"] = json!({ "elements": elements });
         }
+        budget::fit(&mut card, process_index, self.process.front());
         card
     }
 
@@ -998,7 +992,7 @@ impl LarkCardContent {
                 Self::usage_column(
                     i18n::INPUT,
                     usage.input_tokens,
-                    &i18n::cached_tokens(Self::format_tokens(usage.cached_input_tokens)),
+                    &i18n::cached_tokens(i18n::format_tokens(usage.cached_input_tokens)),
                 ),
                 Self::usage_column(i18n::OUTPUT, usage.output_tokens, i18n::TOKENS),
                 Self::usage_column(
@@ -1021,22 +1015,12 @@ impl LarkCardContent {
                 "tag": "markdown",
                 "content": format!(
                     "<font color='grey'>{label}</font>\n**{}**\n<font color='grey'>{detail}</font>",
-                    Self::format_tokens(tokens),
+                    i18n::format_tokens(tokens),
                 ),
                 "text_align": "center",
                 "text_size": "notation",
             }]
         })
-    }
-
-    fn format_tokens(tokens: u64) -> String {
-        if tokens < 1_000 {
-            tokens.to_string()
-        } else if tokens < 1_000_000 {
-            format!("{:.1}K", tokens as f64 / 1_000.0)
-        } else {
-            format!("{:.1}M", tokens as f64 / 1_000_000.0)
-        }
     }
 
     fn truncate_answer(answer: &str) -> String {
@@ -1088,6 +1072,13 @@ impl LarkAgentCard {
     async fn publish_event(&self, event: RunEvent) -> Result<()> {
         let flush_now = {
             let mut state = self.inner.state.lock().await;
+            if !matches!(
+                state.content.state,
+                LarkRunState::Queued { .. } | LarkRunState::Running
+            ) {
+                drop(state);
+                return self.flush_latest().await;
+            }
             let flush_now = match event {
                 RunEvent::Queued { ahead } => {
                     state.content.queue(ahead);
@@ -1138,19 +1129,35 @@ impl LarkAgentCard {
     }
 
     fn schedule_flush(&self, delay: Duration) {
-        let card = self.clone();
+        let weak = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            {
+            let mut delay = delay;
+            loop {
+                tokio::time::sleep(delay).await;
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let card = LarkAgentCard { inner };
+                let attempted_version = card.inner.state.lock().await.version;
+                if let Err(err) = card.flush_latest().await {
+                    logger::error!(
+                        "lark card update failed source_message_id={} error={}",
+                        card.inner.target.message_id,
+                        err
+                    );
+                }
                 let mut state = card.inner.state.lock().await;
-                state.flush_scheduled = false;
-            }
-            if let Err(err) = card.flush_latest().await {
-                logger::error!(
-                    "lark card update failed source_message_id={} error={}",
-                    card.inner.target.message_id,
-                    err
-                );
+                if state.version == state.sent_version
+                    || state.version == attempted_version
+                    || !matches!(
+                        state.content.state,
+                        LarkRunState::Queued { .. } | LarkRunState::Running
+                    )
+                {
+                    state.flush_scheduled = false;
+                    return;
+                }
+                delay = CARD_UPDATE_INTERVAL;
             }
         });
     }
@@ -1189,8 +1196,8 @@ impl LarkAgentCard {
                 Err(error)
                     if !refreshed
                         && error
-                            .downcast_ref::<LarkHttpStatusError>()
-                            .is_some_and(LarkHttpStatusError::is_unauthorized) =>
+                            .downcast_ref::<LarkApiError>()
+                            .is_some_and(LarkApiError::is_unauthorized) =>
                 {
                     self.inner
                         .api

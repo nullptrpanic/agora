@@ -64,7 +64,7 @@ fn node_config_generate_builds_a_telegram_config_without_detected_codex() {
         empty_path.path(),
         "-g",
         std::path::Path::new("config2.json"),
-        "9\n2\nbot-token\nallowed-user\n\n/custom/bin/codex\n\ngpt-5.6\n\n",
+        "9\n2\n123:bot-token\nallowed-user\n\n/custom/bin/codex\n\ngpt-5.6\n\n",
     );
 
     assert!(
@@ -81,7 +81,7 @@ fn node_config_generate_builds_a_telegram_config_without_detected_codex() {
         panic!("generated channel should be Telegram");
     };
     assert_eq!(channel.name, "telegram");
-    assert_eq!(channel.token, "bot-token");
+    assert_eq!(channel.token, "123:bot-token");
     assert_eq!(channel.permission.users[0].id, "allowed-user");
     assert_generated_agent(
         &config,
@@ -237,7 +237,7 @@ fn node_config_generate_overwrites_an_existing_config() {
         empty_path.path(),
         "-g",
         &config_path,
-        "2\nreplacement-token\nallowed-user\n\n/custom/bin/codex\ngpt-5.6\n\n",
+        "2\n123:replacement-token\nallowed-user\n\n/custom/bin/codex\ngpt-5.6\n\n",
     );
 
     assert!(
@@ -250,7 +250,7 @@ fn node_config_generate_overwrites_an_existing_config() {
     let ChannelConfig::Telegram(channel) = &config.channels[0] else {
         panic!("generated channel should be Telegram");
     };
-    assert_eq!(channel.token, "replacement-token");
+    assert_eq!(channel.token, "123:replacement-token");
 }
 
 #[test]
@@ -262,7 +262,7 @@ fn node_config_generate_reports_the_underlying_write_error() {
         empty_path.path(),
         "-g",
         temp.path(),
-        "2\nbot-token\nallowed-user\n\n/custom/bin/codex\ngpt-5.6\n\n",
+        "2\n123:bot-token\nallowed-user\n\n/custom/bin/codex\ngpt-5.6\n\n",
     );
 
     assert!(!output.status.success());

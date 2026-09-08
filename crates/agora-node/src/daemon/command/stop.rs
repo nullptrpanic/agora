@@ -20,10 +20,13 @@ impl StopCommand {
                 "agent_name",
                 i18n::STOP_AGENT_ARGUMENT_DESCRIPTION,
             ))
-            .handler(CommandHandler::new(move |context, arguments| {
-                let command = command.clone();
-                async move { command.stop(context, arguments).await }
-            }))
+            .handler(
+                CommandHandler::new(move |context, arguments| {
+                    let command = command.clone();
+                    async move { command.stop(context, arguments).await }
+                })
+                .control(),
+            )
     }
 
     async fn stop(

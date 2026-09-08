@@ -55,7 +55,9 @@ pub(crate) const STOP_AGENT_ARGUMENT_DESCRIPTION: &str =
     "已配置的 Agent 名称；省略时停止全部 Agent。";
 pub(crate) const RESET_COMMAND_DESCRIPTION: &str = "停止任务并重置后端 Agent 会话。";
 pub(crate) const RESET_SUCCESSFUL: &str = "重置成功。";
-pub(crate) const ASK_COMMAND_DESCRIPTION: &str = "向指定 Agent 提问或控制 Agent 的消息接收状态。";
+pub(crate) const ASK_COMMAND_DESCRIPTION: &str = "向指定 Agent 提问。";
+pub(crate) const AGENT_COMMAND_DESCRIPTION: &str = "管理 Agent 的消息接收状态。";
+pub(crate) const AGENT_REPLY_TOO_LARGE: &str = "Agent 列表或回复超出卡片大小限制，无法展示完整列表和按钮。请使用 /agent status {agent_name} 查看单个状态，使用 /agent enable {agent_name} 或 /agent disable {agent_name} 管理消息接收。";
 pub(crate) const AGENT_NAME_ARGUMENT_DESCRIPTION: &str = "当前对话中已配置的 Agent 名称。";
 pub(crate) const ASK_PROMPT_ARGUMENT_DESCRIPTION: &str = "仅发送给指定 Agent 的提示词。";
 pub(crate) const ASK_LIST_DESCRIPTION: &str = "列出所有已订阅 Agent 及其当前状态。";
@@ -179,11 +181,14 @@ pub(crate) fn reset_failed(agent_names: &[String]) -> String {
 }
 
 pub(crate) fn command_details_hint(command_path: &str) -> String {
-    format!("使用 {command_path} {{子命令}} help 查看详情。")
+    format!(
+        "使用 /help {} {{子命令}} 查看详情。",
+        command_path.trim_start_matches('/')
+    )
 }
 
 pub(crate) fn root_command_details_hint() -> &'static str {
-    "使用 /{command} help 查看详情。"
+    "使用 /help {command} 查看详情。"
 }
 
 pub(crate) fn usage(syntax: &str) -> String {

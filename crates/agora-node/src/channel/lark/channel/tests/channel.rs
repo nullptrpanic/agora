@@ -87,7 +87,7 @@ fn acknowledged_event_receiver(
 async fn permission_api() -> (LarkApi, HttpMockServer) {
     let server = HttpMockServer::start(|request| {
         let body = if request.path.ends_with("tenant_access_token/internal") {
-            r#"{"code":0,"msg":"ok","tenant_access_token":"token"}"#
+            r#"{"code":0,"msg":"ok","tenant_access_token":"token","expire":7200}"#
         } else if request.path == "/open-apis/bot/v3/info" {
             r#"{"code":0,"msg":"ok","bot":{"open_id":"ou-bot"}}"#
         } else if request.path.ends_with("/reply") {
@@ -165,7 +165,7 @@ async fn receiver_routes_ignored_interrupt_card_and_message_events() {
             user_id: "ou-user".to_string(),
             session_id: "oc-chat".to_string(),
             message_id: "om-card".to_string(),
-            command: CommandRequest::new(["ask", "list"]),
+            command: CommandRequest::new(["agent", "list"]),
             conversation: None,
         }),
     ]));
@@ -174,7 +174,7 @@ async fn receiver_routes_ignored_interrupt_card_and_message_events() {
     assert!(interrupted.load(AtomicOrdering::Relaxed));
     assert_eq!(task.task_id(), "evt-action");
     assert_eq!(task.session_id(), "oc-chat");
-    assert_eq!(task.input().command().unwrap().path(), &["ask", "list"]);
+    assert_eq!(task.input().command().unwrap().path(), &["agent", "list"]);
 
     channel.receiver = Some(event_receiver([]));
     assert!(channel.recv().await.unwrap().is_none());
@@ -223,7 +223,7 @@ async fn private_messages_support_text_replies_runs_and_actions() {
             user_id: "ou-user".to_string(),
             session_id: "oc-chat".to_string(),
             message_id: "om-card".to_string(),
-            command: CommandRequest::new(["ask", "list"]),
+            command: CommandRequest::new(["agent", "list"]),
             conversation: None,
         },
     )]));
@@ -284,7 +284,9 @@ async fn receiver_maps_daemon_acceptance_and_retry_to_lark_status() {
 async fn receiver_rejects_ack_when_attachment_normalization_fails() {
     let server = HttpMockServer::start(|request| {
         if request.path.ends_with("tenant_access_token/internal") {
-            MockResponse::json(r#"{"code":0,"msg":"ok","tenant_access_token":"token"}"#)
+            MockResponse::json(
+                r#"{"code":0,"msg":"ok","tenant_access_token":"token","expire":7200}"#,
+            )
         } else {
             MockResponse::json("download failed").with_status(503)
         }
@@ -315,7 +317,9 @@ async fn receiver_rejects_ack_when_attachment_normalization_fails() {
 async fn receiver_acknowledges_permanent_attachment_failures() {
     let server = HttpMockServer::start(|request| {
         if request.path.ends_with("tenant_access_token/internal") {
-            MockResponse::json(r#"{"code":0,"msg":"ok","tenant_access_token":"token"}"#)
+            MockResponse::json(
+                r#"{"code":0,"msg":"ok","tenant_access_token":"token","expire":7200}"#,
+            )
         } else {
             MockResponse::json("missing").with_status(404)
         }
@@ -479,7 +483,7 @@ async fn lark_actions_check_the_actor_but_do_not_require_a_new_mention() {
             user_id: "ou-allowed".to_string(),
             session_id: "oc-chat".to_string(),
             message_id: "om-card-allowed".to_string(),
-            command: CommandRequest::new(["ask", "list"]),
+            command: CommandRequest::new(["agent", "list"]),
             conversation: None,
         }),
     ]));
@@ -489,8 +493,8 @@ async fn lark_actions_check_the_actor_but_do_not_require_a_new_mention() {
     assert_eq!(task.task_id(), "evt-allowed");
     assert_eq!(task.conversation(), Some(LarkConversation::Group));
     assert!(!interrupted.load(AtomicOrdering::Relaxed));
-    let cloned = channel.clone();
-    assert!(cloned.group_sessions.is_empty());
+    let cloned = channel.sender().clone();
+    assert!(!channel.group_sessions.is_empty());
     cloned
         .reply(&task, ChannelReply::new("legacy action reply"))
         .await
@@ -517,7 +521,7 @@ async fn marked_group_card_actions_survive_channel_reconstruction() {
                 "operator":{"open_id":"ou-allowed"},
                 "action":{"tag":"button","value":{
                     "agora_conversation":"group",
-                    "agora_command":{"path":["ask","list"],"arguments":{}}
+                    "agora_command":{"path":["agent","list"],"arguments":{}}
                 }},
                 "context":{"open_message_id":"om-card","open_chat_id":"oc-restarted"}
             }
@@ -548,7 +552,7 @@ async fn marked_private_card_actions_survive_channel_reconstruction() {
                 "operator":{"open_id":"ou-allowed"},
                 "action":{"tag":"button","value":{
                     "agora_conversation":"private",
-                    "agora_command":{"path":["ask","list"],"arguments":{}}
+                    "agora_command":{"path":["agent","list"],"arguments":{}}
                 }},
                 "context":{"open_message_id":"om-card","open_chat_id":"oc-private"}
             }
@@ -612,7 +616,7 @@ async fn card_action_tasks_cannot_open_agent_runs() {
         user_id: "ou-user".to_string(),
         session_id: "oc-chat".to_string(),
         message_id: "om-card".to_string(),
-        command: CommandRequest::new(["ask", "list"]),
+        command: CommandRequest::new(["agent", "list"]),
         conversation: None,
     });
     let error = channel
@@ -642,7 +646,6 @@ async fn configured_channel_rejects_a_task_from_another_channel_type() {
         permission: Default::default(),
         proxy: None,
     }))
-    .unwrap()
     .unwrap();
     let task = ConfiguredTask::Lark(LarkTask::from_message(
         message("text"),

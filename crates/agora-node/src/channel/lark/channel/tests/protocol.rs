@@ -114,7 +114,7 @@ fn parses_lark_agent_enabled_card_action() {
                     "tag": "button",
                     "value": {
                         "agora_command": {
-                            "path": ["ask", "enable"],
+                            "path": ["agent", "enable"],
                             "arguments": {
                                 "agent_name": "reviewer"
                             }
@@ -137,7 +137,7 @@ fn parses_lark_agent_enabled_card_action() {
     assert_eq!(event.session_id, "oc_123");
     assert_eq!(
         event.command,
-        CommandRequest::new(["ask", "enable"]).with_argument("agent_name", "reviewer")
+        CommandRequest::new(["agent", "enable"]).with_argument("agent_name", "reviewer")
     );
 }
 

@@ -6,6 +6,34 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 
+#[test]
+fn websocket_failure_diagnostics_keep_codes_without_peer_secrets() {
+    let error = anyhow::Error::new(LarkApiError::Business {
+        code: 99991663,
+        message: "https://host?token=private".into(),
+    })
+    .context("bootstrap");
+    assert_eq!(websocket_failure_reason(&error), "lark_code_99991663");
+    assert_eq!(
+        websocket_failure_reason(&LarkApiError::Http(StatusCode::SERVICE_UNAVAILABLE).into()),
+        "http_status_503"
+    );
+    assert_eq!(
+        websocket_failure_reason(
+            &std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "private").into()
+        ),
+        "io_ConnectionRefused"
+    );
+    assert_eq!(
+        websocket_failure_reason(&anyhow!("connect lark websocket timed out")),
+        "connect_timeout"
+    );
+    assert_eq!(
+        websocket_failure_reason(&anyhow!("https://host?token=private")),
+        "unclassified_connection_error"
+    );
+}
+
 fn config() -> LarkChannelConfig {
     LarkChannelConfig {
         name: "lark-api-test".to_string(),
@@ -13,6 +41,67 @@ fn config() -> LarkChannelConfig {
         secret: "secret".to_string(),
         permission: Default::default(),
         proxy: None,
+    }
+}
+
+#[tokio::test]
+async fn lark_card_serialized_budget_is_enforced_before_http() {
+    let server = HttpMockServer::start_json_queue([
+        r#"{"code":0,"msg":"ok","data":{"message_id":"reply"}}"#,
+        r#"{"code":0,"msg":"ok"}"#,
+    ])
+    .await;
+    let api = LarkApi::with_base_url(config(), server.base_url()).unwrap();
+    let card = json!({"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "x".repeat(30_001)}]}});
+    assert!(
+        api.reply_card(
+            "token",
+            &LarkReplyTarget {
+                message_id: "source".into()
+            },
+            &card
+        )
+        .await
+        .is_err()
+    );
+    assert!(api.patch_card("token", "reply", &card).await.is_err());
+    assert!(server.requests().await.is_empty());
+}
+
+#[tokio::test]
+async fn tenant_token_cache_obeys_server_expiry_and_preserves_newer_tokens() {
+    let server = HttpMockServer::start_json_queue([
+        r#"{"code":0,"msg":"ok","tenant_access_token":"first","expire":10}"#,
+        r#"{"code":0,"msg":"ok","tenant_access_token":"second","expire":7200}"#,
+    ])
+    .await;
+    let api = LarkApi::with_base_url(config(), server.base_url()).unwrap();
+    assert_eq!(api.cached_tenant_access_token().await.unwrap(), "first");
+    assert_eq!(api.cached_tenant_access_token().await.unwrap(), "first");
+    {
+        let mut cache = api.token_cache.lock().await;
+        let token = cache.as_mut().unwrap();
+        assert!(token.expires_at <= Instant::now() + Duration::from_secs(10));
+        token.expires_at = Instant::now() - Duration::from_secs(1);
+    }
+    assert_eq!(api.cached_tenant_access_token().await.unwrap(), "second");
+    api.invalidate_cached_tenant_access_token("first").await;
+    assert_eq!(api.cached_tenant_access_token().await.unwrap(), "second");
+    assert_eq!(server.requests().await.len(), 2);
+}
+
+#[tokio::test]
+async fn tenant_token_cache_rejects_invalid_token_or_lifetime() {
+    for body in [
+        r#"{"code":0,"msg":"ok","tenant_access_token":"","expire":7200}"#,
+        r#"{"code":0,"msg":"ok","tenant_access_token":"token","expire":0}"#,
+        r#"{"code":0,"msg":"ok","tenant_access_token":"token","expire":-1}"#,
+        r#"{"code":0,"msg":"ok","tenant_access_token":"token"}"#,
+    ] {
+        let server = HttpMockServer::start_json_queue([body]).await;
+        let api = LarkApi::with_base_url(config(), server.base_url()).unwrap();
+        assert!(api.cached_tenant_access_token().await.is_err(), "{body}");
+        assert!(api.token_cache.lock().await.is_none());
     }
 }
 
@@ -32,6 +121,89 @@ fn event_frame(payload: impl Into<Vec<u8>>) -> LarkFrame {
 
 fn message_event_payload() -> Vec<u8> {
     br#"{"schema":"2.0","header":{"event_id":"evt_1","event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_1"}},"message":{"message_id":"om_1","chat_id":"oc_1","chat_type":"group","message_type":"text","content":"{\"text\":\"hello\"}"}}}"#.to_vec()
+}
+
+#[tokio::test]
+async fn fragmented_websocket_event_is_admitted_only_after_reassembly() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let websocket_url = format!("ws://{}/", listener.local_addr().unwrap());
+    let endpoint = HttpMockServer::start(move |_| {
+        MockResponse::json(format!(
+            r#"{{"code":0,"msg":"ok","data":{{"URL":"{websocket_url}"}}}}"#
+        ))
+    })
+    .await;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        let payload = message_event_payload();
+        let (first, second) = payload.split_at(payload.len() / 2);
+        for (seq, part) in [(1, second), (1, second), (0, first)] {
+            let mut frame = event_frame(part.to_vec());
+            frame.upsert_header("message_id", "fragmented-event");
+            frame.upsert_header("sum", "2");
+            frame.upsert_header("seq", seq.to_string());
+            socket
+                .send(WebSocketMessage::Binary(frame.encode_to_vec().into()))
+                .await
+                .unwrap();
+            if seq == 1 {
+                socket
+                    .send(WebSocketMessage::Ping(vec![7].into()))
+                    .await
+                    .unwrap();
+                loop {
+                    match socket.next().await.unwrap().unwrap() {
+                        WebSocketMessage::Pong(_) => break,
+                        WebSocketMessage::Binary(bytes) => {
+                            assert_ne!(
+                                LarkFrame::decode(bytes).unwrap().method,
+                                LARK_FRAME_TYPE_DATA,
+                                "an incomplete event must not be acknowledged"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        loop {
+            if let WebSocketMessage::Binary(bytes) = socket.next().await.unwrap().unwrap() {
+                let ack = LarkFrame::decode(bytes).unwrap();
+                if ack.method == LARK_FRAME_TYPE_DATA {
+                    assert_eq!(ack.header("message_id"), Some("fragmented-event"));
+                    assert_eq!(ack.header("seq"), Some("0"));
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&ack.payload).unwrap()["code"],
+                        200
+                    );
+                    break;
+                }
+            }
+        }
+        socket.send(WebSocketMessage::Close(None)).await.unwrap();
+    });
+    let api = LarkApi::with_base_url(config(), endpoint.base_url()).unwrap();
+    let (sender, mut receiver) = mpsc::channel::<LarkDelivery>(1);
+    let admitted = tokio::spawn(async move {
+        let delivery = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (event, acknowledgement) = delivery.into_parts();
+        assert!(matches!(event, LarkEvent::Message(_)));
+        acknowledgement.send(200).unwrap();
+        assert!(receiver.recv().await.is_none());
+    });
+    let mut connected = false;
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        api.run_websocket_once(sender, &mut connected),
+    )
+    .await;
+    server.await.unwrap();
+    result.unwrap().unwrap();
+    admitted.await.unwrap();
 }
 
 fn short_websocket_timing() -> LarkWebSocketTiming {
@@ -798,7 +970,9 @@ async fn lark_patch_retries_transport_failures_without_exposing_secrets() {
 async fn lark_api_reads_the_current_bot_open_id() {
     let server = HttpMockServer::start(|request| {
         if request.path.ends_with("tenant_access_token/internal") {
-            MockResponse::json(r#"{"code":0,"msg":"ok","tenant_access_token":"token"}"#)
+            MockResponse::json(
+                r#"{"code":0,"msg":"ok","tenant_access_token":"token","expire":7200}"#,
+            )
         } else {
             assert_eq!(request.path, "/open-apis/bot/v3/info");
             MockResponse::json(

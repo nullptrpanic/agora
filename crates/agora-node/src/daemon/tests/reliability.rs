@@ -231,6 +231,7 @@ struct ReliabilityRunState {
     terminal_count: AtomicUsize,
     queued_gate: Option<Arc<Semaphore>>,
     fail_initial_queued: bool,
+    fail_second_queued: bool,
     fail_started: bool,
     fail_output: bool,
 }
@@ -265,7 +266,8 @@ impl ChannelRun for ReliabilityRun {
         match event {
             RunEvent::Queued { .. } => {
                 let queued = self.state.queued_count.fetch_add(1, Ordering::AcqRel) + 1;
-                if self.state.fail_initial_queued {
+                if self.state.fail_initial_queued || (queued == 2 && self.state.fail_second_queued)
+                {
                     bail!("initial queued delivery failed");
                 }
                 if queued > 1
@@ -300,7 +302,7 @@ struct ReliabilityChannel {
     reply_gate: Option<Arc<Semaphore>>,
 }
 
-impl Channel for ReliabilityChannel {
+impl crate::channel::ChannelSender for ReliabilityChannel {
     type Task = ScopedTask;
     type Run = ReliabilityRun;
 
@@ -310,14 +312,6 @@ impl Channel for ReliabilityChannel {
 
     fn identity(&self) -> ChannelIdentity {
         ChannelIdentity::new(self.name(), "test", self.name())
-    }
-
-    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
-        if let Some(delivery) = self.tasks.lock().unwrap().pop_front() {
-            Ok(Some(delivery))
-        } else {
-            pending().await
-        }
     }
 
     async fn open_run(&self, _task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
@@ -338,6 +332,19 @@ impl Channel for ReliabilityChannel {
             gate.acquire().await.unwrap().forget();
         }
         Ok(())
+    }
+}
+impl Channel for ReliabilityChannel {
+    type Sender = Self;
+    fn sender(&self) -> Self::Sender {
+        self.clone()
+    }
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
+        if let Some(delivery) = self.tasks.lock().unwrap().pop_front() {
+            Ok(Some(delivery))
+        } else {
+            pending().await
+        }
     }
 }
 
@@ -412,6 +419,95 @@ async fn wait_for(condition: impl Fn() -> bool) {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn partial_initial_publication_is_closed_on_error_and_timeout() {
+    for fail in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = reliability_dispatcher(temp.path(), &runtime(4, 2));
+        let state = Arc::new(ReliabilityRunState {
+            fail_second_queued: fail,
+            queued_gate: Some(Arc::new(Semaphore::new(0))),
+            ..Default::default()
+        });
+        let (ack, disposition) = oneshot::channel();
+        let task = ChannelDelivery::new(
+            ScopedTask::new("partial", "chat-1"),
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            move |result| {
+                let _ = ack.send(result);
+            },
+        );
+        let channel = reliability_channel(task, Arc::clone(&state));
+        let agents = ["first", "second"]
+            .into_iter()
+            .map(|name| reliability_agent(name, temp.path(), std::path::Path::new("/bin/cat")))
+            .collect();
+        let daemon = run_reliability_channel(
+            channel,
+            agents,
+            dispatcher.clone(),
+            super::super::TaskSlots::new(4),
+        );
+        assert_eq!(disposition.await.unwrap(), DeliveryDisposition::Retry);
+        wait_for(|| state.terminal_count.load(Ordering::Acquire) == 2).await;
+        for name in ["first", "second"] {
+            let events = state.events_for(name);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, RunEvent::Started { .. }))
+            );
+            assert!(matches!(events.last(), Some(RunEvent::Failed { .. })));
+        }
+        timeout(
+            Duration::from_secs(1),
+            dispatcher.scheduler.wait_until_complete(),
+        )
+        .await
+        .unwrap();
+        daemon.abort();
+    }
+}
+
+#[tokio::test]
+async fn stop_bypasses_full_task_capacity_and_a_slow_busy_reply() {
+    let temp = tempfile::tempdir().unwrap();
+    let dispatcher = reliability_dispatcher(temp.path(), &runtime(4, 2));
+    let admitted = dispatcher
+        .scheduler
+        .try_enqueue_batch(vec![super::super::ExecutionScope::new(
+            "reliability",
+            "chat-1",
+            SessionKey::new("agent", IsolationScope::session("reliability", "chat-1")),
+            temp.path().to_path_buf(),
+        )])
+        .unwrap()
+        .pop()
+        .unwrap();
+    let (execution, _completion) = admitted.into_parts();
+    let control = execution.control();
+    let (busy, _busy_ack) = delivery("busy", "chat-1");
+    let mut channel = reliability_channel(busy, Arc::new(ReliabilityRunState::default()));
+    channel.reply_gate = Some(Arc::new(Semaphore::new(0)));
+    let mut task = ScopedTask::new("stop", "chat-1");
+    task.input = ChannelTaskInput::Message(TaskContent::new("/stop"));
+    channel
+        .tasks
+        .lock()
+        .unwrap()
+        .push_back(ChannelDelivery::new(
+            task,
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            |_| {},
+        ));
+    let slots = super::super::TaskSlots::new(1);
+    let _occupied = slots.try_acquire().unwrap();
+    let daemon = run_reliability_channel(channel, Vec::new(), dispatcher, slots);
+    let cancellation = timeout(Duration::from_millis(500), control.cancelled()).await;
+    daemon.abort();
+    assert_eq!(cancellation.unwrap(), AgentRunCancellation::Stopped);
 }
 
 #[tokio::test]

@@ -1,6 +1,69 @@
 use super::*;
 
 #[test]
+fn split_budget_includes_prefix_and_wrapper() {
+    for prefix in [
+        "x".repeat(32_767),
+        "line\n".repeat(399),
+        "<b>x</b>\n".repeat(133),
+    ] {
+        for (text, escaped) in [
+            ("y", "y"),
+            ("&", "&amp;"),
+            ("<", "&lt;"),
+            ("你", "你"),
+            ("\n", "\n"),
+        ] {
+            let parts =
+                TelegramRichContent::split_sections(vec![prefix.clone(), text.repeat(32_769)]);
+
+            assert!(
+                parts[0] == prefix,
+                "the full prefix must be sent on its own"
+            );
+            assert!(parts.iter().all(|part| part.chars().count() <= 32_768));
+            assert!(
+                parts
+                    .iter()
+                    .all(|part| part.lines().count() + part.matches('<').count() <= 400)
+            );
+            let content = parts[1..]
+                .iter()
+                .map(|part| {
+                    part.strip_prefix("<pre>")
+                        .unwrap()
+                        .strip_suffix("</pre>")
+                        .unwrap()
+                })
+                .collect::<String>();
+            assert_eq!(content, escaped.repeat(32_769));
+        }
+    }
+}
+
+#[test]
+fn split_budget_reserves_the_first_escaped_character() {
+    let prefix = "x".repeat(32_754);
+    let parts = TelegramRichContent::split_sections(vec![prefix.clone(), "&".repeat(32_769)]);
+
+    assert!(
+        parts[0] == prefix,
+        "the escaped character does not fit beside the prefix"
+    );
+    assert!(parts.iter().all(|part| part.chars().count() <= 32_768));
+    let content = parts[1..]
+        .iter()
+        .map(|part| {
+            part.strip_prefix("<pre>")
+                .unwrap()
+                .strip_suffix("</pre>")
+                .unwrap()
+        })
+        .collect::<String>();
+    assert_eq!(content, "&amp;".repeat(32_769));
+}
+
+#[test]
 fn telegram_terminal_header_aligns_agent_and_status_on_one_baseline() {
     let mut content = TelegramRichContent::new("codex-dev".to_string());
     content.apply(RunEvent::Completed { exit_code: 0 });
@@ -608,7 +671,7 @@ fn telegram_draft_and_terminal_rendering_cover_all_progress_labels() {
 
 #[test]
 fn telegram_escape_tail_accounts_for_structural_character_expansion() {
-    assert_eq!(TelegramRichContent::format_tokens(1_000_000), "1.0M");
+    assert_eq!(crate::i18n::format_tokens(1_000_000), "1.0M");
     assert_eq!(
         TelegramRichContent::escape_tail("prefix&<>", 13),
         "&amp;&lt;&gt;"

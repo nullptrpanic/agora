@@ -5,7 +5,7 @@ fn telegram_permission_denial_owns_its_rich_markdown_layout() {
     let denial =
         PermissionDenial::new("telegram1", "42", Some("-1001"), "当前群聊未在允许列表中。");
 
-    let markdown = TelegramChannel::render_permission_denial(&denial);
+    let markdown = denial.markdown();
 
     assert!(markdown.starts_with("**无权访问此 Channel**"));
     assert!(markdown.contains("> 当前群聊未在允许列表中。"));
@@ -237,7 +237,6 @@ fn ignores_commands_addressed_to_another_bot() {
 #[test]
 fn configured_telegram_channel_is_active() {
     let channel = ConfiguredChannel::from_config(ChannelConfig::Telegram(telegram_config()))
-        .unwrap()
         .expect("telegram channel should be active");
 
     assert!(matches!(channel, ConfiguredChannel::Telegram(_)));

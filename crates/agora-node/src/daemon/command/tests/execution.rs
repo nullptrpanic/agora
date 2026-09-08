@@ -24,11 +24,12 @@ fn command_execution_conversions_and_handler_identity_are_explicit() {
 
 #[test]
 fn neutral_command_request_and_button_preserve_data() {
-    let request = CommandRequest::new(["ask", "disable"]).with_argument("agent_name", "codex-dev");
+    let request =
+        CommandRequest::new(["agent", "disable"]).with_argument("agent_name", "codex-dev");
     let input = ChannelTaskInput::Command(request.clone());
     let button = ChannelButton::new("Disable", ChannelButtonStyle::Default, request.clone());
 
-    assert_eq!(request.path(), ["ask", "disable"]);
+    assert_eq!(request.path(), ["agent", "disable"]);
     assert_eq!(request.argument("agent_name"), Some("codex-dev"));
     assert_eq!(input.command(), Some(&request));
     assert_eq!(button.text(), "Disable");

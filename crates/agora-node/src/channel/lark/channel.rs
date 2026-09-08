@@ -3,8 +3,8 @@ use super::card::{LarkAgentCard, LarkReplyCard};
 use super::lark_api::{LarkApi, LarkImageDownloadError};
 use crate::channel::permission::{AccessContext, PermissionGate};
 use crate::channel::{
-    Channel, ChannelDelivery, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask,
-    DeliveryDisposition, InterruptCallbacks, RunEvent,
+    Channel, ChannelDelivery, ChannelReply, ChannelRun, ChannelRunContext, ChannelSender,
+    ChannelTask, DeliveryDisposition, InterruptCallbacks, RunEvent,
 };
 #[cfg(test)]
 use crate::config::ChannelPermissionConfig;
@@ -483,18 +483,11 @@ pub struct LarkChannel {
     receiver: Option<LarkWebSocketReceiver>,
 }
 
-impl Clone for LarkChannel {
-    fn clone(&self) -> Self {
-        Self {
-            api: self.api.clone(),
-            identity: self.identity.clone(),
-            permission: self.permission.clone(),
-            bot_open_id: self.bot_open_id.clone(),
-            group_sessions: GroupSessions::default(),
-            interrupts: self.interrupts.clone(),
-            receiver: None,
-        }
-    }
+#[derive(Clone)]
+pub struct LarkSender {
+    api: LarkApi,
+    identity: ChannelIdentity,
+    interrupts: InterruptCallbacks,
 }
 
 impl LarkChannel {
@@ -760,7 +753,7 @@ impl LarkChannel {
     }
 }
 
-impl Channel for LarkChannel {
+impl ChannelSender for LarkSender {
     type Task = LarkTask;
     type Run = LarkRun;
 
@@ -770,46 +763,6 @@ impl Channel for LarkChannel {
 
     fn identity(&self) -> ChannelIdentity {
         self.identity.clone()
-    }
-
-    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
-        loop {
-            let Some(delivery) = self.receiver().next_delivery().await? else {
-                return Ok(None);
-            };
-            let deadline = delivery.deadline();
-            let (event, acknowledgement) = delivery.into_parts();
-            let admitted = tokio::time::timeout_at(deadline, self.handle_event(event)).await;
-            match admitted {
-                Err(_) => {
-                    let _ = acknowledgement.send(500);
-                    return Err(anyhow!("lark event admission timed out"));
-                }
-                Ok(Ok(Some(task))) => {
-                    return Ok(Some(ChannelDelivery::new(
-                        task,
-                        deadline,
-                        move |disposition| {
-                            let status = match disposition {
-                                DeliveryDisposition::Accepted => 200,
-                                DeliveryDisposition::Retry => 500,
-                            };
-                            let _ = acknowledgement.send(status);
-                        },
-                    )));
-                }
-                Ok(Ok(None)) => {
-                    let _ = acknowledgement.send(200);
-                }
-                Ok(Err(error)) => {
-                    let permanent = error
-                        .downcast_ref::<LarkImageDownloadError>()
-                        .is_some_and(LarkImageDownloadError::is_permanent);
-                    let _ = acknowledgement.send(if permanent { 200 } else { 500 });
-                    return Err(error);
-                }
-            }
-        }
     }
 
     async fn open_run(&self, task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
@@ -857,8 +810,8 @@ impl Channel for LarkChannel {
                 }
             },
             LarkTaskSource::CardAction(event) => {
-                let conversation = self
-                    .action_conversation(&event.session_id, event.conversation)
+                let conversation = event
+                    .conversation
                     .context("lark card action conversation is unresolved")?;
                 self.api
                     .patch_card(
@@ -872,6 +825,71 @@ impl Channel for LarkChannel {
     }
 }
 
+impl ChannelSender for LarkChannel {
+    type Task = LarkTask;
+    type Run = LarkRun;
+    fn name(&self) -> &str {
+        self.api.name()
+    }
+    fn identity(&self) -> ChannelIdentity {
+        self.identity.clone()
+    }
+    async fn open_run(&self, task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
+        self.sender().open_run(task, context).await
+    }
+    async fn reply(&self, task: &Self::Task, reply: ChannelReply) -> Result<()> {
+        self.sender().reply(task, reply).await
+    }
+}
+impl Channel for LarkChannel {
+    type Sender = LarkSender;
+    fn sender(&self) -> Self::Sender {
+        LarkSender {
+            api: self.api.clone(),
+            identity: self.identity.clone(),
+            interrupts: self.interrupts.clone(),
+        }
+    }
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
+        loop {
+            let Some(delivery) = self.receiver().next_delivery().await? else {
+                return Ok(None);
+            };
+            let deadline = delivery.deadline();
+            let (event, acknowledgement) = delivery.into_parts();
+            let admitted = tokio::time::timeout_at(deadline, self.handle_event(event)).await;
+            match admitted {
+                Err(_) => {
+                    let _ = acknowledgement.send(500);
+                    return Err(anyhow!("lark event admission timed out"));
+                }
+                Ok(Ok(Some(task))) => {
+                    return Ok(Some(ChannelDelivery::new(
+                        task,
+                        deadline,
+                        move |disposition| {
+                            let status = match disposition {
+                                DeliveryDisposition::Accepted => 200,
+                                DeliveryDisposition::Retry => 500,
+                            };
+                            let _ = acknowledgement.send(status);
+                        },
+                    )));
+                }
+                Ok(Ok(None)) => {
+                    let _ = acknowledgement.send(200);
+                }
+                Ok(Err(error)) => {
+                    let permanent = error
+                        .downcast_ref::<LarkImageDownloadError>()
+                        .is_some_and(LarkImageDownloadError::is_permanent);
+                    let _ = acknowledgement.send(if permanent { 200 } else { 500 });
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
 struct LarkWebSocketReceiver {
     events: mpsc::Receiver<LarkDelivery>,
     task: Option<JoinHandle<Result<()>>>,

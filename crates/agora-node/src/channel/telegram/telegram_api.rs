@@ -228,8 +228,8 @@ impl TelegramApi {
         markdown: &str,
         callback_data: Option<&str>,
     ) -> Result<()> {
-        let _: TelegramSentMessage = self
-            .request(
+        let result = self
+            .request_with_attempts::<_, TelegramSentMessage>(
                 "editMessageText",
                 &EditRichMessageRequest {
                     chat_id,
@@ -237,9 +237,14 @@ impl TelegramApi {
                     rich_message: InputRichMessage { markdown },
                     reply_markup: TelegramInlineKeyboardMarkup::stop_or_empty(callback_data),
                 },
+                TELEGRAM_REQUEST_MAX_ATTEMPTS,
             )
-            .await?;
-        Ok(())
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if error.message_not_modified => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn request<B, T>(&self, method: &str, body: &B) -> Result<T>
@@ -339,10 +344,14 @@ impl TelegramApi {
             let description = envelope
                 .description
                 .unwrap_or_else(|| "unknown Telegram API error".to_string());
-            return Err(TelegramApiError::new(
+            return Err(TelegramApiError {
                 retryable,
-                format!("telegram {method} failed code={code}: {description}"),
-            ));
+                message_not_modified: method == "editMessageText"
+                    && error_code == Some(400)
+                    && (description == "Bad Request: message is not modified"
+                        || description.starts_with("Bad Request: message is not modified: ")),
+                message: format!("telegram {method} failed code={code}: {description}"),
+            });
         }
     }
 
@@ -405,6 +414,7 @@ impl TelegramApi {
 #[derive(Debug)]
 struct TelegramApiError {
     retryable: bool,
+    message_not_modified: bool,
     message: String,
 }
 
@@ -412,6 +422,7 @@ impl TelegramApiError {
     fn new(retryable: bool, message: impl Into<String>) -> Self {
         Self {
             retryable,
+            message_not_modified: false,
             message: message.into(),
         }
     }

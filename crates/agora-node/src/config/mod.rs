@@ -1,5 +1,5 @@
-use serde::Deserialize;
 use serde::de::Error as _;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fmt;
@@ -8,9 +8,10 @@ use std::str::FromStr;
 
 pub mod generate;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<HttpProxy>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -18,7 +19,8 @@ pub struct NodeConfig {
     pub agents: Vec<AgentConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default = "default_max_in_flight_tasks")]
     pub max_in_flight_tasks: usize,
@@ -65,6 +67,16 @@ impl NodeConfig {
             anyhow::bail!("runtime max_concurrent_runs must not exceed max_in_flight_runs");
         }
 
+        for (name, value) in [
+            ("max_in_flight_tasks", self.runtime.max_in_flight_tasks),
+            ("max_in_flight_runs", self.runtime.max_in_flight_runs),
+            ("max_concurrent_runs", self.runtime.max_concurrent_runs),
+        ] {
+            if value > tokio::sync::Semaphore::MAX_PERMITS {
+                anyhow::bail!("runtime {name} exceeds Semaphore::MAX_PERMITS");
+            }
+        }
+        let mut channel_accounts = HashSet::new();
         let mut channel_names = HashSet::new();
         for channel in &self.channels {
             let name = channel.name();
@@ -75,12 +87,24 @@ impl NodeConfig {
                 anyhow::bail!("duplicate channel name: {name}");
             }
             channel.validate()?;
+            let account = match channel {
+                ChannelConfig::Lark(config) => ("lark", config.app_id.trim().to_string()),
+                ChannelConfig::Telegram(config) => {
+                    ("telegram", config.bot_id()?.parse::<u64>()?.to_string())
+                }
+            };
+            if !channel_accounts.insert(account) {
+                anyhow::bail!("duplicate provider account: channel {name}");
+            }
         }
 
         let mut agent_names = HashSet::new();
         for agent in &self.agents {
             if agent.name.trim().is_empty() {
                 anyhow::bail!("agent name must not be empty");
+            }
+            if agent.name.chars().any(char::is_whitespace) {
+                anyhow::bail!("agent name must not contain whitespace: {}", agent.name);
             }
             if !agent_names.insert(agent.name.as_str()) {
                 anyhow::bail!("duplicate agent name: {}", agent.name);
@@ -153,15 +177,19 @@ impl NodeConfig {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_filesystem(&self) -> anyhow::Result<()> {
         for agent in &self.agents {
-            validate_agent_executable(&agent.name, Path::new(&agent.path))?;
+            resolve_agent_executable(&agent.name, Path::new(&agent.path))?;
         }
         Ok(())
     }
 }
 
-fn validate_agent_executable(name: &str, configured_path: &Path) -> anyhow::Result<()> {
+pub(crate) fn resolve_agent_executable(
+    name: &str,
+    configured_path: &Path,
+) -> anyhow::Result<PathBuf> {
     let path = resolve_executable(configured_path).ok_or_else(|| {
         anyhow::anyhow!(
             "agent executable does not exist: {}: {}",
@@ -191,7 +219,7 @@ fn validate_agent_executable(name: &str, configured_path: &Path) -> anyhow::Resu
             path.display()
         );
     }
-    Ok(())
+    Ok(std::path::absolute(path)?)
 }
 
 fn resolve_executable(path: &Path) -> Option<PathBuf> {
@@ -203,10 +231,17 @@ fn resolve_executable(path: &Path) -> Option<PathBuf> {
     if !is_bare_name {
         return path.exists().then(|| path.to_path_buf());
     }
-    std::env::var_os("PATH").and_then(|search_path| {
-        std::env::split_paths(&search_path)
-            .map(|directory| directory.join(path))
-            .find(|candidate| candidate.exists())
+    std::env::var_os("PATH").and_then(|search_path| find_in_search_path(path, &search_path))
+}
+
+fn find_in_search_path(path: &Path, search_path: &std::ffi::OsStr) -> Option<PathBuf> {
+    executable_names(path.as_os_str()).find_map(|name| {
+        std::env::split_paths(search_path)
+            .map(|directory| directory.join(&name))
+            .find(|candidate| {
+                std::fs::metadata(candidate)
+                    .is_ok_and(|metadata| metadata.is_file() && is_executable(&metadata))
+            })
     })
 }
 
@@ -221,7 +256,64 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
     true
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg(not(windows))]
+fn executable_names(name: &std::ffi::OsStr) -> impl Iterator<Item = std::ffi::OsString> {
+    [name.to_os_string()].into_iter()
+}
+
+#[cfg(windows)]
+fn executable_names(name: &std::ffi::OsStr) -> impl Iterator<Item = std::ffi::OsString> {
+    let extensions = std::env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+    std::iter::once(name.to_os_string()).chain(
+        extensions
+            .to_string_lossy()
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| {
+                std::ffi::OsString::from(format!("{}{extension}", name.to_string_lossy()))
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn encode_proxy_credential(value: &str) -> String {
+    let mut url = reqwest::Url::parse("http://proxy.invalid").expect("static HTTP URL");
+    // URL setters retain percent escapes; escape literal percent signs first.
+    url.set_username(&value.replace('%', "%25"))
+        .expect("HTTP URL supports credentials");
+    url.username().to_string()
+}
+
+fn decode_proxy_credential(value: &str) -> Result<String, String> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let mut lookahead = bytes.clone();
+            if let Some((high, low)) = lookahead.next().and_then(|high| {
+                Some((
+                    (high as char).to_digit(16)?,
+                    (lookahead.next()? as char).to_digit(16)?,
+                ))
+            }) {
+                decoded.push((high * 16 + low) as u8);
+                bytes = lookahead;
+                continue;
+            }
+        }
+        decoded.push(byte);
+    }
+    String::from_utf8(decoded).map_err(|_| "proxy credentials are not valid UTF-8".to_string())
+}
+
+impl Serialize for HttpProxy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.environment_value())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub name: String,
     pub isolate: IsolateMode,
@@ -236,7 +328,7 @@ pub struct AgentConfig {
     pub effort: Option<String>,
     #[serde(default)]
     pub agent_sandbox: Option<AgentSandbox>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<HttpProxy>,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
@@ -304,44 +396,46 @@ impl TelegramChannelConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AgentSubscription {
     pub channel: String,
     #[serde(default)]
     pub filter: Option<Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChannelConfig {
     Lark(LarkChannelConfig),
-    Local(NamedChannelConfig),
-    Http(NamedChannelConfig),
     Telegram(TelegramChannelConfig),
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LarkChannelConfig {
     pub name: String,
     pub app_id: String,
     pub secret: String,
     #[serde(default)]
     pub permission: ChannelPermissionConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<HttpProxy>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TelegramChannelConfig {
     pub name: String,
     pub token: String,
     #[serde(default)]
     pub permission: ChannelPermissionConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<HttpProxy>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelPermissionConfig {
     #[serde(default)]
     pub users: Vec<ChannelUserPermissionConfig>,
@@ -349,12 +443,14 @@ pub struct ChannelPermissionConfig {
     pub groups: Vec<ChannelGroupPermissionConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelUserPermissionConfig {
     pub id: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelGroupPermissionConfig {
     pub id: String,
     #[serde(default)]
@@ -366,7 +462,6 @@ impl ChannelConfig {
         match self {
             ChannelConfig::Lark(config) => &config.name,
             ChannelConfig::Telegram(config) => &config.name,
-            ChannelConfig::Local(config) | ChannelConfig::Http(config) => &config.name,
         }
     }
 
@@ -374,7 +469,6 @@ impl ChannelConfig {
         match self {
             ChannelConfig::Lark(config) => &mut config.proxy,
             ChannelConfig::Telegram(config) => &mut config.proxy,
-            ChannelConfig::Local(config) | ChannelConfig::Http(config) => &mut config.proxy,
         }
     }
 
@@ -395,12 +489,6 @@ impl ChannelConfig {
                 }
                 config.bot_id()?;
                 &config.permission
-            }
-            ChannelConfig::Local(config) => {
-                anyhow::bail!("local channel is not implemented: {}", config.name)
-            }
-            ChannelConfig::Http(config) => {
-                anyhow::bail!("http channel is not implemented: {}", config.name)
             }
         };
         if permission
@@ -427,15 +515,6 @@ impl ChannelConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct NamedChannelConfig {
-    pub name: String,
-    #[serde(default)]
-    pub permission: ChannelPermissionConfig,
-    #[serde(default)]
-    pub proxy: Option<HttpProxy>,
-}
-
 #[derive(Clone, PartialEq, Eq)]
 pub struct HttpProxy {
     address: String,
@@ -446,7 +525,12 @@ impl HttpProxy {
     pub fn environment_value(&self) -> String {
         match &self.credentials {
             Some((username, password)) => {
-                format!("http://{username}:{password}@{}", self.address)
+                format!(
+                    "http://{}:{}@{}",
+                    encode_proxy_credential(username),
+                    encode_proxy_credential(password),
+                    self.address
+                )
             }
             None => format!("http://{}", self.address),
         }
@@ -486,7 +570,13 @@ impl FromStr for HttpProxy {
                 let (username, password) = credentials
                     .split_once(':')
                     .ok_or_else(|| "proxy credentials must use user:password".to_string())?;
-                (Some((username.to_string(), password.to_string())), address)
+                (
+                    Some((
+                        decode_proxy_credential(username)?,
+                        decode_proxy_credential(password)?,
+                    )),
+                    address,
+                )
             }
             None => (None, value),
         };
@@ -504,6 +594,11 @@ impl FromStr for HttpProxy {
         }
         if port.parse::<u16>().ok().filter(|port| *port > 0).is_none() {
             return Err("proxy port is invalid".to_string());
+        }
+        let endpoint = reqwest::Url::parse(&format!("http://{address}"))
+            .map_err(|_| "proxy address is invalid".to_string())?;
+        if endpoint.path() != "/" || endpoint.query().is_some() || endpoint.fragment().is_some() {
+            return Err("proxy address is invalid".to_string());
         }
         Ok(Self {
             address: address.to_string(),
@@ -523,7 +618,7 @@ impl<'de> Deserialize<'de> for HttpProxy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IsolateMode {
     None,
@@ -569,12 +664,10 @@ impl IsolationScope {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentType {
     Codex,
-    Coco,
-    ClaudeCode,
     Custom,
 }
 
@@ -582,14 +675,12 @@ impl AgentType {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
-            Self::Coco => "coco",
-            Self::ClaudeCode => "claude_code",
             Self::Custom => "custom",
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentSandbox {
     ReadOnly,

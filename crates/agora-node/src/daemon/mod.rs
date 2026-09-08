@@ -3,10 +3,10 @@ use crate::agent::{
     AgentSessionUpdate, AgentTask, ConfiguredAgent,
 };
 use crate::channel::{
-    Channel, ChannelAgent, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask,
+    Channel, ChannelAgent, ChannelReply, ChannelRun, ChannelRunContext, ChannelSender, ChannelTask,
     ConfiguredChannel, DeliveryReceipt, InterruptCallback, RunEvent,
 };
-use crate::config::NodeConfig;
+use crate::config::{ChannelConfig, NodeConfig};
 use crate::i18n;
 use crate::instance::{NodeInstanceGuard, StatePaths};
 use crate::store::{
@@ -33,6 +33,22 @@ mod tests;
 
 const CHANNEL_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SHUTDOWN_RUN_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Order scheduler insertion, without holding later control behind network publication.
+#[derive(Clone, Default)]
+struct RouteAdmission(Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>);
+impl RouteAdmission {
+    fn complete(&self) {
+        if let Some(sender) = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = sender.send(());
+        }
+    }
+}
 
 #[derive(Clone)]
 struct TaskSlots {
@@ -79,15 +95,17 @@ impl AgentDispatcher {
         agents: Vec<ConfiguredAgent>,
         task: C::Task,
         runs: &mut JoinSet<Result<()>>,
+        admission: &RouteAdmission,
     ) -> Result<()>
     where
-        C: Channel + Sync,
+        C: ChannelSender + Sync,
         C::Task: Send + Sync + 'static,
         C::Run: Send + Sync + 'static,
     {
         let channel_identity = channel.identity();
         let agents = self.enabled_agents(&channel_identity, task.session_id(), &agents)?;
         if agents.is_empty() {
+            admission.complete();
             return channel
                 .reply(&task, ChannelReply::new(i18n::NO_ENABLED_AGENTS))
                 .await;
@@ -97,7 +115,7 @@ impl AgentDispatcher {
             .message()
             .ok_or_else(|| anyhow::anyhow!("command input cannot start an agent run"))?
             .clone();
-        self.start_agent_runs(channel, agents, task, content, runs)
+        self.start_agent_runs(channel, agents, task, content, runs, admission)
             .await
     }
 
@@ -108,9 +126,10 @@ impl AgentDispatcher {
         task: C::Task,
         content: TaskContent,
         runs: &mut JoinSet<Result<()>>,
+        admission: &RouteAdmission,
     ) -> Result<()>
     where
-        C: Channel + Sync,
+        C: ChannelSender + Sync,
         C::Task: Send + Sync + 'static,
         C::Run: Send + Sync + 'static,
     {
@@ -142,6 +161,7 @@ impl AgentDispatcher {
                 requested,
                 limit,
             }) => {
+                admission.complete();
                 logger::error!(
                     "node run capacity exhausted channel={} task={} current={} requested={} limit={}",
                     channel.name(),
@@ -156,6 +176,7 @@ impl AgentDispatcher {
             }
             Err(err @ SchedulerAdmissionError::Closed) => return Err(err.into()),
         };
+        admission.complete();
         let mut prepared = Vec::with_capacity(admitted.len());
 
         for ((agent, _key, store_key, agent_task), admitted) in planned.into_iter().zip(admitted) {
@@ -180,15 +201,32 @@ impl AgentDispatcher {
             ));
         }
 
-        for (_, _, _, execution, _, _, output) in &prepared {
-            output.initial_queued(execution.ahead()).await?;
-        }
-
+        let (start_batch, _) = tokio::sync::watch::channel(false);
+        let mut publications = Vec::with_capacity(prepared.len());
         for (agent, store_key, agent_task, mut execution, completion, control, mut output) in
             prepared
         {
             let dispatcher = self.clone();
+            let mut start = start_batch.subscribe();
+            let (published, publication) = oneshot::channel();
+            publications.push(publication);
             runs.spawn(async move {
+                let result = tokio::select! {
+                    result = output.initial_queued(execution.ahead()) => result,
+                    _ = start.changed() => Err(anyhow::anyhow!("task admission cancelled")),
+                };
+                let visible = result.is_ok();
+                let _ = published.send(result);
+                if !visible || start.wait_for(|started| *started).await.is_err() {
+                    drop(execution);
+                    let result = tokio::time::timeout(
+                        SHUTDOWN_RUN_TIMEOUT,
+                        output.failed("task initialization failed or was cancelled".to_string()),
+                    )
+                    .await;
+                    drop(completion);
+                    return result?;
+                }
                 while execution.ahead() > 0 {
                     let ahead = tokio::select! {
                         ahead = execution.changed() => ahead?,
@@ -259,6 +297,10 @@ impl AgentDispatcher {
                 result
             });
         }
+        for publication in publications {
+            publication.await??;
+        }
+        start_batch.send(true)?;
         Ok(())
     }
 
@@ -301,8 +343,19 @@ impl AgentDispatcher {
         O: AgentOutput + Send,
     {
         let mut session_id = self.store.get(key)?;
+        let mut session_output = SessionOutput {
+            store: &self.store,
+            key,
+            expected: session_id.clone(),
+            output,
+        };
         let mut outcome = match agent
-            .run(task.clone(), session_id.clone(), control.clone(), output)
+            .run(
+                task.clone(),
+                session_id.clone(),
+                control.clone(),
+                &mut session_output,
+            )
             .await?
         {
             AgentRunOutcome::Completed(outcome) => outcome,
@@ -315,11 +368,12 @@ impl AgentDispatcher {
             };
             self.store.remove_if_matches(key, &stale_session_id)?;
             session_id = None;
+            session_output.expected = None;
             logger::info!(
                 "agent session missing; starting a new session agent={}",
                 agent.name()
             );
-            outcome = match agent.run(task, None, control, output).await? {
+            outcome = match agent.run(task, None, control, &mut session_output).await? {
                 AgentRunOutcome::Completed(outcome) => outcome,
                 cancelled @ AgentRunOutcome::Cancelled(_) => return Ok(cancelled),
             };
@@ -346,9 +400,29 @@ impl AgentDispatcher {
     }
 }
 
+struct SessionOutput<'a, O> {
+    store: &'a SessionStore,
+    key: &'a StoreSessionKey,
+    expected: Option<String>,
+    output: &'a mut O,
+}
+
+impl<O: AgentOutput + Send> AgentOutput for SessionOutput<'_, O> {
+    fn session_started(&mut self, session_id: &str) -> Result<()> {
+        self.store
+            .observe(self.key, self.expected.as_deref(), session_id)?;
+        self.output.session_started(session_id)
+    }
+
+    async fn write(&mut self, event: OutputEvent) -> Result<()> {
+        self.output.write(event).await
+    }
+}
+
 pub struct Daemon {
     instance_guard: NodeInstanceGuard,
-    config: NodeConfig,
+    channels: Vec<ChannelConfig>,
+    agents: AgentRegistry,
     dispatcher: AgentDispatcher,
     commands: Arc<CommandRuntime>,
     task_slots: TaskSlots,
@@ -389,14 +463,15 @@ impl Daemon {
     pub fn new_with_paths(mut config: NodeConfig, paths: StatePaths) -> Result<Self> {
         config.validate()?;
         config.apply_proxy_defaults();
+        let agents = AgentRegistry::from_configs(config.agents)?;
         let instance_guard = NodeInstanceGuard::acquire(paths.clone())?;
         let store = SessionStore::open(paths.store_path())?;
-        config.validate_filesystem()?;
         let scheduler = ExecutionScheduler::new(&config.runtime);
         let task_slots = TaskSlots::new(config.runtime.max_in_flight_tasks);
         Ok(Self {
             instance_guard,
-            config,
+            channels: config.channels,
+            agents,
             dispatcher: AgentDispatcher::from_parts(store.clone(), scheduler.clone()),
             commands: Arc::new(CommandRuntime::new(store, scheduler)?),
             task_slots,
@@ -413,19 +488,13 @@ impl Daemon {
     pub async fn run(self) -> Result<()> {
         let Self {
             instance_guard,
-            config,
+            channels,
+            agents,
             dispatcher,
             commands,
             task_slots,
         } = self;
         let _instance_guard = instance_guard;
-        let NodeConfig {
-            proxy: _,
-            runtime: _,
-            channels,
-            agents,
-        } = config;
-        let agents = AgentRegistry::from_configs(agents)?;
         let shutdown = DaemonShutdown {
             scheduler: dispatcher.scheduler.clone(),
             task_slots: task_slots.clone(),
@@ -433,9 +502,7 @@ impl Daemon {
         let mut configured_channels = Vec::new();
 
         for channel_config in channels {
-            let Some(channel) = ConfiguredChannel::from_config(channel_config)? else {
-                continue;
-            };
+            let channel = ConfiguredChannel::from_config(channel_config)?;
             let subscribed_agents = agents.subscribed_to(channel.name());
             if subscribed_agents.is_empty() {
                 continue;
@@ -478,18 +545,26 @@ impl Daemon {
         task_slots: TaskSlots,
     ) -> Result<()>
     where
-        C: Channel + Clone + Send + Sync + 'static,
+        C: Channel + Send + Sync + 'static,
         C::Task: Send + Sync + 'static,
         C::Run: Send + Sync + 'static,
     {
         let mut routes = JoinSet::new();
         let mut route_tail = None;
+        let control_slots = TaskSlots::new(8);
+        let busy_slots = TaskSlots::new(1);
         loop {
             tokio::select! {
                 received = channel.recv() => match received {
                     Ok(Some(delivery)) => {
                         let (task, receipt) = delivery.into_parts();
-                        let task_slot = match task_slots.try_acquire() {
+                        if task_slots.semaphore.is_closed() {
+                            drop(receipt);
+                            continue;
+                        }
+                        let is_control = commands.is_control(task.input());
+                        let slots = if is_control { &control_slots } else { &task_slots };
+                        let task_slot = match slots.try_acquire() {
                             Ok(task_slot) => task_slot,
                             Err(TryAcquireError::NoPermits) => {
                                 logger::error!(
@@ -499,7 +574,14 @@ impl Daemon {
                                     task_slots.current(),
                                     task_slots.limit
                                 );
-                                Self::reply_busy(&channel, &task, receipt).await;
+                                if let Ok(busy_slot) = busy_slots.try_acquire() {
+                                    let busy_channel = channel.sender();
+                                    routes.spawn(async move {
+                                        Self::reply_busy(&busy_channel, &task, receipt).await;
+                                        drop(busy_slot);
+                                        Ok(())
+                                    });
+                                }
                                 continue;
                             }
                             Err(TryAcquireError::Closed) => {
@@ -512,13 +594,14 @@ impl Daemon {
                                 continue;
                             }
                         };
-                        let task_channel = channel.clone();
+                        let task_channel = channel.sender();
                         let task_agents = agents.clone();
                         let task_dispatcher = dispatcher.clone();
                         let task_commands = Arc::clone(&commands);
                         let predecessor = route_tail.take();
                         let (admitted, successor) = oneshot::channel();
                         route_tail = Some(successor);
+                        let admission = RouteAdmission(Arc::new(std::sync::Mutex::new(Some(admitted))));
                         routes.spawn(async move {
                             let mut agent_runs = JoinSet::new();
                             let deadline = receipt.deadline();
@@ -528,13 +611,14 @@ impl Daemon {
                                 if let Some(predecessor) = predecessor {
                                     let _ = predecessor.await;
                                 }
-                                Self::route_channel_task(
+                                Self::route_channel_task_admitted(
                                     &task_channel,
                                     &task_agents,
                                     &task_dispatcher,
                                     &task_commands,
                                     task,
                                     &mut agent_runs,
+                                    &admission,
                                 )
                                 .await
                             })
@@ -550,7 +634,7 @@ impl Daemon {
                             } else {
                                 drop(receipt);
                             }
-                            let _ = admitted.send(());
+                            admission.complete();
                             while let Some(result) = agent_runs.join_next().await {
                                 AgentDispatcher::log_run_result(result);
                             }
@@ -578,7 +662,7 @@ impl Daemon {
 
     async fn reply_busy<C>(channel: &C, task: &C::Task, receipt: DeliveryReceipt)
     where
-        C: Channel + Sync,
+        C: ChannelSender + Sync,
     {
         let deadline = receipt.deadline();
         match tokio::time::timeout_at(
@@ -602,34 +686,46 @@ impl Daemon {
         }
     }
 
-    async fn route_channel_task<C>(
+    async fn route_channel_task_admitted<C>(
         channel: &C,
         agents: &[ConfiguredAgent],
         dispatcher: &AgentDispatcher,
         commands: &CommandRuntime,
         task: C::Task,
         runs: &mut JoinSet<Result<()>>,
+        admission: &RouteAdmission,
     ) -> Result<()>
     where
-        C: Channel + Sync,
+        C: ChannelSender + Sync,
         C::Task: Send + Sync + 'static,
         C::Run: Send + Sync + 'static,
     {
         match commands
-            .handle(&channel.identity(), task.session_id(), agents, task.input())
+            .handle_admitted(
+                &channel.identity(),
+                task.session_id(),
+                agents,
+                task.input(),
+                admission.clone(),
+            )
             .await?
         {
             CommandOutcome::PassThrough => {
                 dispatcher
-                    .start_channel_task(channel, agents.to_vec(), task, runs)
+                    .start_channel_task(channel, agents.to_vec(), task, runs, admission)
                     .await
             }
-            CommandOutcome::Reply(Some(reply)) => channel.reply(&task, reply).await,
-            CommandOutcome::Reply(None) => Ok(()),
+            CommandOutcome::Reply(reply) => {
+                admission.complete();
+                match reply {
+                    Some(reply) => channel.reply(&task, reply).await,
+                    None => Ok(()),
+                }
+            }
             CommandOutcome::Dispatch(dispatch) => {
                 let (agents, content) = dispatch.into_parts();
                 dispatcher
-                    .start_agent_runs(channel, agents, task, content, runs)
+                    .start_agent_runs(channel, agents, task, content, runs, admission)
                     .await
             }
         }
@@ -720,7 +816,7 @@ where
         let result = self.run.publish(event).await;
         if let Err(err) = &result {
             logger::error!(
-                "agent run terminal delivery failed channel={} task={} agent={} run_id={} stage={} terminal_delivery_exhausted=true: {}",
+                "agent run terminal publication failed channel={} task={} agent={} run_id={} stage={} terminal_publication_failed=true: {}",
                 self.channel_name,
                 self.task_id,
                 self.agent_name,

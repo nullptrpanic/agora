@@ -3,7 +3,7 @@ mod channel;
 mod lark_api;
 mod proxy;
 
-pub use channel::{LarkChannel, LarkRun, LarkTask};
+pub use channel::{LarkChannel, LarkRun, LarkSender, LarkTask};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LarkReplyTarget {

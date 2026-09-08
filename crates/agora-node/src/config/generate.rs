@@ -1,63 +1,15 @@
+use super::{
+    AgentConfig, AgentSubscription, AgentType, ChannelConfig, ChannelPermissionConfig,
+    ChannelUserPermissionConfig, IsolateMode, LarkChannelConfig, NodeConfig, TelegramChannelConfig,
+};
 use anyhow::{Context, bail};
 use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
-use serde::Serialize;
-use std::ffi::OsString;
 use std::io::{self, BufRead, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 const ACCENT: &str = "\u{1b}[1;36m";
 const SUCCESS: &str = "\u{1b}[1;32m";
 const RESET: &str = "\u{1b}[0m";
-
-#[derive(Serialize)]
-struct GeneratedConfig {
-    channels: Vec<GeneratedChannel>,
-    agents: Vec<GeneratedAgent>,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum GeneratedChannel {
-    Lark {
-        name: &'static str,
-        app_id: String,
-        secret: String,
-        permission: GeneratedPermission,
-    },
-    Telegram {
-        name: &'static str,
-        token: String,
-        permission: GeneratedPermission,
-    },
-}
-
-#[derive(Serialize)]
-struct GeneratedPermission {
-    users: Vec<GeneratedUserPermission>,
-}
-
-#[derive(Serialize)]
-struct GeneratedUserPermission {
-    id: String,
-}
-
-#[derive(Serialize)]
-struct GeneratedAgent {
-    name: &'static str,
-    isolate: &'static str,
-    workspace: String,
-    #[serde(rename = "type")]
-    agent_type: &'static str,
-    path: String,
-    model: String,
-    effort: String,
-    subscribe: Vec<GeneratedSubscription>,
-}
-
-#[derive(Serialize)]
-struct GeneratedSubscription {
-    channel: &'static str,
-}
 
 pub fn run(output_path: &Path) -> anyhow::Result<()> {
     let current_dir = std::env::current_dir().context("get current directory")?;
@@ -109,7 +61,7 @@ fn collect_config(
     detected_codex: Option<PathBuf>,
     interactive: bool,
     colored: bool,
-) -> anyhow::Result<GeneratedConfig> {
+) -> anyhow::Result<NodeConfig> {
     section(output, "Channel", colored)?;
     let channel = choose(
         output,
@@ -133,12 +85,13 @@ fn collect_config(
             )?;
             (
                 "lark",
-                GeneratedChannel::Lark {
-                    name: "lark",
+                ChannelConfig::Lark(LarkChannelConfig {
+                    name: "lark".into(),
                     app_id,
                     secret,
                     permission: permission(allowed_user),
-                },
+                    proxy: None,
+                }),
             )
         }
         1 => {
@@ -153,11 +106,12 @@ fn collect_config(
             )?;
             (
                 "telegram",
-                GeneratedChannel::Telegram {
-                    name: "telegram",
+                ChannelConfig::Telegram(TelegramChannelConfig {
+                    name: "telegram".into(),
                     token,
                     permission: permission(allowed_user),
-                },
+                    proxy: None,
+                }),
             )
         }
         _ => unreachable!("channel choice is bounded"),
@@ -194,26 +148,36 @@ fn collect_config(
         interactive,
     )?;
 
-    Ok(GeneratedConfig {
+    let config = NodeConfig {
+        proxy: None,
+        runtime: Default::default(),
         channels: vec![channel_config],
-        agents: vec![GeneratedAgent {
-            name: "agent",
-            isolate: "session",
+        agents: vec![AgentConfig {
+            name: "agent".into(),
+            isolate: IsolateMode::Session,
             workspace: workspace.to_string_lossy().into_owned(),
-            agent_type: "codex",
+            agent_type: AgentType::Codex,
             path: codex_path,
-            model,
-            effort,
-            subscribe: vec![GeneratedSubscription {
-                channel: channel_name,
+            model: Some(model),
+            effort: Some(effort),
+            agent_sandbox: None,
+            proxy: None,
+            timeout_seconds: super::default_timeout_seconds(),
+            max_output_bytes: super::default_max_output_bytes(),
+            subscribe: vec![AgentSubscription {
+                channel: channel_name.to_string(),
+                filter: None,
             }],
         }],
-    })
+    };
+    config.validate()?;
+    Ok(config)
 }
 
-fn permission(user_id: String) -> GeneratedPermission {
-    GeneratedPermission {
-        users: vec![GeneratedUserPermission { id: user_id }],
+fn permission(user_id: String) -> ChannelPermissionConfig {
+    ChannelPermissionConfig {
+        users: vec![ChannelUserPermissionConfig { id: user_id }],
+        groups: Vec::new(),
     }
 }
 
@@ -336,48 +300,10 @@ fn read_line(input: &mut impl BufRead, label: &str) -> anyhow::Result<String> {
 }
 
 fn find_executable(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    executable_names(name).find_map(|name| {
-        std::env::split_paths(&path).find_map(|directory| {
-            let candidate = directory.join(&name);
-            is_executable(&candidate).then_some(candidate)
-        })
-    })
+    super::resolve_agent_executable(name, Path::new(name)).ok()
 }
 
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
-}
-
-#[cfg(not(windows))]
-fn executable_names(name: &str) -> impl Iterator<Item = OsString> {
-    [OsString::from(name)].into_iter()
-}
-
-#[cfg(windows)]
-fn executable_names(name: &str) -> impl Iterator<Item = OsString> {
-    let extensions =
-        std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
-    std::iter::once(OsString::from(name)).chain(
-        extensions
-            .to_string_lossy()
-            .split(';')
-            .filter(|extension| !extension.is_empty())
-            .map(|extension| OsString::from(format!("{name}{extension}")))
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn write_config(path: &Path, config: &GeneratedConfig) -> anyhow::Result<()> {
+fn write_config(path: &Path, config: &NodeConfig) -> anyhow::Result<()> {
     atomic_write(path, |writer| {
         serde_json::to_writer_pretty(&mut *writer, config)?;
         writeln!(writer)?;

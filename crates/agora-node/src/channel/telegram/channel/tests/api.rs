@@ -4,6 +4,88 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[tokio::test]
+async fn cancelled_receive_retains_pending_acknowledgement() {
+    let server = HttpMockServer::start_json_queue([
+        r#"{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}}"#,
+        r#"{"ok":true,"result":true}"#,
+        r#"{"ok":true,"result":[{"update_id":701,"message":{"message_id":31,"from":{"id":42},"chat":{"id":1,"type":"private"},"text":"first"}}]}"#,
+        r#"{"ok":true,"result":[{"update_id":702,"message":{"message_id":32,"from":{"id":42},"chat":{"id":1,"type":"private"},"text":"second"}}]}"#,
+    ])
+    .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+    let mut channel = TelegramChannel::with_api(api);
+    let (_, receipt) = channel.recv().await.unwrap().unwrap().into_parts();
+
+    for _ in 0..3 {
+        let mut pending = Box::pin(channel.recv());
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        drop(pending);
+    }
+    receipt.accept();
+
+    let next = channel.recv().await.unwrap().unwrap();
+    assert_eq!(next.task_id(), "702");
+    let requests = server.requests().await;
+    let poll: serde_json::Value = serde_json::from_str(&requests[3].body).unwrap();
+    assert_eq!(poll["offset"], 702);
+}
+
+#[tokio::test]
+async fn telegram_edit_accepts_only_explicit_not_modified_response() {
+    for (code, description, accepted) in [
+        (400, "Bad Request: message is not modified", true),
+        (
+            400,
+            "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message",
+            true,
+        ),
+        (400, "Bad Request: message to edit not found", false),
+        (403, "Bad Request: message is not modified", false),
+        (
+            400,
+            "Bad Request: other failure: message is not modified",
+            false,
+        ),
+    ] {
+        let body = serde_json::json!({
+            "ok": false,
+            "error_code": code,
+            "description": description,
+        })
+        .to_string();
+        let server = HttpMockServer::start_json_queue([body.as_str()]).await;
+        let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+
+        let result = api.edit_rich_message(1, 100, "same answer", None).await;
+
+        assert_eq!(result.is_ok(), accepted, "code={code}: {result:?}");
+        assert_eq!(server.endpoint_count("editMessageText").await, 1);
+    }
+}
+
+#[tokio::test]
+async fn telegram_send_does_not_accept_an_edit_noop_error() {
+    let server = HttpMockServer::start_json_queue([
+        r#"{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}"#,
+    ])
+    .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+    let target = TelegramReplyTarget {
+        chat_id: 1,
+        message_id: 7,
+        message_thread_id: None,
+        is_private: true,
+    };
+
+    assert!(
+        api.send_rich_message(&target, "answer", None)
+            .await
+            .is_err()
+    );
+    assert_eq!(server.endpoint_count("sendRichMessage").await, 1);
+}
+
+#[tokio::test]
 async fn telegram_api_uses_an_authenticated_http_proxy() {
     let proxy = HttpMockServer::start_json_queue([
         r#"{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}}"#,
@@ -109,6 +191,11 @@ async fn telegram_channel_retries_a_delivery_without_advancing_offset() {
     let mut channel = TelegramChannel::with_api(api);
 
     let first = channel.recv().await.unwrap().unwrap();
+    for _ in 0..3 {
+        let mut pending = Box::pin(channel.recv());
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        drop(pending);
+    }
     drop(first);
     let retried = channel.recv().await.unwrap().unwrap();
 
@@ -369,11 +456,12 @@ async fn telegram_channel_returns_supported_updates_in_order_and_advances_offset
     assert_eq!(requests.len(), 4);
     assert_eq!(requests[1].path, "/bot123456:secret/setMyCommands");
     let commands: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
-    assert_eq!(commands["commands"].as_array().unwrap().len(), 4);
+    assert_eq!(commands["commands"].as_array().unwrap().len(), 5);
     assert_eq!(commands["commands"][0]["command"], "stop");
     assert_eq!(commands["commands"][1]["command"], "reset");
     assert_eq!(commands["commands"][2]["command"], "ask");
-    assert_eq!(commands["commands"][3]["command"], "help");
+    assert_eq!(commands["commands"][3]["command"], "agent");
+    assert_eq!(commands["commands"][4]["command"], "help");
     let second_poll: serde_json::Value = serde_json::from_str(&requests[3].body).unwrap();
     assert_eq!(second_poll["offset"], 304);
 }

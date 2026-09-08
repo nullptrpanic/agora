@@ -1,12 +1,13 @@
 use super::{AgentDispatcher, AgentRunOutput, CommandRuntime, Daemon, DaemonShutdown};
 use crate::agent::{AgentRegistry, ConfiguredAgent};
+use crate::channel::ChannelSender;
 use crate::channel::{
     Channel, ChannelDelivery, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask,
     ConfiguredChannel, RunEvent,
 };
 use crate::config::{
     AgentConfig, AgentSubscription, AgentType, ChannelConfig, IsolateMode, IsolationScope,
-    LarkChannelConfig, NamedChannelConfig, NodeConfig,
+    LarkChannelConfig, NodeConfig,
 };
 use crate::store::{ChannelIdentity, SessionKey, SessionStore};
 use crate::task::{ChannelTaskInput, OutputEvent, TaskContent};
@@ -31,7 +32,7 @@ impl AgentDispatcher {
         C::Run: Send + Sync + 'static,
     {
         let mut runs = JoinSet::new();
-        self.start_channel_task(channel, agents, task, &mut runs)
+        self.start_channel_task(channel, agents, task, &mut runs, &Default::default())
             .await?;
 
         while let Some(result) = runs.join_next().await {
@@ -42,6 +43,32 @@ impl AgentDispatcher {
 }
 
 mod dispatcher;
+impl Daemon {
+    pub(super) async fn route_channel_task<C>(
+        channel: &C,
+        agents: &[ConfiguredAgent],
+        dispatcher: &AgentDispatcher,
+        commands: &CommandRuntime,
+        task: C::Task,
+        runs: &mut JoinSet<Result<()>>,
+    ) -> Result<()>
+    where
+        C: Channel + Sync,
+        C::Task: Send + Sync + 'static,
+        C::Run: Send + Sync + 'static,
+    {
+        Self::route_channel_task_admitted(
+            channel,
+            agents,
+            dispatcher,
+            commands,
+            task,
+            runs,
+            &Default::default(),
+        )
+        .await
+    }
+}
 mod queue;
 mod reliability;
 mod sessions;
@@ -113,6 +140,7 @@ impl ChannelRun for RecordingRun {
     }
 }
 
+#[derive(Clone)]
 struct RecordingChannel {
     contexts: Arc<Mutex<Vec<ChannelRunContext>>>,
     events: Arc<Mutex<Vec<RunEvent>>>,
@@ -137,11 +165,12 @@ impl ChannelTask for ReplyTask {
     }
 }
 
+#[derive(Clone)]
 struct ReplyChannel {
     replies: Arc<Mutex<Vec<ChannelReply>>>,
 }
 
-impl Channel for ReplyChannel {
+impl crate::channel::ChannelSender for ReplyChannel {
     type Task = ReplyTask;
     type Run = RecordingRun;
 
@@ -151,10 +180,6 @@ impl Channel for ReplyChannel {
 
     fn identity(&self) -> ChannelIdentity {
         ChannelIdentity::new(self.name(), "test", self.name())
-    }
-
-    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
-        Ok(None)
     }
 
     async fn open_run(&self, _task: &Self::Task, _context: ChannelRunContext) -> Result<Self::Run> {
@@ -168,6 +193,15 @@ impl Channel for ReplyChannel {
         Ok(())
     }
 }
+impl Channel for ReplyChannel {
+    type Sender = Self;
+    fn sender(&self) -> Self::Sender {
+        self.clone()
+    }
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
+        Ok(None)
+    }
+}
 
 #[derive(Clone)]
 struct FailingRun;
@@ -178,7 +212,7 @@ impl ChannelRun for FailingRun {
     }
 }
 
-impl Channel for RecordingChannel {
+impl crate::channel::ChannelSender for RecordingChannel {
     type Task = TestTask;
     type Run = RecordingRun;
 
@@ -190,10 +224,6 @@ impl Channel for RecordingChannel {
         ChannelIdentity::new(self.name(), "test", self.name())
     }
 
-    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
-        Ok(None)
-    }
-
     async fn open_run(&self, _task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
         self.contexts.lock().unwrap().push(context);
         Ok(RecordingRun {
@@ -203,6 +233,15 @@ impl Channel for RecordingChannel {
 
     async fn reply(&self, _task: &Self::Task, _reply: ChannelReply) -> Result<()> {
         Ok(())
+    }
+}
+impl Channel for RecordingChannel {
+    type Sender = Self;
+    fn sender(&self) -> Self::Sender {
+        self.clone()
+    }
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
+        Ok(None)
     }
 }
 
@@ -237,6 +276,7 @@ impl ChannelTask for ScopedTask {
     }
 }
 
+#[derive(Clone)]
 struct ScopedChannel {
     name: String,
     events: Arc<Mutex<Vec<RunEvent>>>,
@@ -255,7 +295,7 @@ impl ScopedChannel {
     }
 }
 
-impl Channel for ScopedChannel {
+impl crate::channel::ChannelSender for ScopedChannel {
     type Task = ScopedTask;
     type Run = RecordingRun;
 
@@ -267,10 +307,6 @@ impl Channel for ScopedChannel {
         ChannelIdentity::new(self.name(), "test", self.name())
     }
 
-    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
-        Ok(None)
-    }
-
     async fn open_run(&self, _task: &Self::Task, _context: ChannelRunContext) -> Result<Self::Run> {
         Ok(RecordingRun {
             events: Arc::clone(&self.events),
@@ -279,5 +315,14 @@ impl Channel for ScopedChannel {
 
     async fn reply(&self, _task: &Self::Task, _reply: ChannelReply) -> Result<()> {
         Ok(())
+    }
+}
+impl Channel for ScopedChannel {
+    type Sender = Self;
+    fn sender(&self) -> Self::Sender {
+        self.clone()
+    }
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
+        Ok(None)
     }
 }

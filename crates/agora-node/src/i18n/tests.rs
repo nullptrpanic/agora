@@ -1,4 +1,17 @@
 use super::*;
+
+#[test]
+fn shared_token_format_handles_unit_boundaries() {
+    for (tokens, expected) in [
+        (0, "0"),
+        (999, "999"),
+        (1000, "1.0K"),
+        (58_800, "58.8K"),
+        (1_000_000, "1.0M"),
+    ] {
+        assert_eq!(format_tokens(tokens), expected);
+    }
+}
 use crate::task::ProgressStatus;
 
 #[test]
@@ -50,13 +63,13 @@ fn chinese_copy_formats_dynamic_command_and_agent_messages() {
     );
     assert_eq!(
         command_details_hint("/ask"),
-        "使用 /ask {子命令} help 查看详情。"
+        "使用 /help ask {子命令} 查看详情。"
     );
     assert_eq!(
         root_command_details_hint(),
-        "使用 /{command} help 查看详情。"
+        "使用 /help {command} 查看详情。"
     );
-    assert_eq!(usage("/ask list"), "用法：/ask list");
+    assert_eq!(usage("/agent list"), "用法：/agent list");
     assert_eq!(
         unknown_command("oops"),
         "未知命令：oops\n使用 /help 查看全部命令。"

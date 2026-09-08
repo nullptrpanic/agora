@@ -2,8 +2,8 @@ use super::*;
 
 #[test]
 fn command_and_message_inputs_expose_only_their_own_payload() {
-    let command = CommandRequest::new(["ask", "status"]).with_argument("agent_name", "reviewer");
-    assert_eq!(command.path(), &["ask", "status"]);
+    let command = CommandRequest::new(["agent", "status"]).with_argument("agent_name", "reviewer");
+    assert_eq!(command.path(), &["agent", "status"]);
     assert_eq!(command.argument("agent_name"), Some("reviewer"));
     assert_eq!(command.argument("missing"), None);
     assert_eq!(command.arguments().len(), 1);

@@ -101,7 +101,8 @@ async fn resolves_lark_post_images_into_task_attachments() {
             let (content_type, body) = if request.contains("tenant_access_token/internal") {
                 (
                     "application/json",
-                    br#"{"code":0,"msg":"ok","tenant_access_token":"token"}"#.as_slice(),
+                    br#"{"code":0,"msg":"ok","tenant_access_token":"token","expire":7200}"#
+                        .as_slice(),
                 )
             } else {
                 assert!(request.contains(
@@ -167,7 +168,9 @@ async fn rejects_lark_post_images_above_the_cumulative_attachment_limit() {
     };
     let server = HttpMockServer::start(|request| {
         if request.path.contains("tenant_access_token/internal") {
-            MockResponse::json(r#"{"code":0,"msg":"ok","tenant_access_token":"token"}"#)
+            MockResponse::json(
+                r#"{"code":0,"msg":"ok","tenant_access_token":"token","expire":7200}"#,
+            )
         } else {
             MockResponse::bytes(b"123456".to_vec(), "image/png")
         }

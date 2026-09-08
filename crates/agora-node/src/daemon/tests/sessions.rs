@@ -1,4 +1,176 @@
 use super::*;
+use crate::agent::{AgentRunControl, AgentRunOutcome, AgentTask};
+
+#[cfg(unix)]
+#[tokio::test]
+async fn early_session_is_saved_on_timeout_cancellation_and_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    for ending in ["timeout", "cancel", "failure"] {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("codex");
+        std::fs::write(&script, format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"early-thread\"}}'\nprintf observed > emitted\n{}\n",
+            if ending == "failure" { "exit 1" } else { "sleep 120" }
+        )).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = agent("early", "test");
+        config.path = script.to_string_lossy().into_owned();
+        config.workspace = temp.path().to_string_lossy().into_owned();
+        config.timeout_seconds = if std::env::var_os("CARGO_LLVM_COV").is_some() {
+            30
+        } else {
+            10
+        };
+        let agent = ConfiguredAgent::from_config(config).unwrap();
+        let channel = RecordingChannel {
+            contexts: Arc::new(Mutex::new(Vec::new())),
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let store = SessionStore::open(temp.path().join("store.db")).unwrap();
+        let key = agent.store_session_key(&channel.identity(), "chat");
+        let dispatcher = AgentDispatcher::new(store.clone());
+        let control = AgentRunControl::default();
+        let mut output = AgentRunOutput::new(RecordingRun {
+            events: Arc::clone(&channel.events),
+        });
+        let run = dispatcher.execute_agent(
+            &key,
+            &agent,
+            AgentTask::new("hello"),
+            control.clone(),
+            &mut output,
+        );
+        let cancel = async {
+            if ending == "cancel" {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while !temp.path().join("emitted").exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                control.stop();
+            }
+        };
+        let (result, ()) = tokio::join!(run, cancel);
+        assert!(
+            temp.path().join("emitted").exists(),
+            "backend did not emit: {result:?}"
+        );
+        if ending == "timeout" {
+            assert!(result.is_err());
+        }
+        if ending == "cancel" {
+            assert!(matches!(result.unwrap(), AgentRunOutcome::Cancelled(_)));
+        }
+        assert_eq!(
+            store.get(&key).unwrap().as_deref(),
+            Some("early-thread"),
+            "{ending}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn successful_resume_is_not_replayed_for_unrelated_stderr() {
+    assert_resume_not_replayed(
+        concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"existing-thread\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}\n",
+            "{\"type\":\"turn.completed\"}\n",
+        ),
+        "warning: background lookup: session not found\n",
+        0,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn started_resume_is_not_replayed_after_backend_failure() {
+    for event in [
+        "{\"type\":\"thread.started\",\"thread_id\":\"existing-thread\"}\n",
+        "{\"type\":\"turn.started\"}\n",
+        "{\"type\":\"item.started\",\"item\":{\"type\":\"command_execution\",\"command\":\"echo done\"}}\n",
+        "{\"type\":\"turn.completed\"}\n",
+        "unexpected backend output\n",
+        "{\"type\":\"future.event\"}\n",
+    ] {
+        assert_resume_not_replayed(
+            event,
+            "Error: thread/resume failed: no rollout found for thread id existing-thread\n",
+            1,
+        )
+        .await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resume_is_not_replayed_for_ambiguous_missing_session_diagnostics() {
+    for diagnostic in [
+        "warning: background lookup: session not found\n",
+        "Error: unrelated subsystem: thread not found\n",
+        "warning: no rollout found for thread id existing-thread\n",
+    ] {
+        assert_resume_not_replayed("", diagnostic, 1).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn successful_resume_is_not_replayed_for_a_missing_rollout_diagnostic() {
+    assert_resume_not_replayed(
+        "",
+        "Error: thread/resume failed: no rollout found for thread id existing-thread\n",
+        0,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+async fn assert_resume_not_replayed(stdout: &str, stderr: &str, exit_code: i32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(temp.path().join("events.jsonl"), stdout).unwrap();
+    std::fs::write(temp.path().join("diagnostic"), stderr).unwrap();
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' called >> invocations\ncat events.jsonl\ncat diagnostic >&2\nexit {exit_code}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = agent("agent", "test");
+    config.workspace = temp.path().to_string_lossy().into_owned();
+    config.path = script.to_string_lossy().into_owned();
+    let agent = ConfiguredAgent::from_config(config).unwrap();
+    let channel = RecordingChannel {
+        contexts: Arc::new(Mutex::new(Vec::new())),
+        events: Arc::new(Mutex::new(Vec::new())),
+    };
+    let store = SessionStore::open(temp.path().join("store.db")).unwrap();
+    let key = agent.store_session_key(&channel.identity(), TestTask.session_id());
+    store.observe(&key, None, "existing-thread").unwrap();
+
+    let result = AgentDispatcher::new(store.clone())
+        .dispatch_channel_task(&channel, vec![agent], TestTask)
+        .await;
+
+    let invocations = std::fs::read_to_string(temp.path().join("invocations")).unwrap();
+    assert_eq!(
+        invocations.lines().count(),
+        1,
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert_eq!(result.is_ok(), exit_code == 0, "{result:?}");
+    assert_eq!(store.get(&key).unwrap().as_deref(), Some("existing-thread"));
+}
 
 #[cfg(unix)]
 #[tokio::test]

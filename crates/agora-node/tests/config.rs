@@ -114,7 +114,7 @@ fn rejects_removed_task_isolation_mode() {
 }
 
 #[test]
-fn ignores_removed_agent_env_field() {
+fn rejects_removed_agent_env_field() {
     let content = r#"{
         "channels": [],
         "agents": [{
@@ -127,10 +127,12 @@ fn ignores_removed_agent_env_field() {
         }]
     }"#;
 
-    let config = serde_json::from_str::<NodeConfig>(content).unwrap();
-
-    assert_eq!(config.agents.len(), 1);
-    assert_eq!(config.agents[0].proxy, None);
+    assert!(
+        serde_json::from_str::<NodeConfig>(content)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field")
+    );
 }
 
 #[test]

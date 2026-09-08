@@ -28,6 +28,18 @@ pub(super) struct CommandRuntime {
 }
 
 impl CommandRuntime {
+    pub(super) fn is_control(&self, input: &ChannelTaskInput) -> bool {
+        let resolution = match input {
+            ChannelTaskInput::Message(content) => self.registry.route_text(content.text()),
+            ChannelTaskInput::Command(request) => self.registry.route_structured(request),
+        };
+        match resolution {
+            CommandResolution::Invocation(invocation) => invocation.into_parts().0.is_control(),
+            CommandResolution::Reply(_) => true,
+            CommandResolution::AgentInput => false,
+        }
+    }
+
     pub(super) fn new(store: SessionStore, scheduler: ExecutionScheduler) -> Result<Self> {
         let stop = stop::StopCommand::new(scheduler.clone());
         let reset = reset::ResetCommand::new(store.clone(), scheduler);
@@ -36,15 +48,29 @@ impl CommandRuntime {
         registry.register(stop.command())?;
         registry.register(reset.command())?;
         registry.register(ask.command())?;
+        registry.register(ask.management_command())?;
         Ok(Self { registry })
     }
 
+    #[cfg(test)]
     pub(super) async fn handle(
         &self,
         channel: &ChannelIdentity,
         session_id: &str,
         agents: &[ConfiguredAgent],
         input: &ChannelTaskInput,
+    ) -> Result<CommandOutcome> {
+        self.handle_admitted(channel, session_id, agents, input, Default::default())
+            .await
+    }
+
+    pub(super) async fn handle_admitted(
+        &self,
+        channel: &ChannelIdentity,
+        session_id: &str,
+        agents: &[ConfiguredAgent],
+        input: &ChannelTaskInput,
+        admission: super::RouteAdmission,
     ) -> Result<CommandOutcome> {
         let (resolution, context) = match input {
             ChannelTaskInput::Message(content) => (
@@ -65,10 +91,15 @@ impl CommandRuntime {
             }
             CommandResolution::Invocation(invocation) => {
                 let (handler, arguments) = invocation.into_parts();
-                Ok(match handler.execute(context, arguments).await? {
-                    CommandExecution::Reply(reply) => CommandOutcome::Reply(reply),
-                    CommandExecution::Dispatch(dispatch) => CommandOutcome::Dispatch(dispatch),
-                })
+                Ok(
+                    match handler
+                        .execute(context.with_admission(admission), arguments)
+                        .await?
+                    {
+                        CommandExecution::Reply(reply) => CommandOutcome::Reply(reply),
+                        CommandExecution::Dispatch(dispatch) => CommandOutcome::Dispatch(dispatch),
+                    },
+                )
             }
         }
     }

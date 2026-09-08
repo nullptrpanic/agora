@@ -10,6 +10,18 @@ QUICK START
   Relative paths use the current directory. Absolute paths are accepted.
   Existing files are overwritten. Generated channels deny all incoming messages
   until permission.users and, for groups, permission.groups are configured.
+  Unknown fields (including the removed agent env field) are rejected at every
+  configuration level. Duplicate Lark app IDs or Telegram bot IDs are rejected.
+
+CHAT COMMANDS
+  /ask <agent_name> <prompt>  Run one agent; preserve the prompt's original spacing.
+  /agent list               List this conversation's subscribed agents.
+  /agent status <agent_name>
+  /agent enable <agent_name>
+  /agent disable <agent_name>
+  /stop [agent_name]        Stop running or queued work in this conversation.
+  /reset                    Reset subscribed agents in their isolation scope.
+  /help [command path]      Show generated help, for example /help agent enable.
 
 MINIMAL CONFIGURATION
   {
@@ -58,15 +70,16 @@ FIELD REFERENCE
     agents                   Local agent definitions.
 
   Runtime fields
-    max_in_flight_tasks      Maximum accepted channel tasks; defaults to 32.
+    max_in_flight_tasks      Maximum ordinary channel tasks; defaults to 32.
     max_in_flight_runs       Maximum admitted agent runs; defaults to 64 and must
                              fit every channel's complete subscribed-agent fan-out.
     max_concurrent_runs      Maximum concurrently executing agent backends; defaults
                              to 4 and cannot exceed max_in_flight_runs.
+    All three values must be positive and fit Tokio Semaphore::MAX_PERMITS.
+    Each channel separately reserves 8 control admissions and 1 busy-reply worker.
 
   Channel fields
-    type                     Active types: "lark" and "telegram". "local" and
-                             "http" are reserved and not active yet.
+    type                     "lark" or "telegram"; other types are rejected.
     name                     Unique name referenced by agent subscriptions.
     permission               Optional access policy; omission means deny all.
     proxy                    Optional channel-specific HTTP proxy.
@@ -86,11 +99,12 @@ FIELD REFERENCE
     require_mention          Optional group flag; defaults to false.
 
   Agent fields
-    name                     Unique local agent name.
+    name                     Unique, non-empty local agent name without whitespace.
     isolate                  Backend session isolation: "none" or "session".
     workspace                Optional workdir; defaults to ~/.agora/workspace.
     type                     "codex" or "custom".
-    path                     Backend executable path.
+    path                     Executable file, resolved once at startup. Bare names
+                             use PATH; relative paths use the Node working directory.
     model                    Optional Codex model override.
     effort                   Optional Codex reasoning effort override.
     agent_sandbox            Optional Codex sandbox: "read-only",
@@ -102,9 +116,12 @@ FIELD REFERENCE
                              HTTP_PROXY/HTTPS_PROXY in upper and lower case.
     subscribe                Channel subscriptions for this agent.
     subscribe[].channel      Name of a configured channel.
-    subscribe[].filter       Reserved channel filter; currently ignored.
+    subscribe[].filter       Omit, use null, or {} for no filter. Other values fail
+                             validation because filtering is not implemented.
 
   Proxy format
     proxy                    address:port or user:password@address:port. An optional
                              http:// prefix is accepted. Component-level values
                              override the top-level default.
+                             Credentials are percent-decoded for HTTP Basic/CONNECT
+                             and safely URL-encoded for the agent environment.

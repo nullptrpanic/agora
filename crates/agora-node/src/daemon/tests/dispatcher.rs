@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::AgentOutput;
+use crate::channel::ChannelSender;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -26,11 +27,12 @@ impl ChannelRun for BlockingTerminalRun {
     }
 }
 
+#[derive(Clone)]
 struct BlockingTerminalChannel {
     terminal: Arc<Notify>,
 }
 
-impl Channel for BlockingTerminalChannel {
+impl crate::channel::ChannelSender for BlockingTerminalChannel {
     type Task = TestTask;
     type Run = BlockingTerminalRun;
 
@@ -42,10 +44,6 @@ impl Channel for BlockingTerminalChannel {
         ChannelIdentity::new(self.name(), "test", self.name())
     }
 
-    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
-        Ok(None)
-    }
-
     async fn open_run(&self, _task: &Self::Task, _context: ChannelRunContext) -> Result<Self::Run> {
         Ok(BlockingTerminalRun {
             terminal: Arc::clone(&self.terminal),
@@ -54,6 +52,15 @@ impl Channel for BlockingTerminalChannel {
 
     async fn reply(&self, _task: &Self::Task, _reply: ChannelReply) -> Result<()> {
         Ok(())
+    }
+}
+impl Channel for BlockingTerminalChannel {
+    type Sender = Self;
+    fn sender(&self) -> Self::Sender {
+        self.clone()
+    }
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
+        Ok(None)
     }
 }
 
@@ -88,7 +95,6 @@ fn wraps_configured_channel_behind_channel_trait() {
         permission: Default::default(),
         proxy: None,
     }))
-    .unwrap()
     .unwrap();
 
     assert_eq!(channel.name(), "lark1");
@@ -289,42 +295,21 @@ async fn reports_nonzero_agent_exit_as_failed() {
     );
 }
 
-#[tokio::test]
-async fn daemon_rejects_unsupported_channels_even_without_constructor_validation() {
+#[test]
+fn daemon_rejects_invalid_executable_before_opening_state() {
     let temp = tempfile::tempdir().unwrap();
     let paths = crate::instance::StatePaths::from_home(temp.path());
-    let instance_guard = crate::instance::NodeInstanceGuard::acquire(paths).unwrap();
-    let store = SessionStore::open(temp.path().join("store.db")).unwrap();
-    let scheduler = super::super::ExecutionScheduler::default();
+    let mut invalid = custom_agent("invalid");
+    invalid.path = temp.path().join("missing").to_string_lossy().into_owned();
     let config = NodeConfig {
         proxy: None,
         runtime: Default::default(),
-        channels: vec![
-            ChannelConfig::Local(NamedChannelConfig {
-                name: "local".to_string(),
-                permission: Default::default(),
-                proxy: None,
-            }),
-            ChannelConfig::Lark(LarkChannelConfig {
-                name: "lark".to_string(),
-                app_id: "app".to_string(),
-                secret: "secret".to_string(),
-                permission: Default::default(),
-                proxy: None,
-            }),
-        ],
-        agents: Vec::new(),
+        channels: vec![],
+        agents: vec![invalid],
     };
-    let daemon = Daemon {
-        instance_guard,
-        config,
-        dispatcher: AgentDispatcher::from_parts(store.clone(), scheduler.clone()),
-        commands: Arc::new(CommandRuntime::new(store, scheduler).unwrap()),
-        task_slots: super::super::TaskSlots::new(32),
-    };
-
-    let error = daemon.run().await.unwrap_err();
-    assert_eq!(error.to_string(), "local channel is not implemented: local");
+    let result = Daemon::new_with_paths(config, paths.clone());
+    assert!(result.is_err());
+    assert!(!paths.store_path().exists());
 }
 
 #[tokio::test]

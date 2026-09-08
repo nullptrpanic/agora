@@ -104,7 +104,7 @@ fn agent_status_with_button(name: &str, enabled: bool) -> ChannelAgentStatus {
     ChannelAgentStatus::new(name, enabled).with_button(ChannelButton::new(
         text,
         style,
-        CommandRequest::new(["ask", command]).with_argument("agent_name", name),
+        CommandRequest::new(["agent", command]).with_argument("agent_name", name),
     ))
 }
 
@@ -142,7 +142,7 @@ impl CommandTestTask {
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
             input: ChannelTaskInput::Command(
-                CommandRequest::new(["ask", if enabled { "enable" } else { "disable" }])
+                CommandRequest::new(["agent", if enabled { "enable" } else { "disable" }])
                     .with_argument("agent_name", agent_name),
             ),
         }
@@ -198,7 +198,7 @@ impl CommandTestChannel {
     }
 }
 
-impl Channel for CommandTestChannel {
+impl crate::channel::ChannelSender for CommandTestChannel {
     type Task = CommandTestTask;
     type Run = CommandTestRun;
 
@@ -208,17 +208,6 @@ impl Channel for CommandTestChannel {
 
     fn identity(&self) -> ChannelIdentity {
         command_channel_identity()
-    }
-
-    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
-        if let Some(task) = self.tasks.pop_front() {
-            if let Some(received) = &self.received {
-                received.fetch_add(1, Ordering::Release);
-            }
-            Ok(Some(ChannelDelivery::untracked(task)))
-        } else {
-            pending().await
-        }
     }
 
     async fn open_run(&self, _task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
@@ -234,5 +223,21 @@ impl Channel for CommandTestChannel {
     async fn reply(&self, _task: &Self::Task, reply: ChannelReply) -> Result<()> {
         self.replies.lock().unwrap().push(reply);
         Ok(())
+    }
+}
+impl Channel for CommandTestChannel {
+    type Sender = Self;
+    fn sender(&self) -> Self::Sender {
+        self.clone()
+    }
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
+        if let Some(task) = self.tasks.pop_front() {
+            if let Some(received) = &self.received {
+                received.fetch_add(1, Ordering::Release);
+            }
+            Ok(Some(ChannelDelivery::untracked(task)))
+        } else {
+            pending().await
+        }
     }
 }
