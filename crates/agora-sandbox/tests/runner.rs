@@ -15,6 +15,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
+#[path = "runner/lifecycle.rs"]
+mod lifecycle;
+
+#[cfg(target_os = "macos")]
 const TLS_TRUST_ENVIRONMENT: [&str; 6] = [
     "SSL_CERT_FILE",
     "CURL_CA_BUNDLE",

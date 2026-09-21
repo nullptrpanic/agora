@@ -9,6 +9,38 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
 
 #[test]
+fn missing_directory_cache_is_bounded() {
+    let root = tempfile::tempdir().unwrap();
+    let store = MetadataStore::new(root.path()).unwrap();
+    for index in 0..(super::METADATA_CACHE_CAPACITY * 2) {
+        assert!(
+            store
+                .load(Path::new(&format!("/missing-{index}")))
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert!(store.cache().directories.len() <= super::METADATA_CACHE_CAPACITY);
+    }
+}
+
+#[test]
+fn read_hits_share_metadata_without_mutating_existing_snapshots() {
+    let root = tempfile::tempdir().unwrap();
+    let store = MetadataStore::new(root.path()).unwrap();
+    store.set(Path::new("/entry"), EntryState::Cow).unwrap();
+    let first = store.load_shared(Path::new("/")).unwrap();
+    let second = store.load_shared(Path::new("/")).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+    store.set_whiteout(Path::new("/another"), false).unwrap();
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(
+        store.state(Path::new("/another")).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+}
+
+#[test]
 fn metadata_store_creates_and_validates_directory_markers() {
     let root = tempfile();
     let store = MetadataStore::new(&root).unwrap();

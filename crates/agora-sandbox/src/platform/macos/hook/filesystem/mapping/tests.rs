@@ -150,7 +150,7 @@ fn mapping_ranges_split_and_reject_address_and_file_overflow() {
             ),
             libc::MAP_FAILED
         );
-        assert_eq!(*libc::__error(), libc::EIO);
+        assert_eq!(*libc::__error(), libc::EOVERFLOW);
 
         assert_eq!(agora_sandbox_close(descriptor), 0);
     });

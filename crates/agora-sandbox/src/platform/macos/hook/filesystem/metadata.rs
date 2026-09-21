@@ -83,13 +83,26 @@ unsafe fn sandbox_fchmod(descriptor: libc::c_int, mode: libc::mode_t) -> libc::c
             unsafe { set_errno(libc::ENOTSUP) };
             return -1;
         }
-        match runtime.filesystem.chmod_authorized(
+        let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
+            return -1;
+        }
+        let identity = open
+            .identity
+            .map(|identity| (identity.device, identity.inode))
+            .unwrap_or((status.st_dev as u64, status.st_ino));
+        match runtime.filesystem.chmod_identity_authorized(
             &open.logical(),
             mode.into(),
             false,
             &Credentials::effective(),
+            Some(identity),
         ) {
             Ok(()) => 0,
+            Err(error) if error_errno(&error) == libc::ESTALE && open.layer == FileLayer::Upper => {
+                // The old upper vnode is still alive, but its path names another inode.
+                unsafe { original(descriptor, mode) }
+            }
             Err(error) => unsafe { fail(&error, -1) },
         }
     })
@@ -371,7 +384,14 @@ unsafe fn sandbox_fstat(descriptor: libc::c_int, status: *mut libc::stat) -> lib
                     };
                     (Some(size), Some(attributes))
                 }
-                Ok(None) => match runtime.filesystem.attributes(&open.logical()) {
+                Ok(None) => match runtime.filesystem.descriptor_attributes(
+                    &open.logical(),
+                    open.identity
+                        .map(|identity| (identity.device, identity.inode))
+                        .unwrap_or((unsafe { (*status).st_dev } as u64, unsafe {
+                            (*status).st_ino
+                        })),
+                ) {
                     Ok(attributes) => (None, attributes),
                     Err(error) => return unsafe { fail(&error, -1) },
                 },

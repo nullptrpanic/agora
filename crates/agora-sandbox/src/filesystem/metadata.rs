@@ -12,9 +12,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 const LEGACY_METADATA_VERSION: u32 = 1;
 const READABLE_METADATA_VERSION: u32 = 2;
@@ -248,6 +248,17 @@ struct MetadataCache {
     directories: HashMap<PathBuf, CachedDirectoryMetadata>,
 }
 
+impl MetadataCache {
+    fn insert(&mut self, path: PathBuf, metadata: CachedDirectoryMetadata) {
+        if self.directories.len() >= METADATA_CACHE_CAPACITY
+            && !self.directories.contains_key(&path)
+        {
+            self.directories.clear();
+        }
+        self.directories.insert(path, metadata);
+    }
+}
+
 #[derive(Default)]
 struct TransactionGeneration {
     owner: Option<usize>,
@@ -267,7 +278,7 @@ struct AppendFile {
 #[derive(Clone)]
 struct CachedDirectoryMetadata {
     identity: Option<SourceIdentity>,
-    metadata: Option<DirectoryMetadata>,
+    metadata: Arc<DirectoryMetadata>,
 }
 
 impl MetadataStore {
@@ -398,7 +409,11 @@ impl MetadataStore {
             return Ok(None);
         }
         let (parent, name) = Self::split(path)?;
-        Ok(self.load(parent)?.entries.get(&Self::encode(name)).cloned())
+        Ok(self
+            .load_shared(parent)?
+            .entries
+            .get(&Self::encode(name))
+            .cloned())
     }
 
     pub(super) fn records(
@@ -423,7 +438,7 @@ impl MetadataStore {
     pub(super) fn ensure_marker(&self, directory: &Path) -> Result<()> {
         let path = self.path(directory)?;
         match path.symlink_metadata() {
-            Ok(metadata) if metadata.is_file() => self.load(directory).map(|_| ()),
+            Ok(metadata) if metadata.is_file() => self.load_shared(directory).map(|_| ()),
             Ok(_) => bail!(
                 "failed to read filesystem metadata {}: marker is not a file",
                 path.display()
@@ -453,7 +468,7 @@ impl MetadataStore {
             self.advance_generation()?;
         }
         if identity.is_some() {
-            self.load(directory)?;
+            self.load_shared(directory)?;
         }
         Ok(identity.is_some())
     }
@@ -549,7 +564,7 @@ impl MetadataStore {
         }
         let (parent, name) = Self::split(path)?;
         Ok(self
-            .load(parent)?
+            .load_shared(parent)?
             .attributes
             .get(&Self::encode(name))
             .cloned())
@@ -583,15 +598,15 @@ impl MetadataStore {
     }
 
     pub(super) fn entries(&self, directory: &Path) -> Result<Vec<(OsString, EntryState)>> {
-        self.load(directory)?
+        self.load_shared(directory)?
             .entries
-            .into_iter()
-            .map(|(name, state)| Ok((Self::decode(&name)?, state)))
+            .iter()
+            .map(|(name, state)| Ok((Self::decode(name)?, state.clone())))
             .collect()
     }
 
     pub(super) fn contains_only_loader_cache_records(&self, directory: &Path) -> Result<bool> {
-        let metadata = self.load(directory)?;
+        let metadata = self.load_shared(directory)?;
         Ok(metadata.attributes.is_empty()
             && metadata.encrypted_names.is_empty()
             && metadata.entries.values().all(|state| {
@@ -608,7 +623,7 @@ impl MetadataStore {
     pub(super) fn encrypted_name(&self, path: &Path) -> Result<Option<OsString>> {
         let (parent, name) = Self::split(path)?;
         Ok(self
-            .load(parent)?
+            .load_shared(parent)?
             .encrypted_names
             .get(&Self::encode(name))
             .map(|name| OsString::from(namespace::encrypted_backing_name(name))))
@@ -636,13 +651,13 @@ impl MetadataStore {
     }
 
     pub(super) fn encrypted_names(&self, directory: &Path) -> Result<Vec<(OsString, OsString)>> {
-        self.load(directory)?
+        self.load_shared(directory)?
             .encrypted_names
-            .into_iter()
+            .iter()
             .map(|(logical, backing)| {
                 Ok((
-                    Self::decode(&logical)?,
-                    OsString::from(namespace::encrypted_backing_name(&backing)),
+                    Self::decode(logical)?,
+                    OsString::from(namespace::encrypted_backing_name(backing)),
                 ))
             })
             .collect()
@@ -665,11 +680,19 @@ impl MetadataStore {
     }
 
     fn load(&self, directory: &Path) -> Result<DirectoryMetadata> {
+        self.load_shared(directory).map(Arc::unwrap_or_clone)
+    }
+
+    fn load_shared(&self, directory: &Path) -> Result<Arc<DirectoryMetadata>> {
         let generation = self.current_generation()?;
         self.load_at_generation(directory, generation)
     }
 
-    fn load_at_generation(&self, directory: &Path, generation: u64) -> Result<DirectoryMetadata> {
+    fn load_at_generation(
+        &self,
+        directory: &Path,
+        generation: u64,
+    ) -> Result<Arc<DirectoryMetadata>> {
         let path = self.path(directory)?;
         {
             let mut cache = self.cache();
@@ -678,7 +701,7 @@ impl MetadataStore {
                 cache.directories.clear();
             }
             if let Some(cached) = cache.directories.get(&path) {
-                return Ok(cached.metadata.clone().unwrap_or_default());
+                return Ok(Arc::clone(&cached.metadata));
             }
         }
         #[cfg(test)]
@@ -689,17 +712,18 @@ impl MetadataStore {
         {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let metadata = Arc::default();
                 let mut cache = self.cache();
                 if cache.generation == Some(generation) {
-                    cache.directories.insert(
+                    cache.insert(
                         path,
                         CachedDirectoryMetadata {
                             identity: None,
-                            metadata: None,
+                            metadata: Arc::clone(&metadata),
                         },
                     );
                 }
-                return Ok(DirectoryMetadata::default());
+                return Ok(metadata);
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -720,23 +744,18 @@ impl MetadataStore {
             MAX_DIRECTORY_METADATA_BYTES,
             &format!("filesystem metadata {}", path.display()),
         )?;
-        let metadata = self.decode_metadata(&contents, &path)?;
+        let metadata = Arc::new(self.decode_metadata(&contents, &path)?);
         #[cfg(test)]
         self.parse_count.fetch_add(1, Ordering::Relaxed);
         let mut cache = self.cache();
         if cache.generation != Some(generation) {
             return Ok(metadata);
         }
-        if cache.directories.len() >= METADATA_CACHE_CAPACITY
-            && !cache.directories.contains_key(&path)
-        {
-            cache.directories.clear();
-        }
-        cache.directories.insert(
+        cache.insert(
             path,
             CachedDirectoryMetadata {
                 identity,
-                metadata: Some(metadata.clone()),
+                metadata: Arc::clone(&metadata),
             },
         );
         Ok(metadata)
@@ -765,7 +784,7 @@ impl MetadataStore {
             let marker = self.path(ancestor)?;
             match Self::marker_identity(&marker)? {
                 Some(_) => {
-                    self.load(ancestor)?;
+                    self.load_shared(ancestor)?;
                 }
                 None => self.write_one(ancestor, &DirectoryMetadata::default())?,
             }
@@ -825,11 +844,10 @@ impl MetadataStore {
             let Some(cached) = cache.directories.get(&path) else {
                 return Ok(false);
             };
-            let (Some(expected_identity), Some(metadata)) =
-                (cached.identity, cached.metadata.as_ref())
-            else {
+            let Some(expected_identity) = cached.identity else {
                 return Ok(false);
             };
+            let metadata = &cached.metadata;
             if metadata.entries.contains_key(&logical_name)
                 || metadata.attributes.contains_key(&logical_name)
                 || metadata.encrypted_names.contains_key(&logical_name)
@@ -901,8 +919,8 @@ impl MetadataStore {
             cache.directories.clear();
         } else if let Some(cached) = cache.directories.get_mut(&path)
             && cached.identity == Some(expected_identity)
-            && let Some(metadata) = cached.metadata.as_mut()
         {
+            let metadata = Arc::make_mut(&mut cached.metadata);
             metadata
                 .entries
                 .insert(logical_name.clone(), EntryState::Whiteout);
@@ -1019,16 +1037,11 @@ impl MetadataStore {
             cache.directories.clear();
         }
         cache.generation = Some(generation);
-        if cache.directories.len() >= METADATA_CACHE_CAPACITY
-            && !cache.directories.contains_key(&path)
-        {
-            cache.directories.clear();
-        }
-        cache.directories.insert(
+        cache.insert(
             path,
             CachedDirectoryMetadata {
                 identity: Some(identity),
-                metadata: Some(metadata),
+                metadata: Arc::new(metadata),
             },
         );
         Ok(())

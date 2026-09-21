@@ -163,6 +163,20 @@ pub(super) trait ContentBackend: Send + Sync {
         Ok(())
     }
 
+    fn prepare_close(
+        &self,
+        state: &ContentState,
+        runtime: &FilesystemHookRuntime,
+        descriptor: libc::c_int,
+        open: &OpenFile,
+    ) -> Result<()> {
+        self.finish(state, runtime, descriptor, open)
+    }
+
+    fn complete_close(&self, _runtime: &FilesystemHookRuntime) -> Result<()> {
+        Ok(())
+    }
+
     fn supports_async_write(&self) -> bool {
         true
     }

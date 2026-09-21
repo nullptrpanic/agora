@@ -402,12 +402,6 @@ fn receive_marker(stream: &UnixStream) -> io::Result<Vec<OwnedFd>> {
     if received < 0 {
         return Err(io::Error::last_os_error());
     }
-    if received != 1 || marker[0] != FRAME_MARKER {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid remote filesystem frame marker",
-        ));
-    }
     let reported_control_length = header.msg_controllen as usize;
     let control_start = header.msg_control as usize;
     let control_end = control_start.saturating_add(reported_control_length.min(control.len()));
@@ -462,6 +456,13 @@ fn receive_marker(stream: &UnixStream) -> io::Result<Vec<OwnedFd>> {
             }
             message = libc::CMSG_NXTHDR(&header, message);
         }
+    }
+    // Own every delivered FD before rejecting the frame so errors also close it.
+    if received != 1 || marker[0] != FRAME_MARKER {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid remote filesystem frame marker",
+        ));
     }
     if invalid_control || descriptors.len() > MAX_DESCRIPTORS {
         return Err(io::Error::new(

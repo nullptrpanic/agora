@@ -187,35 +187,49 @@ impl ExecutionServer {
                         continue;
                     };
                     let state = Arc::clone(&self.state);
+                    let shutdown = shutdown.clone();
                     connections.spawn(async move {
                         let _permit = permit;
-                        Self::handle(stream, state).await
+                        Self::handle(stream, state, shutdown).await
                     });
                 }
             }
         }
-        connections.abort_all();
+        // Reads and response delivery are cancellable; an accepted blocking
+        // preparation must finish before its store/workspace can be released.
         while connections.join_next().await.is_some() {}
         Ok(())
     }
 
-    async fn handle(mut stream: TcpStream, state: Arc<ExecutionState>) -> Result<()> {
-        let frame =
-            tokio::time::timeout(EXECUTION_HANDSHAKE_TIMEOUT, Self::read_frame(&mut stream))
-                .await
-                .context("sandbox execution handshake timed out")??;
-        let (ping, authenticated) = Self::respond(&mut stream, &state, frame).await?;
+    async fn handle(
+        mut stream: TcpStream,
+        state: Arc<ExecutionState>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        let frame = tokio::time::timeout(
+            EXECUTION_HANDSHAKE_TIMEOUT,
+            Self::read_until_shutdown(&mut stream, &mut shutdown),
+        )
+        .await
+        .context("sandbox execution handshake timed out")??;
+        let Some(frame) = frame else {
+            return Ok(());
+        };
+        let (ping, authenticated) =
+            Self::respond(&mut stream, &state, frame, &mut shutdown).await?;
         if !ping || !authenticated {
             stream.shutdown().await?;
             return Ok(());
         }
         loop {
-            let frame = match Self::read_frame(&mut stream).await {
-                Ok(frame) => frame,
+            let frame = match Self::read_until_shutdown(&mut stream, &mut shutdown).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Ok(()),
                 Err(error) if disconnected(&error) => return Ok(()),
                 Err(error) => return Err(error),
             };
-            let (_, authenticated) = Self::respond(&mut stream, &state, frame).await?;
+            let (_, authenticated) =
+                Self::respond(&mut stream, &state, frame, &mut shutdown).await?;
             if !authenticated {
                 stream.shutdown().await?;
                 return Ok(());
@@ -227,6 +241,7 @@ impl ExecutionServer {
         stream: &mut TcpStream,
         state: &ExecutionState,
         frame: Vec<u8>,
+        shutdown: &mut watch::Receiver<bool>,
     ) -> Result<(bool, bool)> {
         let request = decode_request(&frame)?;
         let ping = matches!(&request, ExecutionRequest::Ping { .. });
@@ -262,9 +277,12 @@ impl ExecutionServer {
                 }
             }
         };
-        stream
-            .write_all(&encode_prepare_response(&response)?)
-            .await?;
+        let encoded = encode_prepare_response(&response)?;
+        tokio::select! {
+            biased;
+            _ = shutdown.wait_for(|stopped| *stopped) => return Ok((false, authenticated)),
+            result = stream.write_all(&encoded) => result?,
+        }
         Ok((ping, authenticated))
     }
 
@@ -274,6 +292,17 @@ impl ExecutionServer {
         let mut frame = vec![0_u8; frame_length(prefix)?];
         stream.read_exact(&mut frame).await?;
         Ok(frame)
+    }
+
+    async fn read_until_shutdown(
+        stream: &mut TcpStream,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<Option<Vec<u8>>> {
+        tokio::select! {
+            biased;
+            _ = shutdown.wait_for(|stopped| *stopped) => Ok(None),
+            frame = Self::read_frame(stream) => frame.map(Some),
+        }
     }
 }
 
@@ -300,4 +329,65 @@ fn preparation_errno(error: &anyhow::Error) -> i32 {
         .chain()
         .find_map(|cause| cause.downcast_ref::<io::Error>()?.raw_os_error())
         .unwrap_or(libc::EIO)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drains_started_preparation_but_not_idle_connections() {
+        let directory = tempfile::tempdir().unwrap();
+        let controller = ExecutionController::start(directory.path().join("cache"))
+            .await
+            .unwrap();
+        let store = Arc::clone(&controller.store);
+        let held_store = Arc::clone(&store);
+        let (ready, locked) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let locker = std::thread::spawn(move || {
+            let _guard = lock(&held_store);
+            let _ = ready.send(());
+            let _ = released.recv_timeout(Duration::from_secs(60));
+        });
+        locked.await.unwrap();
+        let baseline = Arc::strong_count(&store);
+        let _idle = TcpStream::connect(controller.runtime.control())
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(controller.runtime.control())
+            .await
+            .unwrap();
+        stream
+            .write_all(
+                &super::super::protocol::encode_prepare_request(
+                    controller.runtime.token(),
+                    std::path::Path::new("/bin/sh"),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&store) == baseline {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let shutdown = tokio::spawn(controller.shutdown());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let returned_early = shutdown.is_finished();
+        release.send(()).unwrap();
+        locker.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !returned_early,
+            "shutdown detached an in-flight preparation"
+        );
+    }
 }

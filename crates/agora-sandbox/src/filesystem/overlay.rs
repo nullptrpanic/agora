@@ -582,6 +582,7 @@ impl OverlayStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn attributes(&self, path: &Path) -> Result<Option<FileAttributes>> {
         self.transaction(|transaction| transaction.attributes(path))
     }

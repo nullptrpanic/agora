@@ -114,6 +114,11 @@ where
     );
     let open = runtime.tracked_open(descriptor)?;
     let content = open.managed();
+    if content.backend.read_mode() == ContentReadMode::Native {
+        // The caller releases its hook guard before the native fallback. A
+        // tracked FIFO must not retain signal masking or the fork barrier.
+        return None;
+    }
     let _mutation = content.mutation_guard();
     let logical = LogicalIoState::acquire(content, requested_offset);
     let mut operations = ReadOperations {
@@ -162,6 +167,13 @@ where
     );
     let open = runtime.tracked_open(descriptor)?;
     let content = open.managed();
+    if content.backend.write_mode()
+        == (ContentWriteMode::Native {
+            track_snapshot: false,
+        })
+    {
+        return None;
+    }
     let _mutation = content.mutation_guard();
     let logical = LogicalIoState::acquire(content, requested_offset);
     let mut operations = WriteOperations {

@@ -265,7 +265,7 @@ pub(super) unsafe fn sandbox_close(
             let result = if runtime.has_mapping(open) {
                 runtime.commit_open_file(descriptor, open, true)
             } else {
-                runtime.finish_open_file(descriptor, open)
+                runtime.prepare_open_file_close(descriptor, open)
             };
             if let Err(error) = result {
                 runtime.restore_descriptor_under_lease(descriptor, Arc::clone(open));
@@ -273,6 +273,15 @@ pub(super) unsafe fn sandbox_close(
             }
         }
         let result = operation(descriptor);
+        let native_errno = unsafe { *libc::__error() };
+        let completion = if let Some((open, true)) = &tracked
+            && result == 0
+            && !runtime.has_mapping(open)
+        {
+            runtime.complete_open_file_close(open)
+        } else {
+            Ok(())
+        };
         if result == 0
             && let Some((open, last_alias)) = &tracked
         {
@@ -286,6 +295,10 @@ pub(super) unsafe fn sandbox_close(
             transition.clear();
             runtime.unregister_directory(descriptor);
         }
+        if let Err(error) = completion {
+            return unsafe { fail(&error, -1) };
+        }
+        unsafe { set_errno(native_errno) };
         result
     })
 }
@@ -363,7 +376,7 @@ unsafe fn sandbox_fclose(stream: *mut libc::FILE) -> libc::c_int {
             let result = if runtime.has_mapping(open) {
                 runtime.commit_open_file(descriptor, open, true)
             } else {
-                runtime.finish_open_file(descriptor, open)
+                runtime.prepare_open_file_close(descriptor, open)
             };
             if let Err(error) = result {
                 runtime.restore_descriptor_under_lease(descriptor, Arc::clone(open));
@@ -371,12 +384,24 @@ unsafe fn sandbox_fclose(stream: *mut libc::FILE) -> libc::c_int {
             }
         }
         let result = unsafe { original(stream) };
+        let native_errno = unsafe { *libc::__error() };
         transition.clear();
         if let Some((open, last_alias)) = &tracked {
             release_local_close_locks(open, *last_alias);
         }
+        let completion = if let Some((open, true)) = &tracked
+            && !runtime.has_mapping(open)
+        {
+            runtime.complete_open_file_close(open)
+        } else {
+            Ok(())
+        };
         if result != 0 {
+            unsafe { set_errno(native_errno) };
             return result;
+        }
+        if let Err(error) = completion {
+            return unsafe { fail(&error, -1) };
         }
         if let Some(errno) = flush_errno {
             unsafe { set_errno(errno) };

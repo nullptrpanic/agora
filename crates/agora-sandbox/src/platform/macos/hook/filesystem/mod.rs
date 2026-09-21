@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use content::{EncryptedContent, LocalContentInheritance, ManagedContent, NfsContent};
 
 type GuardId = u64;
-const INHERITED_LOCAL_DESCRIPTOR_VERSION: u8 = 6;
+const INHERITED_LOCAL_DESCRIPTOR_VERSION: u8 = 7;
 const MAX_INHERITED_LOCAL_DESCRIPTORS: usize = 256;
 
 thread_local! {
@@ -335,6 +335,7 @@ impl OpenFile {
 #[derive(Serialize, Deserialize)]
 struct InheritedLocalDescriptors {
     version: u8,
+    handles: Vec<String>,
     descriptors: Vec<InheritedLocalDescriptor>,
 }
 
@@ -1307,10 +1308,12 @@ impl FilesystemHookRuntime {
     fn encode_inherited_local_descriptors(&self) -> Option<InheritedLocalEnvironment> {
         let files = lock(&self.open_files);
         let mut descriptors = Vec::new();
+        let mut handles = Vec::new();
         for (&descriptor, open) in files.iter() {
             let Some(local) = open.local_inheritance() else {
                 continue;
             };
+            handles.push(local.handle.to_owned());
             let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
             if flags < 0 || flags & libc::FD_CLOEXEC != 0 {
                 continue;
@@ -1347,17 +1350,20 @@ impl FilesystemHookRuntime {
                 lazy: local.lazy,
             });
         }
-        if descriptors.is_empty() {
+        handles.extend(lock(&self.mappings).iter().filter_map(|mapping| {
+            mapping
+                .open
+                .local_inheritance()
+                .map(|local| local.handle.to_owned())
+        }));
+        if handles.is_empty() {
             return None;
         }
-        let mut handles = descriptors
-            .iter()
-            .map(|descriptor| descriptor.handle.clone())
-            .collect::<Vec<_>>();
         handles.sort_unstable();
         handles.dedup();
         let encoded = serde_json::to_string(&InheritedLocalDescriptors {
             version: INHERITED_LOCAL_DESCRIPTOR_VERSION,
+            handles: handles.clone(),
             descriptors,
         })
         .ok()?;
@@ -1447,11 +1453,7 @@ impl FilesystemHookRuntime {
                 ]
             })
             .collect::<HashSet<_>>();
-        let mut advertised_handles = inherited
-            .descriptors
-            .iter()
-            .map(|descriptor| descriptor.handle.clone())
-            .collect::<Vec<_>>();
+        let mut advertised_handles = inherited.handles;
         advertised_handles.sort_unstable();
         advertised_handles.dedup();
         let mut handles = HashMap::<String, (libc::c_int, libc::c_int, Arc<OpenFile>)>::new();
@@ -1736,6 +1738,17 @@ impl FilesystemHookRuntime {
         result
     }
 
+    fn prepare_open_file_close(&self, descriptor: libc::c_int, open: &OpenFile) -> Result<()> {
+        open.managed().prepare_close(self, descriptor, open)
+    }
+
+    fn complete_open_file_close(&self, open: &OpenFile) -> Result<()> {
+        if open.finished.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        open.managed().complete_close(self)
+    }
+
     fn commit_all_open_files(&self) -> Result<()> {
         let (stale, open_files) = {
             let _barrier = self
@@ -1840,11 +1853,12 @@ impl FilesystemHookRuntime {
     }
 
     fn refresh_attributes(&self, descriptor: libc::c_int, path: &str) -> Result<()> {
-        if self
-            .tracked_open(descriptor)
-            .is_some_and(|open| open.manages_metadata())
-        {
-            return Ok(());
+        if let Some(open) = self.tracked_open(descriptor) {
+            return if open.manages_metadata() {
+                Ok(())
+            } else {
+                self.refresh_open_attributes(descriptor, &open)
+            };
         }
         let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
         if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
@@ -1860,15 +1874,12 @@ impl FilesystemHookRuntime {
             return Err(io::Error::last_os_error().into());
         }
         let logical = open.logical();
-        if let Some(identity) = open.identity {
-            match self.filesystem.visible_identity(&logical) {
-                Ok((device, inode)) if device == identity.device && inode == identity.inode => {}
-                Ok(_) => return Ok(()),
-                Err(error) if error_errno(&error) == libc::ENOENT => return Ok(()),
-                Err(error) => return Err(error),
-            }
-        }
-        self.filesystem.refresh_timestamps(&logical, &status)
+        let identity = open
+            .identity
+            .map(|identity| (identity.device, identity.inode))
+            .unwrap_or((status.st_dev as u64, status.st_ino));
+        self.filesystem
+            .refresh_timestamps(&logical, &status, Some(identity))
     }
 
     fn create_directory(
@@ -2037,6 +2048,10 @@ impl FilesystemHookRuntime {
         let open_files = lock(&self.open_files).values().cloned().collect::<Vec<_>>();
         for open in open_files {
             open.retarget(from, to);
+        }
+        let mut current = lock(&self.current_directory);
+        if let Ok(suffix) = current.logical.strip_prefix(from) {
+            current.logical = to.join(suffix);
         }
     }
 
@@ -2464,12 +2479,14 @@ pub(super) fn flush_before_exec() -> Result<()> {
 
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
 pub(super) fn flush_at_exit() {
-    let Some(_guard) = FilesystemHookGuard::enter() else {
-        return;
-    };
+    // libc may call interposed writes while flushing FILE buffers. They must
+    // retain logical offsets and writeback tracking, just as explicit fclose.
     unsafe {
         libc::fflush(std::ptr::null_mut());
     }
+    let Some(_guard) = FilesystemHookGuard::enter() else {
+        return;
+    };
     if let Some(runtime) = FilesystemHookRuntime::global() {
         let _ = runtime.finish_all_open_files();
     }

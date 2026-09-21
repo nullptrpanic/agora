@@ -859,10 +859,6 @@ impl VirtualFilesystem {
         Ok((mapped, Some(size), logical))
     }
 
-    pub(crate) fn attributes(&self, path: &Path) -> Result<Option<super::FileAttributes>> {
-        self.overlay.attributes(path)
-    }
-
     pub(crate) fn exists(&self, path: &Path) -> Result<bool> {
         self.overlay.exists(path)
     }
@@ -953,7 +949,23 @@ impl VirtualFilesystem {
         follow_final: bool,
         credentials: &Credentials,
     ) -> Result<()> {
+        self.chmod_identity_authorized(path, mode, follow_final, credentials, None)
+    }
+
+    pub(crate) fn chmod_identity_authorized(
+        &self,
+        path: &Path,
+        mode: u32,
+        follow_final: bool,
+        credentials: &Credentials,
+        identity: Option<(u64, u64)>,
+    ) -> Result<()> {
         self.overlay.transaction(|transaction| {
+            if let Some(identity) = identity
+                && !Self::matches_identity_in(transaction, path, identity)?
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::ESTALE).into());
+            }
             let logical =
                 Self::resolve_access_path_in(transaction, path, follow_final, credentials)?;
             let mut attributes = Self::entry_attributes_in(transaction, &logical)?;
@@ -965,6 +977,41 @@ impl VirtualFilesystem {
         })
     }
 
+    fn matches_identity_in(
+        transaction: &OverlayTransaction<'_>,
+        path: &Path,
+        identity: (u64, u64),
+    ) -> Result<bool> {
+        match transaction
+            .visible_path(path)
+            .and_then(|path| Ok(path.metadata()?))
+        {
+            Ok(metadata) => Ok((metadata.dev(), metadata.ino()) == identity),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn descriptor_attributes(
+        &self,
+        path: &Path,
+        identity: (u64, u64),
+    ) -> Result<Option<super::FileAttributes>> {
+        self.overlay.transaction(|transaction| {
+            if Self::matches_identity_in(transaction, path, identity)? {
+                transaction.attributes(path)
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
     pub(crate) fn set_attributes(
         &self,
         path: &Path,
@@ -973,18 +1020,24 @@ impl VirtualFilesystem {
         self.overlay.set_attributes(path, attributes)
     }
 
-    pub(crate) fn refresh_timestamps(&self, path: &Path, status: &libc::stat) -> Result<()> {
-        let mut attributes = match self.overlay.attributes(path)? {
-            Some(attributes) => attributes,
-            None => super::FileAttributes::from_stat(status),
-        };
-        attributes.refresh_timestamps(status);
-        self.overlay.set_attributes(path, attributes)
-    }
-
-    pub(crate) fn visible_identity(&self, path: &Path) -> Result<(u64, u64)> {
-        let metadata = self.overlay.visible_path(path)?.metadata()?;
-        Ok((metadata.dev(), metadata.ino()))
+    pub(crate) fn refresh_timestamps(
+        &self,
+        path: &Path,
+        status: &libc::stat,
+        identity: Option<(u64, u64)>,
+    ) -> Result<()> {
+        self.overlay.transaction(|transaction| {
+            if let Some(identity) = identity
+                && !Self::matches_identity_in(transaction, path, identity)?
+            {
+                return Ok(());
+            }
+            let mut attributes = transaction
+                .attributes(path)?
+                .unwrap_or_else(|| super::FileAttributes::from_stat(status));
+            attributes.refresh_timestamps(status);
+            transaction.set_attributes(path, attributes)
+        })
     }
 
     #[cfg(test)]

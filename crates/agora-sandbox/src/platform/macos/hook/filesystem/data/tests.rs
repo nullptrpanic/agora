@@ -1684,6 +1684,73 @@ async fn inherited_local_descriptors_restore_aliases_and_shared_offsets() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_environment_tracks_cloexec_and_mapped_only_handles_for_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    let path = c_path(&directory.path().join("cloexec.txt"));
+    with_test_runtime(&runtime, || unsafe {
+        let fd = super::super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600,
+        );
+        assert!(fd >= 0);
+        let environment = runtime.encode_inherited_local_descriptors();
+        let environment =
+            environment.expect("exec would lose ownership of the close-on-exec handle");
+        assert_eq!(environment.handles.len(), 1);
+        let encoded: InheritedLocalDescriptors =
+            serde_json::from_str(&environment.encoded).unwrap();
+        assert!(encoded.descriptors.is_empty());
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        assert_eq!(agora_sandbox_ftruncate(fd, page as libc::off_t), 0);
+        let mapped = super::super::mapping::agora_sandbox_mmap(
+            std::ptr::null_mut(),
+            page,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        assert_ne!(mapped, libc::MAP_FAILED);
+        assert_eq!(super::super::agora_sandbox_close(fd), 0);
+        let mapped_only = runtime.encode_inherited_local_descriptors().unwrap();
+        assert_eq!(mapped_only.handles, environment.handles);
+        assert_eq!(super::super::mapping::agora_sandbox_munmap(mapped, page), 0);
+        assert!(runtime.encode_inherited_local_descriptors().is_none());
+    });
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_native_close_keeps_the_broker_handle_usable() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    let path = c_path(&directory.path().join("close-retry.txt"));
+    with_test_runtime(&runtime, || unsafe {
+        let fd = super::super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR,
+            0o600,
+        );
+        assert!(fd >= 0);
+        assert_eq!(agora_sandbox_write(fd, b"a".as_ptr().cast(), 1), 1);
+        assert_eq!(
+            super::super::descriptor::sandbox_close(fd, |_| {
+                set_errno(libc::EPERM);
+                -1
+            }),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::EPERM);
+        assert!(runtime.tracked_open(fd).is_some());
+        assert_eq!(agora_sandbox_write(fd, b"b".as_ptr().cast(), 1), 1);
+        assert_eq!(super::super::agora_sandbox_close(fd), 0);
+    });
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inherited_local_descriptors_release_handles_when_file_actions_close_all_aliases() {
     let directory = tempfile::tempdir().unwrap();
     let (runtime, controller) = broker_runtime(directory.path()).await;

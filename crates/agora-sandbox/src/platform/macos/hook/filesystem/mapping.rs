@@ -386,7 +386,6 @@ impl FilesystemHookRuntime {
         self.flush_mapping_snapshot(&slices, durable)
     }
 
-    #[cfg(test)]
     fn remove_mappings(&self, start: usize, end: usize) -> Vec<Arc<OpenFile>> {
         let mut mappings = lock(&self.mappings);
         let affected = Self::remove_mappings_locked(&mut mappings, start, end);
@@ -655,6 +654,11 @@ unsafe fn fail_closed_memory<T>(failure: T) -> T {
     failure
 }
 
+fn page_length(length: usize) -> Option<usize> {
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    length.checked_add(page - 1).map(|end| end / page * page)
+}
+
 unsafe fn sandbox_mmap(
     address: *mut libc::c_void,
     length: usize,
@@ -667,13 +671,17 @@ unsafe fn sandbox_mmap(
         unsafe { set_errno(libc::ENOSYS) };
         return libc::MAP_FAILED;
     };
-    if flags & libc::MAP_FIXED != 0 && (address as usize).checked_add(length).is_none() {
+    let Some(mapped_length) = page_length(length) else {
+        unsafe { set_errno(libc::EOVERFLOW) };
+        return libc::MAP_FAILED;
+    };
+    if flags & libc::MAP_FIXED != 0 && (address as usize).checked_add(mapped_length).is_none() {
         unsafe { set_errno(libc::EOVERFLOW) };
         return libc::MAP_FAILED;
     }
     let route = {
         let _signals = super::super::SignalMaskGuard::block_or_abort();
-        mmap_route(address, length, flags, descriptor)
+        mmap_route(address, mapped_length, flags, descriptor)
     };
     let runtime = match route {
         MemoryRoute::Native => {
@@ -690,28 +698,33 @@ unsafe fn sandbox_mmap(
         let operation = runtime
             .operations
             .acquire(FilesystemHookRuntime::mmap_operation_request(
-                address, length, flags, descriptor,
+                address,
+                mapped_length,
+                flags,
+                descriptor,
             ));
-        match mmap_route(address, length, flags, descriptor) {
+        match mmap_route(address, mapped_length, flags, descriptor) {
             MemoryRoute::Native => {
                 return unsafe { original(address, length, protection, flags, descriptor, offset) };
             }
             MemoryRoute::Managed(_) => {}
             MemoryRoute::Busy => return unsafe { fail_closed_memory(libc::MAP_FAILED) },
         }
-        let pending = match runtime.prepare_mapping(length, protection, flags, descriptor, offset) {
-            Ok(pending) => pending,
-            Err(error) => return unsafe { fail(&error, libc::MAP_FAILED) },
-        };
+        let pending =
+            match runtime.prepare_mapping(mapped_length, protection, flags, descriptor, offset) {
+                Ok(pending) => pending,
+                Err(error) => return unsafe { fail(&error, libc::MAP_FAILED) },
+            };
         if flags & libc::MAP_FIXED != 0
-            && let Err(error) = sync_native_mappings(runtime, address as usize, length, true)
+            && let Err(error) = sync_native_mappings(runtime, address as usize, mapped_length, true)
         {
             return unsafe { fail(&error, libc::MAP_FAILED) };
         }
         let fixed = flags & libc::MAP_FIXED != 0;
+        let readonly = pending.as_ref().is_some_and(|mapping| !mapping.writable);
         let (mapped, replaced) = if fixed {
             let start = address as usize;
-            let end = start + length;
+            let end = start + mapped_length;
             let mut mappings = lock(&runtime.mappings);
             let provisional = pending.as_ref().map(|pending| {
                 mappings.push(MemoryMapping {
@@ -756,14 +769,14 @@ unsafe fn sandbox_mmap(
                 return mapped;
             }
             let start = mapped as usize;
-            let Some(_end) = start.checked_add(length) else {
+            let Some(_end) = start.checked_add(mapped_length) else {
                 if let Some(munmap) = original_munmap() {
                     unsafe { munmap(mapped, length) };
                 }
                 unsafe { set_errno(libc::EOVERFLOW) };
                 return libc::MAP_FAILED;
             };
-            if let Err(error) = runtime.register_mapping(mapped, length, pending) {
+            if let Err(error) = runtime.register_mapping(mapped, mapped_length, pending) {
                 if let Some(munmap) = original_munmap() {
                     unsafe { munmap(mapped, length) };
                 }
@@ -771,6 +784,19 @@ unsafe fn sandbox_mmap(
             }
             (mapped, Vec::new())
         };
+        // The anonymous content FD is writable even for a logical O_RDONLY open.
+        // Lower the kernel's maximum protection once; mprotect remains native.
+        if readonly && unsafe { agora_sandbox_readonly_mapping(mapped, mapped_length) } != 0 {
+            if let Some(munmap) = original_munmap() {
+                unsafe { munmap(mapped, mapped_length) };
+            }
+            let removed = runtime.remove_mappings(mapped as usize, mapped as usize + mapped_length);
+            drop(operation);
+            let _ = runtime.finish_unreferenced(removed);
+            let _ = runtime.finish_unreferenced(replaced);
+            unsafe { set_errno(libc::EACCES) };
+            return libc::MAP_FAILED;
+        }
         drop(operation);
         let _ = runtime.finish_unreferenced(replaced);
         mapped
@@ -852,7 +878,11 @@ unsafe fn sandbox_munmap(address: *mut libc::c_void, length: usize) -> libc::c_i
         unsafe { set_errno(libc::ENOSYS) };
         return -1;
     };
-    let Some(end) = (address as usize).checked_add(length) else {
+    let Some(mapped_length) = page_length(length) else {
+        unsafe { set_errno(libc::EOVERFLOW) };
+        return -1;
+    };
+    let Some(end) = (address as usize).checked_add(mapped_length) else {
         unsafe { set_errno(libc::EOVERFLOW) };
         return -1;
     };
@@ -880,7 +910,7 @@ unsafe fn sandbox_munmap(address: *mut libc::c_void, length: usize) -> libc::c_i
             MemoryRoute::Managed(_) => {}
             MemoryRoute::Busy => return unsafe { fail_closed_memory(-1) },
         }
-        if let Err(error) = sync_native_mappings(runtime, address as usize, length, true) {
+        if let Err(error) = sync_native_mappings(runtime, address as usize, mapped_length, true) {
             return unsafe { fail(&error, -1) };
         }
         let mut mappings = lock(&runtime.mappings);
@@ -896,6 +926,10 @@ unsafe fn sandbox_munmap(address: *mut libc::c_void, length: usize) -> libc::c_i
         let _ = runtime.finish_unreferenced(affected);
         result
     })
+}
+
+unsafe extern "C" {
+    fn agora_sandbox_readonly_mapping(address: *mut libc::c_void, length: usize) -> libc::c_int;
 }
 
 #[unsafe(no_mangle)]

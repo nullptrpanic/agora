@@ -223,7 +223,13 @@ fn authorized_open_preserves_logical_chmod_during_plain_copy_up() {
         0o644
     );
     assert_eq!(
-        filesystem.attributes(&logical).unwrap().unwrap().mode & 0o777,
+        filesystem
+            .overlay
+            .attributes(&logical)
+            .unwrap()
+            .unwrap()
+            .mode
+            & 0o777,
         0o644
     );
     std::fs::OpenOptions::new()
@@ -338,7 +344,10 @@ fn authorized_rename_and_chmod_leave_state_unchanged_on_denial() {
         .unwrap_err();
     assert_eq!(errno(&error), Some(libc::EPERM));
     assert_eq!(filesystem.transaction_count_for_test() - before, 1);
-    assert_eq!(filesystem.attributes(&source).unwrap(), Some(foreign));
+    assert_eq!(
+        filesystem.overlay.attributes(&source).unwrap(),
+        Some(foreign)
+    );
 
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(parent).unwrap();

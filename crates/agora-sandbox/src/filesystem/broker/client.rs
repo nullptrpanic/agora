@@ -411,6 +411,20 @@ impl LocalClient {
         )
     }
 
+    pub(crate) fn prepare_close(
+        &self,
+        handle: &str,
+        ranges: Vec<ByteRange>,
+    ) -> Result<(), LocalClientError> {
+        self.success_until_ready(
+            Request::PrepareClose {
+                handle: handle.to_owned(),
+                ranges,
+            },
+            IDEMPOTENT_ATTEMPTS,
+        )
+    }
+
     pub(crate) fn retain(&self, handles: Vec<String>) -> Result<(), LocalClientError> {
         if handles.is_empty() {
             return Ok(());

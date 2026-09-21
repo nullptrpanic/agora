@@ -186,4 +186,20 @@ impl ManagedContent {
         let _mutation = self.mutation_guard();
         self.backend.finish(&self.state, runtime, descriptor, open)
     }
+
+    pub(super) fn prepare_close(
+        &self,
+        runtime: &FilesystemHookRuntime,
+        descriptor: libc::c_int,
+        open: &OpenFile,
+    ) -> Result<()> {
+        let _mutation = self.mutation_guard();
+        self.backend
+            .prepare_close(&self.state, runtime, descriptor, open)
+    }
+
+    pub(super) fn complete_close(&self, runtime: &FilesystemHookRuntime) -> Result<()> {
+        let _mutation = self.mutation_guard();
+        self.backend.complete_close(runtime)
+    }
 }
