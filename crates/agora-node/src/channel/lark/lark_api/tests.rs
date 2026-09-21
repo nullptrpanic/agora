@@ -198,7 +198,7 @@ async fn fragmented_websocket_event_is_admitted_only_after_reassembly() {
     let mut connected = false;
     let result = tokio::time::timeout(
         Duration::from_secs(3),
-        api.run_websocket_once(sender, &mut connected),
+        api.run_websocket_once(sender.into(), &mut connected),
     )
     .await;
     server.await.unwrap();
@@ -265,7 +265,7 @@ async fn websocket_connect_and_write_deadlines_are_bounded() {
     let mut connected = false;
 
     let error = api
-        .run_websocket_once(sender, &mut connected)
+        .run_websocket_once(sender.into(), &mut connected)
         .await
         .unwrap_err();
     assert!(
@@ -309,7 +309,7 @@ async fn websocket_silent_connection_hits_inbound_idle_timeout() {
     let mut connected = false;
 
     let error = api
-        .run_websocket_once(sender, &mut connected)
+        .run_websocket_once(sender.into(), &mut connected)
         .await
         .unwrap_err();
 
@@ -358,7 +358,7 @@ async fn websocket_inbound_ping_refreshes_the_idle_deadline() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        api.run_websocket_once(sender, &mut connected),
+        api.run_websocket_once(sender.into(), &mut connected),
     )
     .await
     .unwrap()
@@ -432,7 +432,7 @@ async fn websocket_once_forwards_events_and_answers_ack_ping_and_close() {
     });
     let mut connected = false;
 
-    api.run_websocket_once(sender, &mut connected)
+    api.run_websocket_once(sender.into(), &mut connected)
         .await
         .unwrap();
 
@@ -503,7 +503,7 @@ async fn websocket_ping_is_answered_while_event_admission_is_pending() {
     let (sender, mut receiver) = mpsc::channel::<LarkDelivery>(1);
     let mut connected = false;
     let client = tokio::spawn(async move {
-        api.run_websocket_once(sender, &mut connected)
+        api.run_websocket_once(sender.into(), &mut connected)
             .await
             .unwrap();
         connected
@@ -569,7 +569,7 @@ async fn websocket_once_uses_the_configured_proxy_for_http_and_websocket() {
     let (sender, _) = mpsc::channel(1);
     let mut connected = false;
 
-    api.run_websocket_once(sender, &mut connected)
+    api.run_websocket_once(sender.into(), &mut connected)
         .await
         .unwrap();
 
@@ -585,7 +585,7 @@ async fn websocket_loop_retries_startup_and_stops_after_its_receiver_closes() {
     .await;
     let api = LarkApi::with_base_url(config(), endpoint.base_url()).unwrap();
     let (sender, receiver) = mpsc::channel(1);
-    let task = tokio::spawn(async move { api.run_websocket_loop(sender).await });
+    let task = tokio::spawn(async move { api.run_websocket_loop(sender.into()).await });
 
     endpoint.wait_for_endpoint_count("endpoint", 1).await;
     drop(receiver);
@@ -596,6 +596,63 @@ async fn websocket_loop_retries_startup_and_stops_after_its_receiver_closes() {
         .unwrap()
         .unwrap_err();
     assert!(error.to_string().contains("receiver closed"));
+}
+
+#[tokio::test]
+async fn websocket_interrupt_has_capacity_when_all_message_slots_are_occupied() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let endpoint = HttpMockServer::start(move |_| {
+        MockResponse::json(format!(
+            r#"{{"code":0,"msg":"ok","data":{{"URL":"ws://{address}/?service_id=1"}}}}"#
+        ))
+    })
+    .await;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        socket.send(WebSocketMessage::Binary(event_frame(json!({
+            "header": {"event_id": "evt-interrupt-full", "event_type": "card.action.trigger"},
+            "event": {
+                "operator": {"open_id": "ou-user"},
+                "context": {"open_chat_id": "oc-chat", "open_message_id": "om-card"},
+                "action": {"value": {"agora_interrupt": "callback", "agora_conversation": "group"}}
+            }
+        }).to_string().into_bytes()).encode_to_vec().into())).await.unwrap();
+        loop {
+            if let WebSocketMessage::Binary(payload) = socket.next().await.unwrap().unwrap() {
+                let frame = LarkFrame::decode(payload).unwrap();
+                if frame.method == LARK_FRAME_TYPE_DATA {
+                    let code =
+                        serde_json::from_slice::<Value>(&frame.payload).unwrap()["code"].clone();
+                    socket.send(WebSocketMessage::Close(None)).await.unwrap();
+                    return code;
+                }
+            }
+        }
+    });
+    let api = LarkApi::with_base_url(config(), endpoint.base_url()).unwrap();
+    let _busy = api
+        .event_slots
+        .clone()
+        .acquire_many_owned(LARK_MAX_IN_FLIGHT_EVENTS as u32)
+        .await
+        .unwrap();
+    let (sender, mut events) = mpsc::channel(1);
+    let client = tokio::spawn(async move {
+        api.run_websocket_once(sender.into(), &mut false)
+            .await
+            .unwrap();
+    });
+    let delivery = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("interrupt waited on ordinary admission capacity")
+        .expect("interrupt was rejected as overload");
+    let (event, acknowledgement) = delivery.into_parts();
+    assert!(matches!(event, LarkEvent::Interrupt(_)));
+    acknowledgement.send(200).unwrap();
+    assert_eq!(server.await.unwrap(), 200);
+    client.await.unwrap();
 }
 
 #[tokio::test]
@@ -617,7 +674,7 @@ async fn websocket_loop_resets_backoff_after_a_clean_disconnect() {
     let (sender, receiver) = mpsc::channel(1);
     drop(receiver);
 
-    let error = api.run_websocket_loop(sender).await.unwrap_err();
+    let error = api.run_websocket_loop(sender.into()).await.unwrap_err();
 
     assert!(error.to_string().contains("receiver closed"));
     server.await.unwrap();

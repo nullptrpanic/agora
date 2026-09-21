@@ -4,12 +4,13 @@ use super::lark_api::{LarkApi, LarkApiError};
 use crate::channel::permission::PermissionDenial;
 use crate::channel::{
     ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun,
-    InterruptRegistration, RunEvent, append_bounded_tail, bounded_tail,
+    IMAGE_DELIVERY_TIMEOUT, ImageDeliveries, InterruptRegistration, RunEvent, append_bounded_tail,
+    bounded_tail,
 };
 use crate::i18n::{self, RunStatus};
-use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
+use crate::task::{OutputEvent, OutputImage, ProgressStatus, TokenUsage};
 use agora_core::logger;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -24,6 +25,8 @@ const MAX_RETAINED_PROCESS_PHASES: usize = 64;
 const MAX_RETAINED_PROGRESS_PER_PHASE: usize = 64;
 const MAX_RETAINED_PROCESS_TEXT_BYTES: usize = 8 * 1024;
 const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
+const TERMINAL_RETRY_ATTEMPTS: u32 = 3;
+const TERMINAL_RETRY_BUDGET: Duration = Duration::from_secs(60);
 
 pub(super) struct LarkAgentCard {
     inner: Arc<LarkAgentCardInner>,
@@ -40,18 +43,20 @@ impl Clone for LarkAgentCard {
 struct LarkAgentCardInner {
     target: LarkReplyTarget,
     api: LarkApi,
-    _interrupt: Option<InterruptRegistration>,
     state: Mutex<LarkAgentCardState>,
     flush: Mutex<()>,
 }
 
 struct LarkAgentCardState {
+    images: ImageDeliveries,
+    interrupt: Option<InterruptRegistration>,
     message_id: Option<String>,
     content: LarkCardContent,
     version: u64,
     sent_version: u64,
     last_update: Option<Instant>,
     flush_scheduled: bool,
+    terminal_retry_started: bool,
 }
 
 pub(super) struct LarkCardContent {
@@ -357,6 +362,13 @@ impl LarkCardContent {
                 );
             }
             OutputEvent::Usage(usage) => self.usage = Some(usage),
+            OutputEvent::Image { id, .. } => self.apply_progress(
+                id,
+                i18n::IMAGE_SENDING.to_string(),
+                ProgressStatus::Running,
+                LarkProgressKind::Message,
+                None,
+            ),
         }
     }
 
@@ -1051,8 +1063,9 @@ impl LarkAgentCard {
             inner: Arc::new(LarkAgentCardInner {
                 target,
                 api,
-                _interrupt: interrupt,
                 state: Mutex::new(LarkAgentCardState {
+                    images: ImageDeliveries::default(),
+                    interrupt,
                     message_id: None,
                     content: LarkCardContent::with_interrupt(
                         agent_name,
@@ -1063,10 +1076,61 @@ impl LarkAgentCard {
                     sent_version: 0,
                     last_update: None,
                     flush_scheduled: false,
+                    terminal_retry_started: false,
                 }),
                 flush: Mutex::new(()),
             }),
         }
+    }
+
+    async fn publish_image(&self, id: String, image: OutputImage) -> Result<()> {
+        let admitted = {
+            let mut state = self.inner.state.lock().await;
+            if !matches!(
+                state.content.state,
+                LarkRunState::Queued { .. } | LarkRunState::Running
+            ) {
+                return Ok(());
+            }
+            state.images.admit(&id, &image)
+        };
+        if matches!(admitted, Ok(false)) {
+            return Ok(());
+        }
+        let result = match admitted {
+            Ok(_) => {
+                self.publish_event(RunEvent::Output(OutputEvent::Image {
+                    id: id.clone(),
+                    image: image.clone(),
+                }))
+                .await?;
+                tokio::time::timeout(
+                    IMAGE_DELIVERY_TIMEOUT,
+                    self.inner.api.reply_image(&self.inner.target, &image),
+                )
+                .await
+                .context("lark image delivery timed out")
+                .and_then(|result| result)
+            }
+            Err(error) => Err(error),
+        };
+        let (text, status) = match result {
+            Ok(()) => (i18n::IMAGE_SENT, ProgressStatus::Completed),
+            Err(error) => {
+                logger::error!(
+                    "lark image delivery not confirmed channel={}: {}",
+                    self.inner.api.name(),
+                    error
+                );
+                (i18n::IMAGE_SEND_FAILED, ProgressStatus::Failed)
+            }
+        };
+        self.publish_event(RunEvent::Output(OutputEvent::Progress {
+            id,
+            text: text.to_string(),
+            status,
+        }))
+        .await
     }
 
     async fn publish_event(&self, event: RunEvent) -> Result<()> {
@@ -1109,6 +1173,13 @@ impl LarkAgentCard {
                     true
                 }
             };
+            if !matches!(
+                state.content.state,
+                LarkRunState::Queued { .. } | LarkRunState::Running
+            ) {
+                // Delivery retries may outlive execution, but cancellation must not.
+                state.interrupt.take();
+            }
             state.version = state.version.saturating_add(1);
             if !flush_now && !state.flush_scheduled {
                 state.flush_scheduled = true;
@@ -1217,11 +1288,68 @@ impl LarkAgentCard {
         state.last_update = Some(Instant::now());
         Ok(())
     }
+
+    async fn retry_terminal(&self, error: &anyhow::Error) {
+        if !retryable_delivery_error(error) {
+            return;
+        }
+        let mut state = self.inner.state.lock().await;
+        if state.message_id.is_none()
+            || state.version == state.sent_version
+            || state.terminal_retry_started
+            || matches!(
+                state.content.state,
+                LarkRunState::Queued { .. } | LarkRunState::Running
+            )
+        {
+            return;
+        }
+        state.terminal_retry_started = true;
+        let card = self.clone();
+        tokio::spawn(async move {
+            // Keep the last snapshot alive after the daemon releases the run, but
+            // only for a bounded recovery window. Never repeat an initial reply.
+            let recovered = tokio::time::timeout(TERMINAL_RETRY_BUDGET, async {
+                for attempt in 0..TERMINAL_RETRY_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                    match card.flush_latest().await {
+                        Ok(()) => return true,
+                        Err(error) => {
+                            logger::error!("lark terminal card retry failed source_message_id={} attempt={} error={}",
+                                card.inner.target.message_id, attempt + 1, error);
+                            if !retryable_delivery_error(&error) { break; }
+                        }
+                    }
+                }
+                false
+            }).await.unwrap_or(false);
+            if !recovered {
+                logger::error!(
+                    "lark terminal card delivery exhausted source_message_id={} terminal_publication_failed=true",
+                    card.inner.target.message_id
+                );
+            }
+        });
+    }
+}
+
+fn retryable_delivery_error(error: &anyhow::Error) -> bool {
+    if let Some(LarkApiError::Http(status)) = error.downcast_ref::<LarkApiError>() {
+        return status.is_server_error() || matches!(status.as_u16(), 408 | 429);
+    }
+    error.downcast_ref::<reqwest::Error>().is_some()
 }
 
 impl ChannelRun for LarkAgentCard {
     async fn publish(&self, event: RunEvent) -> Result<()> {
-        self.publish_event(event).await
+        if let RunEvent::Output(OutputEvent::Image { id, image }) = event {
+            return self.publish_image(id, image).await;
+        }
+        let result = self.publish_event(event).await;
+        if let Err(error) = &result {
+            self.retry_terminal(error).await;
+        }
+        result
     }
 }
 

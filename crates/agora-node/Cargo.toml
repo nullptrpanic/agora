@@ -12,7 +12,8 @@ dialoguer = { version = "0.12.0", default-features = false, features = ["passwor
 futures-util = "0.3.33"
 libc = { workspace = true }
 prost = "0.14.4"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "rustls"] }
+pulldown-cmark = { version = "0.13.4", default-features = false }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "rustls", "multipart"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -2,9 +2,12 @@ use crate::channel::lark::{LarkChannel, LarkRun, LarkSender, LarkTask};
 use crate::channel::telegram::{TelegramChannel, TelegramChannelSender, TelegramRun, TelegramTask};
 use crate::config::ChannelConfig;
 use crate::store::ChannelIdentity;
-use crate::task::{ChannelTaskInput, CommandRequest, OutputEvent};
-use anyhow::{Result, bail};
-use std::collections::HashMap;
+use crate::task::{
+    ChannelTaskInput, CommandRequest, MAX_OUTPUT_IMAGE_TOTAL_BYTES, MAX_OUTPUT_IMAGES, OutputEvent,
+    OutputImage,
+};
+use anyhow::{Result, bail, ensure};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -19,6 +22,30 @@ mod telegram;
 pub(crate) mod test_http;
 
 pub(crate) const CHANNEL_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
+const IMAGE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct ImageDeliveries {
+    ids: HashSet<String>,
+    bytes: usize,
+}
+
+impl ImageDeliveries {
+    // Claim before I/O: an uncertain HTTP result must not create duplicate photos.
+    fn admit(&mut self, id: &str, image: &OutputImage) -> Result<bool> {
+        if self.ids.contains(id) {
+            return Ok(false);
+        }
+        ensure!(self.ids.len() < MAX_OUTPUT_IMAGES, "too many output images");
+        ensure!(
+            image.data().len() <= MAX_OUTPUT_IMAGE_TOTAL_BYTES - self.bytes,
+            "output images exceed total limit"
+        );
+        self.bytes += image.data().len();
+        self.ids.insert(id.to_string());
+        Ok(true)
+    }
+}
 
 pub(crate) fn append_bounded_tail(
     target: &mut String,

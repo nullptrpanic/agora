@@ -40,6 +40,7 @@ fn completed(outcome: AgentRunOutcome) -> AgentOutcome {
 mod codex;
 mod control;
 mod custom;
+mod images;
 
 fn agent(
     agent_type: AgentType,

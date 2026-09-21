@@ -28,6 +28,7 @@ fn agent_status_with_button(name: &str, enabled: bool) -> ChannelAgentStatus {
 
 mod api;
 mod content;
+mod images;
 
 async fn lark_http_server() -> HttpMockServer {
     HttpMockServer::start(|request| {

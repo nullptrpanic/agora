@@ -11,6 +11,7 @@ use std::time::Duration;
 
 mod api;
 mod content;
+mod images;
 
 fn telegram_api(server: &HttpMockServer) -> TelegramApi {
     TelegramApi::with_base_url(

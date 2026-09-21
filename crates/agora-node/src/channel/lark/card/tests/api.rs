@@ -4,6 +4,177 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[tokio::test]
+async fn terminal_card_retries_after_the_run_owner_is_dropped() {
+    let patches = Arc::new(AtomicUsize::new(0));
+    let counter = patches.clone();
+    let server = HttpMockServer::start(move |request| {
+        if request.path.ends_with("tenant_access_token/internal") {
+            MockResponse::json(
+                r#"{"code":0,"msg":"ok","tenant_access_token":"token","expire":7200}"#,
+            )
+        } else if request.method == "PATCH" {
+            if counter.fetch_add(1, Ordering::SeqCst) < 3 {
+                MockResponse::json("{}").with_status(503)
+            } else {
+                MockResponse::json(r#"{"code":0,"msg":"ok"}"#)
+            }
+        } else {
+            MockResponse::json(r#"{"code":0,"msg":"ok","data":{"message_id":"reply"}}"#)
+        }
+    })
+    .await;
+    let callbacks = crate::channel::InterruptCallbacks::default();
+    let registration = callbacks.register(crate::channel::InterruptCallback::new(|| true));
+    let callback_id = registration.id().to_string();
+    let card = LarkAgentCard::new(
+        LarkReplyTarget {
+            message_id: "source".into(),
+        },
+        "agent".into(),
+        Some(registration),
+        LarkConversation::Private,
+        LarkApi::with_base_url(
+            LarkChannelConfig {
+                name: "test".into(),
+                app_id: "app".into(),
+                secret: "secret".into(),
+                permission: Default::default(),
+                proxy: None,
+            },
+            server.base_url(),
+        )
+        .unwrap(),
+    );
+    card.publish(RunEvent::Queued { ahead: 0 }).await.unwrap();
+    assert!(card.publish(RunEvent::Stopped).await.is_err());
+    assert!(
+        !callbacks.trigger(&callback_id),
+        "terminal recovery kept a stale button active"
+    );
+    let released = Arc::downgrade(&card.inner);
+    drop(card);
+    server.wait_for_method_count("PATCH", 4).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while released.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal retry retained the card after success");
+    let requests = server.requests().await;
+    assert!(requests.last().unwrap().body.contains("已停止"));
+    assert!(!requests.last().unwrap().body.contains("agora_interrupt"));
+    assert_eq!(patches.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn terminal_retry_releases_the_card_after_its_attempt_budget() {
+    let server = HttpMockServer::start(|request| {
+        if request.path.ends_with("tenant_access_token/internal") {
+            MockResponse::json(
+                r#"{"code":0,"msg":"ok","tenant_access_token":"token","expire":7200}"#,
+            )
+        } else if request.method == "PATCH" {
+            MockResponse::json("{}").with_status(503)
+        } else {
+            MockResponse::json(r#"{"code":0,"msg":"ok","data":{"message_id":"reply"}}"#)
+        }
+    })
+    .await;
+    let card = LarkAgentCard::new(
+        LarkReplyTarget {
+            message_id: "source".into(),
+        },
+        "agent".into(),
+        None,
+        LarkConversation::Private,
+        LarkApi::with_base_url(
+            LarkChannelConfig {
+                name: "test".into(),
+                app_id: "app".into(),
+                secret: "secret".into(),
+                permission: Default::default(),
+                proxy: None,
+            },
+            server.base_url(),
+        )
+        .unwrap(),
+    );
+    card.publish(RunEvent::Queued { ahead: 0 }).await.unwrap();
+    assert!(
+        card.publish(RunEvent::Completed { exit_code: 0 })
+            .await
+            .is_err()
+    );
+    let released = Arc::downgrade(&card.inner);
+    drop(card);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while released.upgrade().is_some() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("terminal retries never exhausted their budget");
+    assert_eq!(
+        server
+            .requests()
+            .await
+            .iter()
+            .filter(|request| request.method == "PATCH")
+            .count(),
+        12
+    );
+}
+
+#[tokio::test]
+async fn terminal_recovery_does_not_duplicate_initial_sends_or_retry_permission_errors() {
+    for patch in [false, true] {
+        let server = HttpMockServer::start(move |request| {
+            if request.path.ends_with("tenant_access_token/internal") {
+                MockResponse::json(
+                    r#"{"code":0,"msg":"ok","tenant_access_token":"token","expire":7200}"#,
+                )
+            } else if request.method == "PATCH" || !patch {
+                MockResponse::json("{}").with_status(if patch { 403 } else { 503 })
+            } else {
+                MockResponse::json(r#"{"code":0,"msg":"ok","data":{"message_id":"reply"}}"#)
+            }
+        })
+        .await;
+        let card = LarkAgentCard::new(
+            LarkReplyTarget {
+                message_id: "source".into(),
+            },
+            "agent".into(),
+            None,
+            LarkConversation::Private,
+            LarkApi::with_base_url(
+                LarkChannelConfig {
+                    name: "test".into(),
+                    app_id: "app".into(),
+                    secret: "secret".into(),
+                    permission: Default::default(),
+                    proxy: None,
+                },
+                server.base_url(),
+            )
+            .unwrap(),
+        );
+        if patch {
+            card.publish(RunEvent::Queued { ahead: 0 }).await.unwrap();
+        }
+        assert!(card.publish(RunEvent::Stopped).await.is_err());
+        let released = Arc::downgrade(&card.inner);
+        drop(card);
+        assert!(
+            released.upgrade().is_none(),
+            "unsafe recovery was scheduled"
+        );
+        assert_eq!(server.requests().await.len(), if patch { 3 } else { 2 });
+    }
+}
+
+#[tokio::test]
 async fn lark_worker_delivers_updates_received_during_http_without_another_event() {
     let server = HttpMockServer::start(|request| {
         if request.path.ends_with("tenant_access_token/internal") {
@@ -566,6 +737,7 @@ async fn lark_ask_message_replies_with_a_threaded_interactive_card() {
             content: "/agent list".to_string(),
             image_keys: Vec::new(),
             mention_ids: Vec::new(),
+            mention_keys: Default::default(),
         },
         crate::task::TaskContent::new("/agent list"),
     ));

@@ -22,6 +22,16 @@ pub(crate) const RUN_STOPPED_BODY: &str = "已按请求停止任务，已有输�
 pub(crate) const RUN_INTERRUPTED_BODY: &str =
     "Agora Node 即将退出，本次任务已中断，当前输出已保留。\nNode 恢复后，请重新发送消息继续。";
 pub(crate) const STOP_TASK: &str = "结束任务";
+pub(crate) const IMAGE_SENDING: &str = "正在发送图片附件…";
+pub(crate) const IMAGE_SENT: &str = "图片附件已发送。";
+pub(crate) const IMAGE_SEND_FAILED: &str = "图片未确认送达，请重新请求发送；文字回答已保留。";
+pub(crate) const IMAGE_UNAVAILABLE: &str =
+    "图片无法发送：文件不可读、超出允许范围，或格式/大小/数量不受支持。";
+pub(crate) const IMAGE_REFERENCE: &str = "（图片见本话题的附件；发送状态见任务过程）";
+pub(crate) const IMAGE_REFERENCE_FAILED: &str = "（图片无法发送，详见任务过程）";
+pub(crate) const STOP_REQUEST_ACCEPTED: &str = "停止请求已受理，正在结束任务。";
+pub(crate) const STOP_BUTTON_EXPIRED: &str =
+    "任务已结束或按钮已失效；如需停止当前对话的任务，请发送 /stop。";
 pub(crate) const TOTAL: &str = "Total";
 pub(crate) const INPUT: &str = "Input";
 pub(crate) const OUTPUT: &str = "Output";

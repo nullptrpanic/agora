@@ -1,4 +1,24 @@
 use super::*;
+
+#[test]
+fn image_delivery_claims_are_deduplicated_and_bounded() {
+    let image = OutputImage::new(b"\x89PNG\r\n\x1a\nfixture".to_vec()).unwrap();
+    let mut deliveries = ImageDeliveries::default();
+    for index in 0..MAX_OUTPUT_IMAGES {
+        assert!(deliveries.admit(&index.to_string(), &image).unwrap());
+        assert!(!deliveries.admit(&index.to_string(), &image).unwrap());
+    }
+    assert!(deliveries.admit("excess", &image).is_err());
+    let mut bytes = vec![0; crate::task::MAX_OUTPUT_IMAGE_BYTES];
+    bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    let image = OutputImage::new(bytes).unwrap();
+    let mut deliveries = ImageDeliveries::default();
+    for index in 0..3 {
+        assert!(deliveries.admit(&index.to_string(), &image).unwrap());
+    }
+    assert!(deliveries.admit("too-large", &image).is_err());
+    assert_eq!(deliveries.ids.len(), 3);
+}
 use crate::config::{LarkChannelConfig, TelegramChannelConfig};
 
 #[tokio::test]

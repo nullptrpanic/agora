@@ -22,6 +22,7 @@ pub(super) struct RecordedRequest {
     pub(super) method: String,
     pub(super) path: String,
     pub(super) body: String,
+    pub(super) body_bytes: Vec<u8>,
     headers: String,
 }
 
@@ -309,12 +310,13 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<RecordedRequest> {
             "mock HTTP request line was invalid",
         ));
     }
-    let body = String::from_utf8(received[header_end..header_end + content_length].to_vec())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let body_bytes = received[header_end..header_end + content_length].to_vec();
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
     Ok(RecordedRequest {
         method,
         path,
         body,
+        body_bytes,
         headers,
     })
 }

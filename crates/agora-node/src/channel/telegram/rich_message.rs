@@ -1,10 +1,13 @@
 use super::channel::{TelegramInterruptRegistration, TelegramReplyTarget};
 use super::telegram_api::TelegramApi;
-use crate::channel::{ChannelRun, RunEvent, append_bounded_tail, bounded_tail};
+use crate::channel::{
+    ChannelRun, IMAGE_DELIVERY_TIMEOUT, ImageDeliveries, RunEvent, append_bounded_tail,
+    bounded_tail,
+};
 use crate::i18n::{self, RunStatus};
-use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
+use crate::task::{OutputEvent, OutputImage, ProgressStatus, TokenUsage};
 use agora_core::logger;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,6 +41,7 @@ struct TelegramRichMessageInner {
 }
 
 struct TelegramRichMessageState {
+    images: ImageDeliveries,
     content: TelegramRichContent,
     draft_id: i64,
     message_ids: Vec<i64>,
@@ -110,6 +114,7 @@ impl TelegramRichMessage {
                 api,
                 timing,
                 state: Mutex::new(TelegramRichMessageState {
+                    images: ImageDeliveries::default(),
                     content: TelegramRichContent::new(agent_name),
                     draft_id,
                     message_ids: Vec::new(),
@@ -135,6 +140,53 @@ impl TelegramRichMessage {
         timing: TelegramRichTiming,
     ) -> Self {
         Self::with_timing_inner(target, agent_name, None, api, timing)
+    }
+
+    async fn publish_image(&self, id: String, image: OutputImage) -> Result<()> {
+        let admitted = {
+            let mut state = self.inner.state.lock().await;
+            if state.content.is_terminal() {
+                return Ok(());
+            }
+            state.images.admit(&id, &image)
+        };
+        if matches!(admitted, Ok(false)) {
+            return Ok(());
+        }
+        let result = match admitted {
+            Ok(_) => {
+                self.publish_event(RunEvent::Output(OutputEvent::Image {
+                    id: id.clone(),
+                    image: image.clone(),
+                }))
+                .await?;
+                tokio::time::timeout(
+                    IMAGE_DELIVERY_TIMEOUT,
+                    self.inner.api.send_photo(&self.inner.target, &image),
+                )
+                .await
+                .context("telegram image delivery timed out")
+                .and_then(|result| result)
+            }
+            Err(error) => Err(error),
+        };
+        let (text, status) = match result {
+            Ok(()) => (i18n::IMAGE_SENT, ProgressStatus::Completed),
+            Err(error) => {
+                logger::error!(
+                    "telegram image delivery not confirmed channel={}: {}",
+                    self.inner.api.name(),
+                    error
+                );
+                (i18n::IMAGE_SEND_FAILED, ProgressStatus::Failed)
+            }
+        };
+        self.publish_event(RunEvent::Output(OutputEvent::Progress {
+            id,
+            text: text.to_string(),
+            status,
+        }))
+        .await
     }
 
     async fn publish_event(&self, event: RunEvent) -> Result<()> {
@@ -448,6 +500,9 @@ struct TelegramPendingFlush {
 
 impl ChannelRun for TelegramRichMessage {
     async fn publish(&self, event: RunEvent) -> Result<()> {
+        if let RunEvent::Output(OutputEvent::Image { id, image }) = event {
+            return self.publish_image(id, image).await;
+        }
         self.publish_event(event).await
     }
 }
@@ -910,6 +965,13 @@ impl TelegramRichContent {
                 );
             }
             OutputEvent::Usage(usage) => self.usage = Some(usage),
+            OutputEvent::Image { id, .. } => self.apply_progress(
+                id,
+                i18n::IMAGE_SENDING.to_string(),
+                ProgressStatus::Running,
+                TelegramProgressKind::Message,
+                None,
+            ),
         }
     }
 

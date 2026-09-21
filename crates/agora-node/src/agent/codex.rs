@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+mod images;
+use images::CodexImages;
+
 #[derive(Clone)]
 pub(super) struct CodexAgent {
     name: String,
@@ -146,12 +149,19 @@ impl Agent for CodexAgent {
     where
         O: AgentOutput + Send,
     {
+        let images = CodexImages::prepare(
+            request.workdir.clone(),
+            request.session_id.as_deref(),
+            &self.env,
+        )
+        .await;
         let PreparedCommand {
             command,
             resume_requested,
             _attachment_dir,
         } = self.command(request)?;
-        let mut command_output = CodexCommandOutput::new(&self.name, output, resume_requested);
+        let mut command_output =
+            CodexCommandOutput::new(&self.name, output, resume_requested, images);
         let outcome = command.run(&mut command_output).await?;
         let session_update = if command_output.session_not_found(outcome.exit_code()) {
             AgentSessionUpdate::NotFound
@@ -224,13 +234,19 @@ struct CodexCommandOutput<'a, O> {
     pending_message: Option<PendingAgentMessage>,
     resume_requested: bool,
     stdout_observed: bool,
+    images: CodexImages,
 }
 
 impl<'a, O> CodexCommandOutput<'a, O>
 where
     O: AgentOutput + Send,
 {
-    fn new(agent_name: &'a str, output: &'a mut O, resume_requested: bool) -> Self {
+    fn new(
+        agent_name: &'a str,
+        output: &'a mut O,
+        resume_requested: bool,
+        images: CodexImages,
+    ) -> Self {
         Self {
             agent_name,
             output,
@@ -241,6 +257,7 @@ where
             pending_message: None,
             resume_requested,
             stdout_observed: false,
+            images,
         }
     }
 
@@ -284,16 +301,22 @@ where
         let Some(message) = self.pending_message.take() else {
             return Ok(());
         };
-        let event = if final_answer {
-            OutputEvent::Answer { text: message.text }
-        } else {
-            OutputEvent::Progress {
-                id: message.id,
-                text: Self::concise(&message.text, 240),
-                status: ProgressStatus::Completed,
+        if final_answer {
+            let (text, images) = self.images.markdown(message.text).await;
+            self.output.write(OutputEvent::Answer { text }).await?;
+            for image in images {
+                self.output.write(image).await?;
             }
-        };
-        self.output.write(event).await
+            Ok(())
+        } else {
+            self.output
+                .write(OutputEvent::Progress {
+                    id: message.id,
+                    text: Self::concise(&message.text, 240),
+                    status: ProgressStatus::Completed,
+                })
+                .await
+        }
     }
 
     async fn handle_item(&mut self, event_type: &str, item: &Value) -> Result<()> {
@@ -382,6 +405,11 @@ where
                     Self::progress_status(event_type, item),
                 )
                 .await?;
+                if event_type == "item.completed" {
+                    for image in self.images.mcp_images(item) {
+                        self.output.write(image).await?;
+                    }
+                }
             }
             "web_search" => {
                 let query = item
@@ -489,6 +517,7 @@ where
                         bail!("codex changed session id during execution");
                     }
                     self.output.session_started(thread_id)?;
+                    self.images.session_started(thread_id);
                     self.session_id = Some(thread_id.to_string());
                 }
             }
@@ -499,6 +528,9 @@ where
             }
             Some("turn.completed") => {
                 self.publish_pending_message(true).await?;
+                for image in self.images.native_images().await {
+                    self.output.write(image).await?;
+                }
                 if let Some(usage) = Self::token_usage(&event) {
                     self.output.write(OutputEvent::Usage(usage)).await?;
                 }
@@ -574,6 +606,10 @@ where
 
     async fn finish(&mut self) -> Result<()> {
         self.flush_stdout().await?;
-        self.publish_pending_message(true).await
+        self.publish_pending_message(true).await?;
+        for image in self.images.native_images().await {
+            self.output.write(image).await?;
+        }
+        Ok(())
     }
 }

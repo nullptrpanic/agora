@@ -16,6 +16,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -66,6 +67,8 @@ pub(super) struct LarkMessageEvent {
     pub(super) content: String,
     pub(super) image_keys: Vec<String>,
     pub(super) mention_ids: Vec<String>,
+    #[serde(default)]
+    pub(super) mention_keys: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -288,6 +291,18 @@ impl LarkMessageEvent {
             })
             .map(str::to_string)
             .collect();
+        let mention_keys = message
+            .get("mentions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|mention| {
+                Some((
+                    mention.get("key")?.as_str()?.to_string(),
+                    mention.pointer("/id/open_id")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
         Ok(Self {
             id,
             message_id: Self::required_str(message, "message_id")?.to_string(),
@@ -297,6 +312,7 @@ impl LarkMessageEvent {
             content,
             image_keys,
             mention_ids,
+            mention_keys,
             message_type,
         })
     }
@@ -307,6 +323,36 @@ impl LarkMessageEvent {
 
     pub(super) fn input(&self) -> &str {
         &self.content
+    }
+
+    fn input_without_bot_prefix(&self, bot_open_id: Option<&str>) -> &str {
+        let Some(bot_open_id) = bot_open_id else {
+            return self.input();
+        };
+        let mut input = self.input();
+        loop {
+            let prefix = input.trim_start();
+            let rest = self.mention_keys.iter().find_map(|(key, id)| {
+                if id != bot_open_id || key.is_empty() {
+                    return None;
+                }
+                prefix
+                    .strip_prefix(key)
+                    .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            });
+            match rest {
+                Some(rest) => input = rest.trim_start(),
+                // Only command addressing is syntax. Ordinary prompts (including
+                // a standalone mention) must reach the agent unchanged.
+                None => {
+                    return if input.starts_with('/') {
+                        input
+                    } else {
+                        self.input()
+                    };
+                }
+            }
+        }
     }
 
     pub(super) fn image_keys(&self) -> &[String] {
@@ -478,7 +524,7 @@ pub struct LarkChannel {
     identity: ChannelIdentity,
     permission: PermissionGate,
     bot_open_id: Option<String>,
-    group_sessions: GroupSessions,
+    group_sessions: Arc<StdMutex<GroupSessions>>,
     interrupts: InterruptCallbacks,
     receiver: Option<LarkWebSocketReceiver>,
 }
@@ -499,7 +545,7 @@ impl LarkChannel {
             identity,
             permission,
             bot_open_id: None,
-            group_sessions: GroupSessions::default(),
+            group_sessions: Default::default(),
             interrupts: InterruptCallbacks::default(),
             receiver: None,
         })
@@ -532,15 +578,26 @@ impl LarkChannel {
             identity,
             permission: PermissionGate::new(permission),
             bot_open_id: None,
-            group_sessions: GroupSessions::default(),
+            group_sessions: Default::default(),
             interrupts: InterruptCallbacks::default(),
             receiver: None,
         }
     }
 
     fn receiver(&mut self) -> &mut LarkWebSocketReceiver {
-        self.receiver
-            .get_or_insert_with(|| LarkWebSocketReceiver::spawn(self.api.clone()))
+        if self.receiver.is_none() {
+            self.receiver = Some(LarkWebSocketReceiver::spawn(self.action_handler()));
+        }
+        self.receiver.as_mut().expect("receiver initialized above")
+    }
+
+    fn action_handler(&self) -> LarkActionHandler {
+        LarkActionHandler {
+            api: self.api.clone(),
+            permission: self.permission.clone(),
+            group_sessions: self.group_sessions.clone(),
+            interrupts: self.interrupts.clone(),
+        }
     }
 
     async fn message_mentions_bot(&mut self, event: &LarkMessageEvent) -> Result<bool> {
@@ -560,47 +617,6 @@ impl LarkChannel {
         Ok(mentioned)
     }
 
-    fn action_conversation(
-        &self,
-        session_id: &str,
-        conversation: Option<LarkConversation>,
-    ) -> Option<LarkConversation> {
-        conversation.or_else(|| {
-            self.group_sessions.get(session_id).map(|group| {
-                if group {
-                    LarkConversation::Group
-                } else {
-                    LarkConversation::Private
-                }
-            })
-        })
-    }
-
-    async fn admit_action(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        message_id: &str,
-        conversation: Option<LarkConversation>,
-    ) -> bool {
-        let context = match self.action_conversation(session_id, conversation) {
-            Some(LarkConversation::Private) => AccessContext::private(user_id),
-            Some(LarkConversation::Group) => AccessContext::group_action(user_id, session_id),
-            None => AccessContext::unresolved_group(user_id, session_id),
-        };
-        let target = LarkReplyTarget {
-            message_id: message_id.to_string(),
-        };
-        let api = self.api.clone();
-        self.permission
-            .admit(self.name(), &context, move |denial| async move {
-                let token = api.tenant_access_token().await?;
-                api.reply_card(&token, &target, &LarkReplyCard::permission_denied(&denial))
-                    .await
-            })
-            .await
-    }
-
     pub(super) async fn task_from_event(&self, event: LarkMessageEvent) -> Result<LarkTask> {
         self.task_from_event_with_attachment_limit(event, crate::http::MAX_TASK_ATTACHMENT_BYTES)
             .await
@@ -611,7 +627,8 @@ impl LarkChannel {
         event: LarkMessageEvent,
         maximum_bytes: usize,
     ) -> Result<LarkTask> {
-        let mut content = TaskContent::new(event.input());
+        let mut content =
+            TaskContent::new(event.input_without_bot_prefix(self.bot_open_id.as_deref()));
         let mut remaining_bytes = maximum_bytes;
         if event.image_keys().len() > LARK_MAX_IMAGES_PER_MESSAGE {
             return Err(anyhow::Error::new(LarkImageDownloadError::permanent(
@@ -687,6 +704,8 @@ impl LarkChannel {
                     return Ok(None);
                 }
                 self.group_sessions
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
                     .insert(event.chat_id.clone(), event.chat_type != "p2p");
                 let session_id = event.session_id().to_string();
                 let sender_id = event.sender_id.clone();
@@ -706,8 +725,9 @@ impl LarkChannel {
                 Ok(Some(task))
             }
             LarkEvent::CardAction(mut event) => {
-                let conversation = self.action_conversation(&event.session_id, event.conversation);
-                if !self
+                let actions = self.action_handler();
+                let conversation = actions.conversation(&event.session_id, event.conversation);
+                if !actions
                     .admit_action(
                         &event.user_id,
                         &event.session_id,
@@ -728,24 +748,7 @@ impl LarkChannel {
                 Ok(Some(LarkTask::from_card_action(event)))
             }
             LarkEvent::Interrupt(event) => {
-                if !self
-                    .admit_action(
-                        &event.user_id,
-                        &event.session_id,
-                        &event.message_id,
-                        event.conversation,
-                    )
-                    .await
-                {
-                    return Ok(None);
-                }
-                let triggered = self.interrupts.trigger(&event.callback_id);
-                logger::info!(
-                    "lark interrupt action received channel={} event_id={} triggered={}",
-                    self.name(),
-                    event.id,
-                    triggered
-                );
+                self.action_handler().interrupt(event).await;
                 Ok(None)
             }
             LarkEvent::Message(_) | LarkEvent::Ignore { .. } => Ok(None),
@@ -852,8 +855,14 @@ impl Channel for LarkChannel {
     }
     async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
         loop {
-            let Some(delivery) = self.receiver().next_delivery().await? else {
-                return Ok(None);
+            let delivery = match self.receiver().next_delivery().await {
+                Ok(Some(delivery)) => delivery,
+                result => {
+                    // Rebuild on the supervisor's next attempt, including a panicked
+                    // worker; retrying a permanently closed queue cannot recover.
+                    self.receiver = None;
+                    return result.map(|_| None);
+                }
             };
             let deadline = delivery.deadline();
             let (event, acknowledgement) = delivery.into_parts();
@@ -895,9 +904,22 @@ struct LarkWebSocketReceiver {
     task: Option<JoinHandle<Result<()>>>,
 }
 
+impl Drop for LarkWebSocketReceiver {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
 impl LarkWebSocketReceiver {
-    fn spawn(api: LarkApi) -> Self {
+    fn spawn(actions: LarkActionHandler) -> Self {
         let (sender, events) = mpsc::channel(1);
+        let api = actions.api.clone();
+        let sender = LarkEventSender {
+            messages: sender,
+            actions: Some(Arc::new(actions)),
+        };
         let task = tokio::spawn(async move { api.run_websocket_loop(sender).await });
         Self {
             events,
@@ -909,12 +931,176 @@ impl LarkWebSocketReceiver {
         match self.events.recv().await {
             Some(delivery) => Ok(Some(delivery)),
             None => {
-                if let Some(task) = self.task.take() {
-                    task.await
+                if let Some(task) = self.task.as_mut() {
+                    let result = task.await;
+                    self.task = None;
+                    result
                         .map_err(|err| anyhow!("lark websocket receiver task failed: {err}"))??;
                 }
                 Ok(None)
             }
+        }
+    }
+}
+
+// Permission checks and run-scoped cancellation stay channel-owned. This small
+// shared handler can run in a bounded transport admission job while recv is
+// normalizing another message; it never enters the ordinary message queue.
+#[derive(Clone)]
+struct LarkActionHandler {
+    api: LarkApi,
+    permission: PermissionGate,
+    group_sessions: Arc<StdMutex<GroupSessions>>,
+    interrupts: InterruptCallbacks,
+}
+
+impl LarkActionHandler {
+    fn conversation(
+        &self,
+        session_id: &str,
+        conversation: Option<LarkConversation>,
+    ) -> Option<LarkConversation> {
+        conversation.or_else(|| {
+            self.group_sessions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(session_id)
+                .map(|group| {
+                    if group {
+                        LarkConversation::Group
+                    } else {
+                        LarkConversation::Private
+                    }
+                })
+        })
+    }
+
+    async fn admit_action(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        message_id: &str,
+        conversation: Option<LarkConversation>,
+    ) -> bool {
+        let context = match self.conversation(session_id, conversation) {
+            Some(LarkConversation::Private) => AccessContext::private(user_id),
+            Some(LarkConversation::Group) => AccessContext::group_action(user_id, session_id),
+            None => AccessContext::unresolved_group(user_id, session_id),
+        };
+        self.permission
+            .admit(self.api.name(), &context, |denial| async move {
+                let token = self.api.tenant_access_token().await?;
+                self.api
+                    .reply_card(
+                        &token,
+                        &LarkReplyTarget {
+                            message_id: message_id.into(),
+                        },
+                        &LarkReplyCard::permission_denied(&denial),
+                    )
+                    .await
+            })
+            .await
+    }
+
+    async fn interrupt(&self, event: LarkInterruptEvent) {
+        if !self
+            .admit_action(
+                &event.user_id,
+                &event.session_id,
+                &event.message_id,
+                event.conversation,
+            )
+            .await
+        {
+            return;
+        }
+        let triggered = self.interrupts.trigger(&event.callback_id);
+        logger::info!(
+            "lark interrupt action received channel={} event_id={} triggered={}",
+            self.api.name(),
+            event.id,
+            triggered
+        );
+        // Signal first; a feedback delivery failure must never undo cancellation.
+        let feedback = async {
+            let token = self.api.tenant_access_token().await?;
+            self.api
+                .reply_text(
+                    &token,
+                    &LarkReplyTarget {
+                        message_id: event.message_id,
+                    },
+                    if triggered {
+                        crate::i18n::STOP_REQUEST_ACCEPTED
+                    } else {
+                        crate::i18n::STOP_BUTTON_EXPIRED
+                    },
+                )
+                .await
+        }
+        .await;
+        if let Err(error) = feedback {
+            logger::error!(
+                "lark interrupt feedback failed channel={} event_id={} error={}",
+                self.api.name(),
+                event.id,
+                error
+            );
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct LarkEventSender {
+    messages: mpsc::Sender<LarkDelivery>,
+    actions: Option<Arc<LarkActionHandler>>,
+}
+
+impl LarkEventSender {
+    pub(super) fn is_closed(&self) -> bool {
+        self.messages.is_closed()
+    }
+
+    pub(super) async fn deliver(&self, event: LarkEvent) -> Result<u16> {
+        let event = match (event, &self.actions) {
+            (LarkEvent::Interrupt(event), Some(actions)) => {
+                return Ok(
+                    if tokio::time::timeout(LARK_EVENT_ADMISSION_TIMEOUT, actions.interrupt(event))
+                        .await
+                        .is_ok()
+                    {
+                        200
+                    } else {
+                        500
+                    },
+                );
+            }
+            (event, _) => event,
+        };
+        let (delivery, acknowledged) = LarkDelivery::new(event);
+        let deadline = delivery.deadline();
+        match tokio::time::timeout_at(deadline, async {
+            self.messages
+                .send(delivery)
+                .await
+                .map_err(|_| anyhow!("agora lark receiver closed"))?;
+            Ok(acknowledged.await.unwrap_or(500))
+        })
+        .await
+        {
+            Ok(status) => status,
+            Err(_) => Ok(500),
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<mpsc::Sender<LarkDelivery>> for LarkEventSender {
+    fn from(messages: mpsc::Sender<LarkDelivery>) -> Self {
+        Self {
+            messages,
+            actions: None,
         }
     }
 }

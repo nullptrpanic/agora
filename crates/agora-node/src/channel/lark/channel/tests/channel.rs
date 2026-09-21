@@ -30,6 +30,7 @@ fn message(message_type: &str) -> LarkMessageEvent {
         content: "hello".to_string(),
         image_keys: Vec::new(),
         mention_ids: Vec::new(),
+        mention_keys: HashMap::new(),
     }
 }
 
@@ -494,7 +495,7 @@ async fn lark_actions_check_the_actor_but_do_not_require_a_new_mention() {
     assert_eq!(task.conversation(), Some(LarkConversation::Group));
     assert!(!interrupted.load(AtomicOrdering::Relaxed));
     let cloned = channel.sender().clone();
-    assert!(!channel.group_sessions.is_empty());
+    assert!(!channel.group_sessions.lock().unwrap().is_empty());
     cloned
         .reply(&task, ChannelReply::new("legacy action reply"))
         .await
@@ -533,7 +534,7 @@ async fn marked_group_card_actions_survive_channel_reconstruction() {
         api,
         permission(&["ou-allowed"], &[("oc-restarted", false)]),
     );
-    assert!(channel.group_sessions.is_empty());
+    assert!(channel.group_sessions.lock().unwrap().is_empty());
     channel.receiver = Some(event_receiver([event]));
 
     let task = channel.recv().await.unwrap();
@@ -561,7 +562,7 @@ async fn marked_private_card_actions_survive_channel_reconstruction() {
     .unwrap();
     let (api, _server) = permission_api().await;
     let mut channel = LarkChannel::with_api_and_permission(api, permission(&["ou-allowed"], &[]));
-    assert!(channel.group_sessions.is_empty());
+    assert!(channel.group_sessions.lock().unwrap().is_empty());
     channel.receiver = Some(event_receiver([event]));
 
     let task = channel.recv().await.unwrap();
@@ -686,7 +687,7 @@ async fn configured_channel_rejects_a_task_from_another_channel_type() {
 
 #[tokio::test]
 async fn websocket_receiver_reports_background_task_outcomes() {
-    let mut receiver = LarkWebSocketReceiver::spawn(api());
+    let mut receiver = LarkWebSocketReceiver::spawn(LarkChannel::with_api(api()).action_handler());
     receiver.task.as_ref().unwrap().abort();
     assert!(
         receiver
@@ -740,4 +741,307 @@ async fn websocket_receiver_reports_background_task_outcomes() {
             .to_string()
             .contains("receiver task failed")
     );
+}
+
+#[tokio::test]
+async fn channel_restarts_a_finished_or_failed_websocket_receiver() {
+    enable_test_logging();
+    for failed in [false, true] {
+        let mut channel = LarkChannel::with_api(api());
+        let (sender, events) = mpsc::channel(1);
+        drop(sender);
+        channel.receiver = Some(LarkWebSocketReceiver {
+            events,
+            task: Some(tokio::spawn(async move {
+                if failed {
+                    anyhow::bail!("receiver failed");
+                }
+                Ok(())
+            })),
+        });
+        let result = channel.recv().await;
+        assert_eq!(result.is_err(), failed);
+        assert!(
+            channel.receiver.is_none(),
+            "dead receiver was retained indefinitely"
+        );
+        let restarted = channel.receiver();
+        assert!(
+            restarted.task.is_some(),
+            "next receive did not create a fresh worker"
+        );
+        restarted.task.as_ref().unwrap().abort();
+    }
+}
+
+#[tokio::test]
+async fn cancelling_receive_does_not_detach_the_worker_being_joined() {
+    let (sender, events) = mpsc::channel(1);
+    drop(sender);
+    let task = tokio::spawn(async { std::future::pending::<Result<()>>().await });
+    let worker = task.abort_handle();
+    let mut receiver = LarkWebSocketReceiver {
+        events,
+        task: Some(task),
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), receiver.next_delivery())
+            .await
+            .is_err()
+    );
+    drop(receiver);
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    let finished = worker.is_finished();
+    worker.abort();
+    assert!(
+        finished,
+        "cancelled recv lost ownership of the websocket worker"
+    );
+}
+
+#[tokio::test]
+async fn leading_bot_mentions_do_not_hide_commands_or_rewrite_the_prompt() {
+    let (api, _server) = permission_api().await;
+    let mut channel = LarkChannel::with_api_and_permission(api, permission(&["*"], &[("*", true)]));
+    for (input, expected) in [
+        ("@_user_1 /stop", Some("/stop")),
+        (" @_user_1\n/stop agent", Some("/stop agent")),
+        (
+            "@_user_1 /ask agent \n  keep indentation  ",
+            Some("/ask agent \n  keep indentation  "),
+        ),
+        ("@_user_1 @_user_2 /stop", Some("@_user_1 @_user_2 /stop")),
+        (
+            "@_user_1 ordinary prompt  ",
+            Some("@_user_1 ordinary prompt  "),
+        ),
+        ("@_user_1", Some("@_user_1")),
+        ("@_user_10 /stop", Some("@_user_10 /stop")),
+        ("hello @_user_1", Some("hello @_user_1")),
+    ] {
+        let event = LarkEvent::from_lark_event_payload(serde_json::to_vec(&serde_json::json!({
+            "header": {"event_id": "evt-mentioned", "event_type": "im.message.receive_v1"},
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou-user"}},
+                "message": {
+                    "message_id": "om-mentioned", "chat_id": "oc-chat", "chat_type": "group",
+                    "message_type": "text", "content": serde_json::json!({"text": input}).to_string(),
+                    "mentions": [
+                        {"key": "@_user_1", "id": {"open_id": "ou-bot"}, "name": "Agora"},
+                        {"key": "@_user_2", "id": {"open_id": "ou-other"}, "name": "Other"}
+                    ]
+                }
+            }
+        })).unwrap()).unwrap();
+        let task = channel.handle_event(event).await.unwrap().unwrap();
+        assert_eq!(
+            task.input().message().map(TaskContent::text),
+            expected,
+            "input={input:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn interrupt_buttons_report_accepted_and_expired_without_stopping_another_run() {
+    let (api, server) = permission_api().await;
+    let mut channel = LarkChannel::with_api(api);
+    let triggered = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&triggered);
+    let registration = channel.interrupts.register(InterruptCallback::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        true
+    }));
+    for id in [registration.id(), registration.id(), "old-daemon-button"] {
+        channel
+            .handle_event(LarkEvent::Interrupt(LarkInterruptEvent {
+                id: "evt-interrupt".into(),
+                user_id: "ou-user".into(),
+                session_id: "oc-chat".into(),
+                message_id: "om-card".into(),
+                callback_id: id.into(),
+                conversation: Some(LarkConversation::Group),
+            }))
+            .await
+            .unwrap();
+    }
+    assert_eq!(triggered.load(Ordering::SeqCst), 1);
+    let replies = server
+        .requests()
+        .await
+        .into_iter()
+        .filter(|request| request.path.ends_with("/reply"))
+        .map(|request| request.body)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replies.len(),
+        3,
+        "button outcomes were invisible to the user"
+    );
+    assert!(replies[0].contains("停止请求已受理"));
+    assert!(replies[1].contains("已结束或按钮已失效"));
+    assert!(replies[2].contains("已结束或按钮已失效"));
+}
+
+#[tokio::test]
+async fn interrupt_bypasses_slow_image_download_and_full_message_queue() {
+    let server = HttpMockServer::start(|request| {
+        if request.path.ends_with("tenant_access_token/internal") {
+            MockResponse::json(
+                r#"{"code":0,"msg":"ok","tenant_access_token":"token","expire":7200}"#,
+            )
+        } else if request.path.contains("/resources/") {
+            MockResponse::bytes(b"image".to_vec(), "image/png").with_delay(Duration::from_secs(2))
+        } else {
+            MockResponse::json(r#"{"code":0,"msg":"ok","data":{"message_id":"reply"}}"#)
+        }
+    })
+    .await;
+    let mut channel = LarkChannel::with_api(
+        LarkApi::with_base_url(
+            LarkChannelConfig {
+                name: "test".into(),
+                app_id: "app".into(),
+                secret: "secret".into(),
+                permission: Default::default(),
+                proxy: None,
+            },
+            server.base_url(),
+        )
+        .unwrap(),
+    );
+    let (messages, events) = mpsc::channel(1);
+    let sender = LarkEventSender {
+        messages,
+        actions: Some(Arc::new(channel.action_handler())),
+    };
+    channel.receiver = Some(LarkWebSocketReceiver { events, task: None });
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let flag = interrupted.clone();
+    let registration = channel.interrupts.register(InterruptCallback::new(move || {
+        flag.store(true, AtomicOrdering::SeqCst);
+        true
+    }));
+    let mut image = message("image");
+    image.image_keys.push("img".into());
+    let image_sender = sender.clone();
+    let delivery =
+        tokio::spawn(async move { image_sender.deliver(LarkEvent::Message(image)).await });
+    let receiving = tokio::spawn(async move { channel.recv().await });
+    server.wait_for_method_count("GET", 1).await;
+    let (queued, _) = LarkDelivery::new(LarkEvent::Message(message("text")));
+    sender.messages.try_send(queued).unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        sender.deliver(LarkEvent::Interrupt(LarkInterruptEvent {
+            id: "evt-stop".into(),
+            user_id: "ou-user".into(),
+            session_id: "oc-chat".into(),
+            message_id: "om-card".into(),
+            callback_id: registration.id().into(),
+            conversation: Some(LarkConversation::Group),
+        })),
+    )
+    .await;
+    assert_eq!(
+        result
+            .expect("slow normalization blocked cancellation")
+            .unwrap(),
+        200
+    );
+    assert!(interrupted.load(AtomicOrdering::SeqCst));
+    assert!(
+        !receiving.is_finished(),
+        "fixture did not hold image download open"
+    );
+    let received = receiving.await.unwrap().unwrap().unwrap();
+    let (_, receipt) = received.into_parts();
+    receipt.accept();
+    assert_eq!(delivery.await.unwrap().unwrap(), 200);
+}
+
+#[tokio::test]
+async fn independent_interrupt_admission_still_checks_permissions() {
+    let (api, server) = permission_api().await;
+    let channel =
+        LarkChannel::with_api_and_permission(api, permission(&["allowed"], &[("oc-chat", true)]));
+    let (messages, _events) = mpsc::channel(1);
+    let sender = LarkEventSender {
+        messages,
+        actions: Some(Arc::new(channel.action_handler())),
+    };
+    let triggered = Arc::new(AtomicBool::new(false));
+    let flag = triggered.clone();
+    let registration = channel.interrupts.register(InterruptCallback::new(move || {
+        flag.store(true, AtomicOrdering::SeqCst);
+        true
+    }));
+    for (user, chat, conversation) in [
+        ("denied", "oc-chat", Some(LarkConversation::Group)),
+        ("allowed", "denied-chat", Some(LarkConversation::Group)),
+        ("allowed", "oc-chat", None),
+    ] {
+        assert_eq!(
+            sender
+                .deliver(LarkEvent::Interrupt(LarkInterruptEvent {
+                    id: "evt-denied".into(),
+                    user_id: user.into(),
+                    session_id: chat.into(),
+                    message_id: "om-card".into(),
+                    callback_id: registration.id().into(),
+                    conversation,
+                }))
+                .await
+                .unwrap(),
+            200
+        );
+        assert!(!triggered.load(AtomicOrdering::SeqCst));
+    }
+    assert_eq!(
+        server
+            .requests()
+            .await
+            .iter()
+            .filter(|request| request.path.ends_with("/reply"))
+            .count(),
+        3
+    );
+    assert!(
+        channel.interrupts.trigger(registration.id()),
+        "denial consumed another user's callback"
+    );
+}
+
+#[tokio::test]
+async fn interrupt_feedback_failure_does_not_undo_cancellation() {
+    let channel = LarkChannel::with_api(api());
+    let triggered = Arc::new(AtomicBool::new(false));
+    let flag = triggered.clone();
+    let registration = channel.interrupts.register(InterruptCallback::new(move || {
+        flag.store(true, AtomicOrdering::SeqCst);
+        true
+    }));
+    let (messages, _events) = mpsc::channel(1);
+    let sender = LarkEventSender {
+        messages,
+        actions: Some(Arc::new(channel.action_handler())),
+    };
+    assert_eq!(
+        sender
+            .deliver(LarkEvent::Interrupt(LarkInterruptEvent {
+                id: "evt-stop".into(),
+                user_id: "ou-user".into(),
+                session_id: "oc-chat".into(),
+                message_id: "om-card".into(),
+                callback_id: registration.id().into(),
+                conversation: Some(LarkConversation::Group),
+            }))
+            .await
+            .unwrap(),
+        200
+    );
+    assert!(triggered.load(AtomicOrdering::SeqCst));
+    assert!(!channel.interrupts.trigger(registration.id()));
 }
