@@ -5,7 +5,7 @@ edition = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }
-log = { version = "0.4.33", features = ["std", "kv_serde"] }
+log = { version = "0.4.34", features = ["std", "kv_serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

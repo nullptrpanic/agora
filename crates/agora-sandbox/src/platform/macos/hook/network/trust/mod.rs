@@ -327,7 +327,7 @@ unsafe fn evaluate_async_with_error(
 }
 
 macro_rules! trust_hook {
-    ($symbol:literal, $name:ident($($argument:ident: $type:ty),*) -> $output:ty, $delegate:expr) => {
+    ($symbol:literal, $name:ident($($argument:ident: $type:ty),* $(,)?) -> $output:ty, $delegate:expr) => {
         #[unsafe(export_name = $symbol)]
         unsafe extern "C" fn $name($($argument: $type),*) -> $output {
             unsafe { $delegate }
@@ -360,7 +360,7 @@ trust_hook!(
     hook_evaluate_async_with_error(
         trust: SecTrust,
         queue: *mut c_void,
-        callback: *const c_void
+        callback: *const c_void,
     ) -> OsStatus,
     evaluate_async_with_error(
         original_evaluate_async_with_error(),

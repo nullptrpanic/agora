@@ -599,7 +599,7 @@ impl OverlayStore {
         self.transaction(|transaction| transaction.visible_exists(path))
     }
 
-    #[cfg(not(agora_sandbox_hook_build))]
+    #[cfg(all(not(agora_sandbox_hook_build), feature = "remote-smb"))]
     pub(crate) fn visible_directory(&self, path: &Path) -> Result<Option<bool>> {
         self.transaction(|transaction| {
             if !transaction.visible_exists(path)? {

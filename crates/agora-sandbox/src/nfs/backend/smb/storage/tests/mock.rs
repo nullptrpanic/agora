@@ -6,19 +6,20 @@ use smb2::Tree;
 use smb2::client::Connection;
 use smb2::msg::close::CloseResponse;
 use smb2::msg::create::{CreateAction, CreateDisposition, CreateResponse};
-use smb2::msg::echo::{EchoRequest, EchoResponse};
 use smb2::msg::flush::FlushResponse;
 use smb2::msg::header::{ErrorResponse, Header};
+use smb2::msg::negotiate::NegotiateResponse;
 use smb2::msg::query_directory::QueryDirectoryResponse;
 use smb2::msg::query_info::QueryInfoResponse;
 use smb2::msg::read::ReadResponse;
 use smb2::msg::set_info::SetInfoResponse;
+use smb2::msg::tree_connect::{ShareType, TreeConnectResponse};
 use smb2::msg::write::WriteResponse;
 use smb2::pack::{FileTime, Pack, WriteCursor};
 use smb2::transport::MockTransport;
 use smb2::types::flags::FileAccessMask;
 use smb2::types::status::NtStatus;
-use smb2::types::{Command, FileId, OplockLevel, TreeId};
+use smb2::types::{Command, Dialect, FileId, OplockLevel, SessionId, TreeId};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
@@ -33,6 +34,7 @@ fn response_with_status(command: Command, status: NtStatus, body: &dyn Pack) -> 
     header.flags.set_response();
     header.credits = 32;
     header.status = status;
+    header.tree_id = Some(TreeId(7));
     let mut cursor = WriteCursor::new();
     header.pack(&mut cursor);
     body.pack(&mut cursor);
@@ -136,27 +138,43 @@ fn compound_response(responses: &[Vec<u8>]) -> Vec<u8> {
     frame
 }
 
-async fn session() -> (SmbSession, Arc<MockTransport>) {
+pub(super) async fn session() -> (SmbSession, Arc<MockTransport>) {
     let mock = Arc::new(MockTransport::new());
     mock.enable_auto_rewrite_msg_id();
-    let connection = Connection::from_transport(
+    let mut connection = Connection::from_transport(
         Box::new(Arc::clone(&mock)),
         Box::new(Arc::clone(&mock)),
         "test-server",
     );
-    mock.queue_response(response(Command::Echo, &EchoResponse));
-    connection
-        .execute(Command::Echo, &EchoRequest, None)
-        .await
-        .unwrap();
+    mock.queue_response(response(
+        Command::Negotiate,
+        &NegotiateResponse {
+            security_mode: Default::default(),
+            dialect_revision: Dialect::Smb2_1,
+            server_guid: Default::default(),
+            capabilities: Default::default(),
+            max_transact_size: 1024 * 1024,
+            max_read_size: 64 * 1024,
+            max_write_size: 64 * 1024,
+            system_time: 0,
+            server_start_time: 0,
+            security_buffer: Vec::new(),
+            negotiate_contexts: Vec::new(),
+        },
+    ));
+    connection.negotiate().await.unwrap();
+    connection.set_session_id(SessionId(1));
+    mock.queue_response(response(
+        Command::TreeConnect,
+        &TreeConnectResponse {
+            share_type: ShareType::Disk,
+            share_flags: Default::default(),
+            capabilities: Default::default(),
+            maximal_access: u32::MAX,
+        },
+    ));
+    let tree = Tree::connect(&mut connection, "share").await.unwrap();
     mock.clear_sent();
-    let tree = Tree {
-        tree_id: TreeId(7),
-        share_name: "share".to_string(),
-        server: "test-server".to_string(),
-        is_dfs: false,
-        encrypt_data: false,
-    };
     (SmbSession::from_connection(connection, tree), mock)
 }
 

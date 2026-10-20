@@ -141,9 +141,15 @@ impl MemoryStateIndex {
         let state = ((u64::from(data_tracked) * DATA_TRACKED_BIT)
             | (u64::from(mapping_managed) * MAPPING_MANAGED_BIT))
             << shift;
-        let _ = word.fetch_update(Ordering::Release, Ordering::Relaxed, |current| {
-            Some((current & !mask) | state)
-        });
+        let mut current = word.load(Ordering::Relaxed);
+        while let Err(observed) = word.compare_exchange_weak(
+            current,
+            (current & !mask) | state,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            current = observed;
+        }
     }
 
     fn overlaps(&self, start: usize, end: usize) -> bool {

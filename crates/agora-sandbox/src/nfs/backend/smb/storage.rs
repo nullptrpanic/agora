@@ -1639,10 +1639,13 @@ impl SmbSlot {
                 username: config.username().to_string(),
                 password: config.password().to_string(),
                 domain: config.domain().to_string(),
-                auto_reconnect: true,
+                // Slot replacement owns reconnects and expires all of its raw file IDs.
+                // In-place library reconnects would bypass our generation check.
+                auto_reconnect: false,
                 compression: true,
                 dfs_enabled: true,
                 dfs_target_overrides: HashMap::new(),
+                ..ClientConfig::default()
             })
             .await
             .map_err(storage_error)?;
@@ -1721,7 +1724,7 @@ impl SmbSession {
 
     async fn create_directory(&mut self, path: &str) -> Result<(), smb2::Error> {
         match &mut self.connection {
-            SmbConnection::Client(client) => client.create_directory(&mut self.tree, path).await,
+            SmbConnection::Client(client) => client.create_directory(&self.tree, path).await,
             #[cfg(any(test, coverage))]
             SmbConnection::Transport(connection) => {
                 self.tree.create_directory(connection, path).await
@@ -1731,7 +1734,7 @@ impl SmbSession {
 
     async fn delete_file(&mut self, path: &str) -> Result<(), smb2::Error> {
         match &mut self.connection {
-            SmbConnection::Client(client) => client.delete_file(&mut self.tree, path).await,
+            SmbConnection::Client(client) => client.delete_file(&self.tree, path).await,
             #[cfg(any(test, coverage))]
             SmbConnection::Transport(connection) => self.tree.delete_file(connection, path).await,
         }
@@ -1739,7 +1742,7 @@ impl SmbSession {
 
     async fn delete_directory(&mut self, path: &str) -> Result<(), smb2::Error> {
         match &mut self.connection {
-            SmbConnection::Client(client) => client.delete_directory(&mut self.tree, path).await,
+            SmbConnection::Client(client) => client.delete_directory(&self.tree, path).await,
             #[cfg(any(test, coverage))]
             SmbConnection::Transport(connection) => {
                 self.tree.delete_directory(connection, path).await
