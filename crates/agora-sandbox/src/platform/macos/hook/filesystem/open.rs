@@ -583,8 +583,22 @@ unsafe fn sandbox_posix_spawn_file_actions_addopen(
         let Some(_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(actions, descriptor, path, flags, mode) };
         };
+        let add_open = |path| unsafe {
+            super::super::process::file_actions::record(
+                actions,
+                || {
+                    super::super::process::file_actions::Action::Open(
+                        descriptor,
+                        CStr::from_ptr(path).to_owned(),
+                        flags,
+                        mode,
+                    )
+                },
+                || original(actions, descriptor, path, flags, mode),
+            )
+        };
         let Some(runtime) = FilesystemHookRuntime::global() else {
-            return unsafe { original(actions, descriptor, path, flags, mode) };
+            return add_open(path);
         };
         let request = match runtime.prepare_open(path, libc::AT_FDCWD, flags, mode) {
             Ok(request) => request,
@@ -592,7 +606,7 @@ unsafe fn sandbox_posix_spawn_file_actions_addopen(
         };
         match request.native_path() {
             Ok(Some(native)) => {
-                return unsafe { original(actions, descriptor, native.as_ptr(), flags, mode) };
+                return add_open(native.as_ptr());
             }
             Ok(None) => {}
             Err(error) => return error_errno(&error),
@@ -613,7 +627,7 @@ unsafe fn sandbox_posix_spawn_file_actions_addopen(
             },
             OpenTarget::Descriptor(_) => return libc::ENOTSUP,
         };
-        unsafe { original(actions, descriptor, mapped.as_ptr(), flags, mode) }
+        add_open(mapped.as_ptr())
     })
 }
 

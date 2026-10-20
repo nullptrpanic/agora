@@ -19,6 +19,10 @@ use std::time::{Duration, Instant};
 mod lifecycle;
 
 #[cfg(target_os = "macos")]
+#[path = "runner/inheritance.rs"]
+mod inheritance;
+
+#[cfg(target_os = "macos")]
 const TLS_TRUST_ENVIRONMENT: [&str; 6] = [
     "SSL_CERT_FILE",
     "CURL_CA_BUNDLE",

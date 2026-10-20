@@ -122,6 +122,7 @@ unsafe extern "C" fn lock_filesystem_before_fork() {
         });
     }
     require_fork_barrier(unsafe { libc::pthread_rwlock_wrlock(&raw mut FILESYSTEM_FORK_BARRIER) });
+    lifecycle::retain_at_fork_boundary();
 }
 
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
@@ -133,6 +134,9 @@ unsafe extern "C" fn unlock_filesystem_after_fork() {
 
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
 unsafe extern "C" fn reset_filesystem_after_fork() {
+    if lifecycle::fork_retain_failed() {
+        unsafe { libc::_exit(126) };
+    }
     unsafe {
         std::ptr::write(
             &raw mut FILESYSTEM_FORK_BARRIER,
@@ -154,12 +158,12 @@ unsafe fn restore_filesystem_guard_after_fork() {
     set_filesystem_barrier_read_held(true);
 }
 
-struct FilesystemHookGuard {
+pub(super) struct FilesystemHookGuard {
     _signals: super::SignalMaskGuard,
 }
 
 impl FilesystemHookGuard {
-    fn enter() -> Option<Self> {
+    pub(super) fn enter() -> Option<Self> {
         if !super::initialized() && !test_runtime_is_set() {
             return None;
         }
@@ -363,6 +367,40 @@ struct InheritedLocalDescriptor {
     handle: String,
     writable: bool,
     lazy: bool,
+}
+
+impl InheritedLocalDescriptor {
+    fn capture(descriptor: i32, open: &OpenFile) -> Result<Self> {
+        let local = open
+            .local_inheritance()
+            .context("missing local descriptor state")?;
+        let identity = |fd| {
+            FilesystemHookRuntime::inherited_descriptor_identity(fd)
+                .ok_or_else(io::Error::last_os_error)
+        };
+        let (device, inode) = identity(descriptor)?;
+        let (state_device, state_inode) = identity(local.state.as_raw_fd())?;
+        let (lock_device, lock_inode) = identity(local.lock.as_raw_fd())?;
+        Ok(Self {
+            descriptor,
+            state_descriptor: local.state.as_raw_fd(),
+            state_device,
+            state_inode,
+            lock_descriptor: local.lock.as_raw_fd(),
+            lock_device,
+            lock_inode,
+            device,
+            inode,
+            logical_device: local.identity.device,
+            logical_inode: local.identity.inode,
+            logical_links: local.identity.links,
+            file: open.file.clone(),
+            logical: open.logical().into_os_string().into_vec(),
+            handle: local.handle.to_owned(),
+            writable: open.managed().writable(),
+            lazy: local.lazy,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -1217,10 +1255,7 @@ impl FilesystemHookRuntime {
         lock(&self.open_files).get(&descriptor).cloned()
     }
 
-    pub(super) fn retain_local_files_before_fork(&self) -> Result<Vec<String>> {
-        let Some(local) = &self.local else {
-            return Ok(Vec::new());
-        };
+    fn local_handles(&self) -> Vec<String> {
         let mut handles = lock(&self.open_files)
             .values()
             .filter_map(|open| {
@@ -1236,6 +1271,15 @@ impl FilesystemHookRuntime {
         }));
         handles.sort_unstable();
         handles.dedup();
+        handles
+    }
+
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    pub(super) fn retain_local_files_before_fork(&self) -> Result<Vec<String>> {
+        let Some(local) = &self.local else {
+            return Ok(Vec::new());
+        };
+        let handles = self.local_handles();
         local.retain(handles.clone())?;
         Ok(handles)
     }
@@ -1318,37 +1362,9 @@ impl FilesystemHookRuntime {
             if flags < 0 || flags & libc::FD_CLOEXEC != 0 {
                 continue;
             }
-            let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
-            if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
-                continue;
+            if let Ok(inherited) = InheritedLocalDescriptor::capture(descriptor, open) {
+                descriptors.push(inherited);
             }
-            let mut lock_status = unsafe { std::mem::zeroed::<libc::stat>() };
-            if unsafe { libc::fstat(local.lock.as_raw_fd(), &mut lock_status) } != 0 {
-                continue;
-            }
-            let mut state_status = unsafe { std::mem::zeroed::<libc::stat>() };
-            if unsafe { libc::fstat(local.state.as_raw_fd(), &mut state_status) } != 0 {
-                continue;
-            }
-            descriptors.push(InheritedLocalDescriptor {
-                descriptor,
-                state_descriptor: local.state.as_raw_fd(),
-                state_device: state_status.st_dev as u64,
-                state_inode: state_status.st_ino,
-                lock_descriptor: local.lock.as_raw_fd(),
-                lock_device: lock_status.st_dev as u64,
-                lock_inode: lock_status.st_ino,
-                device: status.st_dev as u64,
-                inode: status.st_ino,
-                logical_device: local.identity.device,
-                logical_inode: local.identity.inode,
-                logical_links: local.identity.links,
-                file: open.file.clone(),
-                logical: open.logical().into_os_string().into_vec(),
-                handle: local.handle.to_owned(),
-                writable: open.managed().writable(),
-                lazy: local.lazy,
-            });
         }
         handles.extend(lock(&self.mappings).iter().filter_map(|mapping| {
             mapping
@@ -1556,6 +1572,11 @@ impl FilesystemHookRuntime {
         }
         let restored_handles = handles.keys().cloned().collect::<HashSet<_>>();
         drop(files);
+        // The private copies start CLOEXEC, but their lifetime must follow the
+        // restored application aliases across every subsequent exec as well.
+        for (_, _, open) in handles.values() {
+            self.refresh_local_state_inheritance(open);
+        }
 
         let mut descriptors_to_close = HashSet::new();
         for inherited in &inherited.descriptors {
@@ -1685,29 +1706,6 @@ impl FilesystemHookRuntime {
             });
         let _ = local.state.set_close_on_exec(!inheritable);
         let _ = set_descriptor_close_on_exec(local.lock.as_raw_fd(), !inheritable);
-    }
-
-    fn inheritable_local_descriptors(&self) -> Vec<libc::c_int> {
-        let files = lock(&self.open_files);
-        let mut descriptors = Vec::new();
-        let mut states = HashSet::new();
-        for (&descriptor, open) in files.iter() {
-            let Some(local) = open.local_inheritance() else {
-                continue;
-            };
-            let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
-            if flags < 0 || flags & libc::FD_CLOEXEC != 0 {
-                continue;
-            }
-            descriptors.push(descriptor);
-            if states.insert(local.state.as_raw_fd()) {
-                descriptors.push(local.state.as_raw_fd());
-            }
-            if states.insert(local.lock.as_raw_fd()) {
-                descriptors.push(local.lock.as_raw_fd());
-            }
-        }
-        descriptors
     }
 
     fn writeback(&self, descriptor: libc::c_int) -> Result<()> {
@@ -2428,35 +2426,6 @@ impl Drop for SpawnLocalRetain {
     }
 }
 
-pub(super) fn retain_local_files_for_spawn(handles: Vec<String>) -> Result<SpawnLocalRetain> {
-    if handles.is_empty() {
-        return Ok(SpawnLocalRetain { release: None });
-    }
-    let _guard = FilesystemHookGuard::enter()
-        .context("filesystem hook is unavailable while retaining child files")?;
-    let runtime = FilesystemHookRuntime::global()
-        .context("filesystem hook runtime is unavailable while retaining child files")?;
-    let local = runtime
-        .local
-        .clone()
-        .context("local filesystem broker is unavailable while retaining child files")?;
-    local.retain(handles.clone())?;
-    Ok(SpawnLocalRetain {
-        release: Some((local, handles)),
-    })
-}
-
-pub(super) fn inheritable_internal_descriptors() -> Vec<libc::c_int> {
-    let Some(_guard) = FilesystemHookGuard::enter() else {
-        return Vec::new();
-    };
-    FILESYSTEM_RUNTIME
-        .get()
-        .and_then(Option::as_ref)
-        .map(FilesystemHookRuntime::inheritable_local_descriptors)
-        .unwrap_or_default()
-}
-
 fn refresh_descriptor_inheritance(descriptor: libc::c_int) {
     let Some(runtime) = FilesystemHookRuntime::global() else {
         return;
@@ -2598,6 +2567,8 @@ mod metadata;
 mod namespace;
 mod nfs;
 mod open;
+mod spawn;
+pub(super) use spawn::{SpawnLocalDescriptors, prepare_local_spawn};
 pub(super) mod socket;
 mod unsupported;
 

@@ -1540,8 +1540,23 @@ async fn broker_managed_io_failures_preserve_errno_and_recoverable_state() {
         );
         set_descriptor_close_on_exec(descriptor, false).unwrap();
         super::super::agora_sandbox_fcntl_commit_setfd(descriptor);
-        let inherited = runtime.inheritable_local_descriptors();
-        assert_eq!(inherited.len(), 3);
+        let inherited: InheritedLocalDescriptors = serde_json::from_str(
+            &runtime
+                .encode_inherited_local_descriptors()
+                .unwrap()
+                .encoded,
+        )
+        .unwrap();
+        assert_eq!(inherited.descriptors.len(), 1);
+        assert_eq!(inherited.descriptors[0].descriptor, descriptor);
+        assert_eq!(
+            inherited.descriptors[0].state_descriptor,
+            registration.state.as_raw_fd()
+        );
+        assert_eq!(
+            inherited.descriptors[0].lock_descriptor,
+            registration.lock.as_raw_fd()
+        );
 
         assert_eq!(libc::ftruncate(registration.state.as_raw_fd(), 0), 0);
         assert_eq!(
@@ -1644,6 +1659,18 @@ async fn inherited_local_descriptors_restore_aliases_and_shared_offsets() {
         &restored.tracked_open(restored_descriptors[0]).unwrap(),
         &restored.tracked_open(restored_descriptors[1]).unwrap(),
     ));
+    let restored_open = restored.tracked_open(restored_descriptors[0]).unwrap();
+    let restored_local = restored_open.local_inheritance().unwrap();
+    for fd in [
+        restored_local.state.as_raw_fd(),
+        restored_local.lock.as_raw_fd(),
+    ] {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "restored auxiliary FD would disappear on the next exec"
+        );
+    }
 
     with_test_runtime(&restored, || unsafe {
         assert_eq!(
