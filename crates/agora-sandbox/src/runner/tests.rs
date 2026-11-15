@@ -89,11 +89,9 @@ fn built_hook_library() -> PathBuf {
     static HOOK: OnceLock<PathBuf> = OnceLock::new();
     HOOK.get_or_init(|| {
         if std::env::var_os("CARGO_LLVM_COV").is_some() {
-            let library = std::env::current_exe()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("libagora_sandbox.dylib");
+            // Cargo's intermediate output layout is private; use the artifact
+            // located by build.rs instead of assuming it is beside this test.
+            let library = PathBuf::from(env!("AGORA_SANDBOX_EMBEDDED_HOOK_PATH"));
             assert!(library.is_file(), "missing {}", library.display());
             return library;
         }

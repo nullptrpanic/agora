@@ -179,9 +179,22 @@ fn node_config_generate_supports_the_interactive_terminal_flow() {
     let script = r#"
         set timeout 10
         spawn -noecho $env(AGORA_NODE_BIN) config -g $env(AGORA_NODE_CONFIG)
+        expect_before timeout {
+            puts stderr "timed out waiting for a config prompt or process exit"
+            catch {exec /bin/kill -TERM [exp_pid]}
+            exit 1
+        }
         expect "Select a channel"; send "\r"
         expect "Lark App ID"; send "app-id\r"
-        expect "Lark App Secret"; send "secret\r"
+        expect "Lark App Secret"
+        # read_secure switches echo off with TCSAFLUSH after printing the prompt.
+        # Wait for that switch so it cannot discard our scripted password.
+        set deadline [expr {[clock milliseconds] + 10000}]
+        while {![regexp {(^|\s)-echo(\s|$)} [exec /bin/stty -f $spawn_out(slave,name) -a]]} {
+            if {[clock milliseconds] >= $deadline} {error "password input did not disable echo"}
+            after 10
+        }
+        send "secret\r"
         expect "Allowed Lark user ID"; send "ou_allowed\r"
         expect "Select an agent type"; send "\r"
         expect "Codex path"; send "\r"
