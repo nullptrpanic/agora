@@ -2,7 +2,6 @@ use super::super::{SmbRoot, SmbSession, SmbSlot, SmbStorage, open_direct_handle}
 use crate::nfs::SmbRemoteConfig;
 use crate::nfs::backend::RemoteStorage;
 use crate::nfs::protocol::{RemoteFileType, RemotePath};
-use smb2::Tree;
 use smb2::client::Connection;
 use smb2::msg::close::CloseResponse;
 use smb2::msg::create::{CreateAction, CreateDisposition, CreateResponse};
@@ -12,6 +11,7 @@ use smb2::msg::negotiate::NegotiateResponse;
 use smb2::msg::query_directory::QueryDirectoryResponse;
 use smb2::msg::query_info::QueryInfoResponse;
 use smb2::msg::read::ReadResponse;
+use smb2::msg::session_setup::{SessionFlags, SessionSetupResponse};
 use smb2::msg::set_info::SetInfoResponse;
 use smb2::msg::tree_connect::{ShareType, TreeConnectResponse};
 use smb2::msg::write::WriteResponse;
@@ -20,6 +20,7 @@ use smb2::transport::MockTransport;
 use smb2::types::flags::FileAccessMask;
 use smb2::types::status::NtStatus;
 use smb2::types::{Command, Dialect, FileId, OplockLevel, SessionId, TreeId};
+use smb2::{Session, Tree};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
@@ -35,6 +36,9 @@ fn response_with_status(command: Command, status: NtStatus, body: &dyn Pack) -> 
     header.credits = 32;
     header.status = status;
     header.tree_id = Some(TreeId(7));
+    if command != Command::Negotiate {
+        header.session_id = SessionId(1);
+    }
     let mut cursor = WriteCursor::new();
     header.pack(&mut cursor);
     body.pack(&mut cursor);
@@ -163,7 +167,33 @@ pub(super) async fn session() -> (SmbSession, Arc<MockTransport>) {
         },
     ));
     connection.negotiate().await.unwrap();
-    connection.set_session_id(SessionId(1));
+    // Establish the mock's unsigned guest session through the public protocol
+    // API. A Type-2 NTLM challenge with only the target-info terminator suffices.
+    let mut challenge = vec![0_u8; 60];
+    challenge[..8].copy_from_slice(b"NTLMSSP\0");
+    challenge[8..12].copy_from_slice(&2_u32.to_le_bytes());
+    challenge[16..20].copy_from_slice(&56_u32.to_le_bytes());
+    challenge[20..24].copy_from_slice(&0x0088_0201_u32.to_le_bytes());
+    challenge[24..32].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    challenge[40..42].copy_from_slice(&4_u16.to_le_bytes());
+    challenge[42..44].copy_from_slice(&4_u16.to_le_bytes());
+    challenge[44..48].copy_from_slice(&56_u32.to_le_bytes());
+    mock.queue_response(response_with_status(
+        Command::SessionSetup,
+        NtStatus::MORE_PROCESSING_REQUIRED,
+        &SessionSetupResponse {
+            session_flags: SessionFlags::default(),
+            security_buffer: challenge,
+        },
+    ));
+    mock.queue_response(response(
+        Command::SessionSetup,
+        &SessionSetupResponse {
+            session_flags: SessionFlags(SessionFlags::IS_GUEST),
+            security_buffer: Vec::new(),
+        },
+    ));
+    Session::setup(&mut connection, "", "", "").await.unwrap();
     mock.queue_response(response(
         Command::TreeConnect,
         &TreeConnectResponse {
@@ -603,6 +633,8 @@ async fn namespace_operations_use_real_smb_create_delete_stat_and_rename_request
         create_response(file_id(61), 0, CreateAction::FileOpened),
         query_info_response(basic_information(0x10)),
         query_info_response(standard_information(0, true)),
+        // FileAttributeTagInformation: directory attributes, no reparse tag.
+        query_info_response([0x10_u32.to_le_bytes(), 0_u32.to_le_bytes()].concat()),
         close_response(0),
     ]));
     storage.connect(0).await.unwrap();
