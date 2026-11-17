@@ -22,6 +22,26 @@ pub(super) struct PermissionDenial {
 }
 
 impl PermissionDenial {
+    pub(super) fn markdown(&self) -> String {
+        let mut identifiers = vec![
+            format!("- Channel：`{}`", self.channel_name()),
+            format!("- User ID：`{}`", self.user_id()),
+        ];
+        if let Some(group_id) = self.group_id() {
+            identifiers.push(format!("- Group ID：`{group_id}`"));
+        }
+        let configuration = self.configuration_example();
+        format!(
+            "**{}**\n\n> {}\n\n**{}**\n{}\n\n**{}**\n```jsonc\n{}\n```",
+            i18n::PERMISSION_DENIED_TITLE,
+            self.reason(),
+            i18n::PERMISSION_IDENTIFIERS_TITLE,
+            identifiers.join("\n"),
+            i18n::PERMISSION_CONFIG_EXAMPLE_TITLE,
+            configuration
+        )
+    }
+
     pub(super) fn new(
         channel_name: impl Into<String>,
         user_id: impl Into<String>,

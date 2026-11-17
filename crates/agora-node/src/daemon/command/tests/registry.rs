@@ -15,7 +15,7 @@ fn command_registry_routes_default_handlers_and_subcommands() {
         panic!("expected reset invocation");
     };
 
-    let CommandResolution::Invocation(enable) = registry.route("/ask enable codex-dev") else {
+    let CommandResolution::Invocation(enable) = registry.route("/agent enable codex-dev") else {
         panic!("expected ask enable invocation");
     };
     let (_, enable_arguments) = enable.into_parts();
@@ -36,7 +36,7 @@ fn command_registry_routes_ask_prompt_to_the_default_handler() {
     assert_eq!(arguments.argument("agent_name"), Some("codex-dev"));
     assert_eq!(arguments.argument("prompt"), Some("review this project"));
 
-    let CommandResolution::Invocation(list) = registry.route("/ask list") else {
+    let CommandResolution::Invocation(list) = registry.route("/agent list") else {
         panic!("expected ask list invocation");
     };
     let (_, arguments) = list.into_parts();
@@ -55,14 +55,15 @@ fn command_registry_generates_root_and_command_help() {
             "Agora 命令：\n\
 /stop - 停止当前对话中正在运行或排队的 Agent 任务。\n\
 /reset - 停止任务并重置后端 Agent 会话。\n\
-/ask - 向指定 Agent 提问或控制 Agent 的消息接收状态。\n\
+/ask - 向指定 Agent 提问。\n\
+/agent - 管理 Agent 的消息接收状态。\n\
 /help - 显示所有命令。\n\n\
-使用 /{command} help 查看详情。"
+使用 /help {command} 查看详情。"
                 .to_string()
         )
     );
     assert_eq!(
-        registry.route("/stop help"),
+        registry.route("/help stop"),
         CommandResolution::Reply(
             "/stop - 停止当前对话中正在运行或排队的 Agent 任务。\n\n\
 用法：\n\
@@ -88,41 +89,36 @@ fn command_registry_generates_subcommand_and_argument_help() {
     let runtime = isolated_command_runtime();
     let registry = runtime.registry();
     let expected = concat!(
-        "/ask - 向指定 Agent 提问或控制 Agent 的消息接收状态。\n\n",
-        "用法：\n",
-        "/ask {agent_name} {prompt}\n\n",
-        "参数：\n",
-        "agent_name (必填) - 当前对话中已配置的 Agent 名称。\n",
-        "prompt (必填) - 仅发送给指定 Agent 的提示词。\n\n",
+        "/agent - 管理 Agent 的消息接收状态。\n\n",
         "子命令：\n",
-        "/ask list\n",
+        "/agent list\n",
         "  列出所有已订阅 Agent 及其当前状态。\n",
-        "/ask status {agent_name}\n",
+        "/agent status {agent_name}\n",
         "  查看指定 Agent 的当前状态。\n",
         "  agent_name (必填) - 当前对话中已配置的 Agent 名称。\n",
-        "/ask disable {agent_name}\n",
+        "/agent disable {agent_name}\n",
         "  禁止指定 Agent 接收后续消息。\n",
         "  agent_name (必填) - 当前对话中已配置的 Agent 名称。\n",
-        "/ask enable {agent_name}\n",
+        "/agent enable {agent_name}\n",
         "  允许指定 Agent 接收后续消息。\n",
         "  agent_name (必填) - 当前对话中已配置的 Agent 名称。\n\n",
-        "使用 /ask {子命令} help 查看详情。",
+        "使用 /help agent {子命令} 查看详情。",
     );
 
     assert_eq!(
-        registry.route("/ask help"),
+        registry.route("/help agent"),
         CommandResolution::Reply(expected.to_string())
     );
     assert_eq!(
-        registry.route("/ask"),
+        registry.route("/agent"),
         CommandResolution::Reply(expected.to_string())
     );
     assert_eq!(
-        registry.route("/ask enable help"),
+        registry.route("/help agent enable"),
         CommandResolution::Reply(
-            "/ask enable - 允许指定 Agent 接收后续消息。\n\n\
+            "/agent enable - 允许指定 Agent 接收后续消息。\n\n\
 用法：\n\
-/ask enable {agent_name}\n\n\
+/agent enable {agent_name}\n\n\
 参数：\n\
 agent_name (必填) - 当前对话中已配置的 Agent 名称。"
                 .to_string()
@@ -144,8 +140,8 @@ fn command_registry_generates_validation_errors_from_registered_arguments() {
         CommandResolution::Reply("用法：/stop [{agent_name}]".to_string())
     );
     assert_eq!(
-        registry.route("/ask disable"),
-        CommandResolution::Reply("用法：/ask disable {agent_name}".to_string())
+        registry.route("/agent disable"),
+        CommandResolution::Reply("用法：/agent disable {agent_name}".to_string())
     );
     assert_eq!(
         registry.route("/ask unknown"),
@@ -196,7 +192,7 @@ fn command_registry_validates_structured_arguments() {
     let mut registry = CommandRegistry::new();
     registry
         .register(
-            CommandNode::new("ask", "Control agents").subcommand(
+            CommandNode::new("agent", "Control agents").subcommand(
                 CommandNode::new("enable", "Enable one agent")
                     .argument(Argument::required("agent_name", "Agent name"))
                     .handler(TestHandler::Enable),
@@ -204,7 +200,7 @@ fn command_registry_validates_structured_arguments() {
         )
         .unwrap();
 
-    let valid = CommandRequest::new(["ask", "enable"]).with_argument("agent_name", "codex-dev");
+    let valid = CommandRequest::new(["agent", "enable"]).with_argument("agent_name", "codex-dev");
     let CommandResolution::Invocation(invocation) = registry.route_structured(&valid) else {
         panic!("expected structured invocation");
     };
@@ -213,8 +209,8 @@ fn command_registry_validates_structured_arguments() {
     assert_eq!(arguments.argument("agent_name"), Some("codex-dev"));
 
     assert_eq!(
-        registry.route_structured(&CommandRequest::new(["ask", "enable"])),
-        CommandResolution::Reply("用法：/ask enable {agent_name}".to_string())
+        registry.route_structured(&CommandRequest::new(["agent", "enable"])),
+        CommandResolution::Reply("用法：/agent enable {agent_name}".to_string())
     );
 }
 
@@ -368,7 +364,7 @@ fn command_registry_handles_invalid_help_and_structured_paths() {
 
     assert_eq!(
         registry.route("/help extra"),
-        CommandResolution::Reply("用法：/help".to_string())
+        CommandResolution::Reply("未知命令：/extra\n使用 /help 查看全部命令。".to_string())
     );
     assert_eq!(
         registry.route("/root help extra"),
@@ -427,7 +423,7 @@ async fn help_commands_reply_without_starting_agents() {
         &[],
         &dispatcher,
         &commands,
-        CommandTestTask::new("stop-help", "chat-1", "/stop help"),
+        CommandTestTask::new("stop-help", "chat-1", "/help stop"),
         &mut runs,
     )
     .await
@@ -457,7 +453,7 @@ async fn help_commands_reply_without_starting_agents() {
         replies.lock().unwrap().as_slice(),
         [
             command_reply(registry, "/ask help"),
-            command_reply(registry, "/stop help"),
+            command_reply(registry, "/help stop"),
             command_reply(registry, "/reset help"),
             command_reply(registry, "/help"),
         ]

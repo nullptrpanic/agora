@@ -101,11 +101,8 @@ impl EncryptedFile {
             logical_len: header.logical_len,
             active_header: header.slot,
         };
-        let expected = encrypted.expected_physical_len(header.logical_len)?;
-        let actual = encrypted.file.metadata()?.len();
-        if actual > expected {
-            encrypted.file.set_len(expected)?;
-        }
+        // Another writer may have written new blocks without publishing its length yet.
+        // Opening a file must not discard that in-flight data; only set_len truncates it.
         Ok(encrypted)
     }
 

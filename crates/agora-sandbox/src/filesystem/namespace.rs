@@ -12,6 +12,29 @@ pub(super) const VFS_LOCK_FILE: &str = ".vfs.lock";
 pub(super) const REKEY_JOURNAL_FILE: &str = ".rekey.json";
 pub(super) const WRITE_LEASE_PREFIX: &[u8] = b".agora-write-lease-";
 const ESCAPED_PREFIX: &[u8] = b".agora-entry-";
+pub(super) const NAME_MAX: usize = 255;
+
+pub(super) fn encrypted_backing_name(ciphertext: &str) -> String {
+    if ciphertext.len() <= NAME_MAX {
+        ciphertext.to_owned()
+    } else {
+        format!("enc_long_{}", name_digest(ciphertext.as_bytes()))
+    }
+}
+
+pub(super) fn write_lease_path(destination: &Path) -> Result<PathBuf> {
+    let name = destination
+        .file_name()
+        .context("filesystem destination has no filename")?;
+    let mut lease = WRITE_LEASE_PREFIX.to_vec();
+    lease.extend_from_slice(name_digest(name.as_bytes()).as_bytes());
+    Ok(destination.with_file_name(OsString::from_vec(lease)))
+}
+
+fn name_digest(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
+}
 
 pub(super) fn backing_path(root: &Path, logical: &Path) -> Result<PathBuf> {
     let logical = normalize(logical)?;

@@ -1,6 +1,7 @@
 mod output;
 
-pub use output::{OutputEvent, ProgressStatus, TokenUsage};
+pub(crate) use output::{MAX_OUTPUT_IMAGE_BYTES, MAX_OUTPUT_IMAGE_TOTAL_BYTES, MAX_OUTPUT_IMAGES};
+pub use output::{OutputEvent, OutputImage, ProgressStatus, TokenUsage};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

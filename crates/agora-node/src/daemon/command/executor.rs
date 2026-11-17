@@ -55,6 +55,7 @@ pub(in crate::daemon) struct CommandContext {
     agents: Vec<ConfiguredAgent>,
     source: CommandSource,
     message: Option<TaskContent>,
+    pub(super) admission: crate::daemon::RouteAdmission,
 }
 
 impl CommandContext {
@@ -86,11 +87,17 @@ impl CommandContext {
             agents,
             source,
             message: None,
+            admission: Default::default(),
         }
     }
 
     pub(super) fn with_message(mut self, message: TaskContent) -> Self {
         self.message = Some(message);
+        self
+    }
+
+    pub(super) fn with_admission(mut self, admission: crate::daemon::RouteAdmission) -> Self {
+        self.admission = admission;
         self
     }
 
@@ -124,6 +131,7 @@ type HandlerFn = dyn Fn(CommandContext, CommandArguments) -> CommandFuture + Sen
 #[derive(Clone)]
 pub(in crate::daemon) struct CommandHandler {
     handler: Arc<HandlerFn>,
+    control: bool,
 }
 
 impl CommandHandler {
@@ -134,11 +142,21 @@ impl CommandHandler {
         Output: Into<CommandExecution> + Send + 'static,
     {
         Self {
+            control: false,
             handler: Arc::new(move |context, arguments| {
                 let future = handler(context, arguments);
                 Box::pin(async move { future.await.map(Into::into) })
             }),
         }
+    }
+
+    pub(super) fn control(mut self) -> Self {
+        self.control = true;
+        self
+    }
+
+    pub(super) fn is_control(&self) -> bool {
+        self.control
     }
 
     pub(in crate::daemon) async fn execute(

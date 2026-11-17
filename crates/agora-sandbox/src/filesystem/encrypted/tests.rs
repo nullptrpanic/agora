@@ -286,7 +286,7 @@ fn key_migration_discards_encrypted_cached_copies() {
         })
     ));
     drop(staged);
-    let old_lease = MetadataStore::lease_path(&old_backing).unwrap();
+    let old_lease = crate::filesystem::namespace::write_lease_path(&old_backing).unwrap();
     std::fs::write(&old_lease, old_backing.as_os_str().as_bytes()).unwrap();
     drop(filesystem);
     drop(workspace);
@@ -347,6 +347,15 @@ fn key_migration_discards_inactive_unix_sockets() {
 
 #[test]
 fn key_migration_reencrypts_logical_names_that_resemble_control_files() {
+    check_key_migration_filename(".metadata.user");
+}
+
+#[test]
+fn key_migration_reencrypts_long_filenames() {
+    check_key_migration_filename(&"x".repeat(255));
+}
+
+fn check_key_migration_filename(name: &str) {
     let workdir = temporary_directory("migration-control-name");
     let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
     let root = workspace.root().to_path_buf();
@@ -354,7 +363,7 @@ fn key_migration_reencrypts_logical_names_that_resemble_control_files() {
     std::fs::create_dir_all(&lower).unwrap();
     let old_cipher = FileCipher::derive(b"old-key", workspace.salt()).unwrap();
     let filesystem = VirtualFilesystem::encrypted(&root, old_cipher).unwrap();
-    let logical = lower.join(".metadata.user");
+    let logical = lower.join(name);
     let mut prepared = filesystem
         .prepare_open(
             &logical,

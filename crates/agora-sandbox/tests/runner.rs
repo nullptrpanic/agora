@@ -15,6 +15,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
+#[path = "runner/lifecycle.rs"]
+mod lifecycle;
+
+#[cfg(target_os = "macos")]
+#[path = "runner/inheritance.rs"]
+mod inheritance;
+
+#[cfg(target_os = "macos")]
 const TLS_TRUST_ENVIRONMENT: [&str; 6] = [
     "SSL_CERT_FILE",
     "CURL_CA_BUNDLE",
@@ -150,12 +158,11 @@ fn workspace_root() -> PathBuf {
 fn hook_library() -> PathBuf {
     static HOOK: OnceLock<PathBuf> = OnceLock::new();
     HOOK.get_or_init(|| {
+        #[cfg(target_os = "macos")]
         if std::env::var_os("CARGO_LLVM_COV").is_some() {
-            let library = std::env::current_exe()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("libagora_sandbox.dylib");
+            // Cargo's intermediate output layout is private; use the artifact
+            // located by build.rs instead of assuming it is beside this test.
+            let library = PathBuf::from(env!("AGORA_SANDBOX_EMBEDDED_HOOK_PATH"));
             assert!(library.is_file(), "missing {}", library.display());
             return library;
         }
@@ -201,6 +208,53 @@ fn sandbox_config_in(workdir: impl AsRef<Path>) -> SandboxConfig {
     SandboxConfig::new(hook_library())
         .with_workdir(workdir.as_ref())
         .with_encrypted_workspace(FILESYSTEM_KEY)
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn foundation_enumerates_logical_encrypted_directories() {
+    let directory = tempfile::tempdir().unwrap();
+    // Foundation canonicalizes /var to /private/var. Keep the C writes and
+    // Foundation reads in one logical namespace; alias unification is separate.
+    let lower = directory.path().canonicalize().unwrap().join("lower");
+    std::fs::create_dir(&lower).unwrap();
+    for name in [".metadata", "lower.txt", "removed.txt"] {
+        std::fs::write(lower.join(name), b"host").unwrap();
+    }
+    let executable = directory.path().join("directory-foundation");
+    let build = Command::new("/usr/bin/xcrun")
+        .args([
+            "clang",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-framework",
+            "Foundation",
+            "-o",
+        ])
+        .arg(&executable)
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/directory-foundation.m"))
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let outcome = tokio::time::timeout(
+        sandbox_lifecycle_timeout(30),
+        Sandbox::new(
+            sandbox_config_in(directory.path().join("workdir")),
+            NoopCallback,
+        )
+        .run(SandboxCommand::new(&executable).arg(&lower)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(outcome.status().success(), "{:?}", outcome.status());
+    assert!(!lower.join("upper.txt").exists());
+    assert!(lower.join("removed.txt").exists());
 }
 
 #[cfg(target_os = "macos")]
@@ -762,6 +816,42 @@ async fn a_second_open_sees_writes_from_a_live_encrypted_descriptor() {
 
     assert!(outcome.status().success());
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn encrypted_path_truncate_updates_existing_descriptors_and_inode() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let workdir = directory.path().join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let script = r#"
+import os
+fd = os.open('file', os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+os.write(fd, b'abcdefgh')
+os.fsync(fd)
+identity = os.fstat(fd).st_ino
+for length, contents in [(3, b'abc'), (9, b'abc' + b'\0' * 6), (0, b''), (4, b'\0' * 4)]:
+    os.truncate('file', length)
+    by_fd, by_path = os.fstat(fd), os.stat('file')
+    assert by_fd.st_size == by_path.st_size == length, (by_fd.st_size, by_path.st_size, length)
+    assert by_fd.st_ino == by_path.st_ino == identity
+    assert os.pread(fd, 16, 0) == contents
+os.close(fd)
+assert open('file', 'rb').read() == b'\0' * 4
+"#;
+    let outcome = tokio::time::timeout(
+        sandbox_lifecycle_timeout(20),
+        Sandbox::new(sandbox_config_in(&workdir), NoopCallback).run(
+            SandboxCommand::new(python3())
+                .args(["-c", script])
+                .current_dir(&source),
+        ),
+    )
+    .await
+    .expect("path truncation timed out")
+    .unwrap();
+    assert!(outcome.status().success());
 }
 
 #[cfg(target_os = "macos")]
@@ -1975,6 +2065,94 @@ fn process_audit_does_not_reject_a_large_argument() {
         .status()
         .unwrap();
     assert!(status.success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn posix_spawn_audit_probe() {
+    let Some(launcher_marker) = std::env::var_os("AGORA_SANDBOX_TEST_POSIX_SPAWN_LAUNCHER_MARKER")
+    else {
+        return;
+    };
+    assert_eq!(
+        std::fs::read_to_string(launcher_marker).unwrap(),
+        "launcher"
+    );
+
+    let arguments = [
+        c"/bin/sh".as_ptr(),
+        c"-c".as_ptr(),
+        c"IFS= read -r value < \"$AGORA_SANDBOX_TEST_POSIX_SPAWN_CHILD_MARKER\"; test \"$value\" = child"
+            .as_ptr(),
+        std::ptr::null(),
+    ];
+    let environment = unsafe { *libc::_NSGetEnviron() };
+    let mut pid = 0;
+    assert_eq!(
+        unsafe {
+            libc::posix_spawn(
+                &mut pid,
+                arguments[0],
+                std::ptr::null(),
+                std::ptr::null(),
+                arguments.as_ptr().cast_mut().cast(),
+                environment,
+            )
+        },
+        0
+    );
+
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+
+    if let Some(node) = std::env::var_os("AGORA_SANDBOX_TEST_NODE_EXECUTABLE") {
+        let status = Command::new(node)
+            .args([
+                "-e",
+                r#"require("child_process").execFileSync("/bin/sh", ["-c", "IFS= read -r value < \"$AGORA_SANDBOX_TEST_NODE_CHILD_MARKER\"; test \"$value\" = node"], {stdio: "inherit"})"#,
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    let arguments = [
+        c"sh".as_ptr(),
+        c"-c".as_ptr(),
+        c"IFS= read -r value < \"$AGORA_SANDBOX_TEST_POSIX_SPAWNP_CHILD_MARKER\"; test \"$value\" = spawnp"
+            .as_ptr(),
+        std::ptr::null(),
+    ];
+    let mut pid = 0;
+    assert_eq!(
+        unsafe {
+            libc::posix_spawnp(
+                &mut pid,
+                arguments[0],
+                std::ptr::null(),
+                std::ptr::null(),
+                arguments.as_ptr().cast_mut().cast(),
+                environment,
+            )
+        },
+        0
+    );
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+
+    let arguments = [
+        c"/bin/sh".as_ptr(),
+        c"-c".as_ptr(),
+        c"IFS= read -r value < \"$AGORA_SANDBOX_TEST_EXEC_CHILD_MARKER\"; test \"$value\" = exec"
+            .as_ptr(),
+        std::ptr::null(),
+    ];
+    unsafe { libc::execv(arguments[0], arguments.as_ptr()) };
+    panic!("execv failed: {}", std::io::Error::last_os_error());
 }
 
 #[cfg(target_os = "macos")]
@@ -3576,6 +3754,87 @@ async fn injected_hook_routes_a_real_child_connection_through_the_proxy() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn hook_initialization_preserves_the_darwin_startup_environment_layout() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("startup.c");
+    let executable = directory.path().join("startup");
+    std::fs::write(
+        &source,
+        br#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    /* Go reads the original env/Apple vector through argv, not environ. */
+    char **entry = argv + argc + 1;
+    for (; *entry; ++entry) {
+        if (strncmp(*entry, "AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY=",
+                    sizeof("AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY=") - 1) == 0 ||
+            strncmp(*entry, "AGORA_SANDBOX_PENDING_PROCESS_EVENT=",
+                    sizeof("AGORA_SANDBOX_PENDING_PROCESS_EVENT=") - 1) == 0) {
+            fputs("internal startup variable is still visible\n", stderr);
+            return 1;
+        }
+    }
+    if (!entry[1] || strncmp(entry[1], "executable_path=/", 17) != 0) {
+        fputs("original Apple executable_path vector was displaced\n", stderr);
+        return 2;
+    }
+    if (getenv("AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY") ||
+        getenv("AGORA_SANDBOX_PENDING_PROCESS_EVENT")) {
+        fputs("internal libc environment variable is still visible\n", stderr);
+        return 3;
+    }
+    if (!getenv("AGORA_SANDBOX_TEST_STARTUP_KEEP") ||
+        strcmp(getenv("AGORA_SANDBOX_TEST_STARTUP_KEEP"), "kept") != 0 ||
+        setenv("AGORA_SANDBOX_TEST_STARTUP_NEW", "after", 1) != 0 ||
+        strcmp(getenv("AGORA_SANDBOX_TEST_STARTUP_NEW"), "after") != 0 ||
+        unsetenv("AGORA_SANDBOX_TEST_STARTUP_NEW") != 0) {
+        fputs("ordinary environment access failed\n", stderr);
+        return 4;
+    }
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let architecture = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        "arm64"
+    };
+    let output = Command::new("/usr/bin/xcrun")
+        .args(["clang", "-arch", architecture, "-o"])
+        .arg(&executable)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "clang failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for command in [
+        SandboxCommand::new(&executable),
+        SandboxCommand::new("/bin/sh")
+            .arg("-c")
+            .arg("exec \"$1\"")
+            .arg("startup-fixture")
+            .arg(&executable),
+    ] {
+        let outcome = Sandbox::new(
+            sandbox_config_in(directory.path().join("cache")),
+            NoopCallback,
+        )
+        .run(command.env("AGORA_SANDBOX_TEST_STARTUP_KEEP", "kept"))
+        .await
+        .unwrap();
+        assert!(outcome.status().success(), "child: {:?}", outcome.status());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn runner_keeps_an_unrestricted_executable_at_its_original_path() {
     let directory = std::env::temp_dir().join(format!(
         "agora-sandbox-executable-test-{}",
@@ -3973,6 +4232,181 @@ async fn runner_truncates_large_process_audit_without_rejecting_the_command() {
         .unwrap();
 
     assert!(outcome.status().success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_posix_spawn_audit_uses_the_spawned_child_identity() {
+    let directory = workspace_root().join(format!(
+        "target/agora-sandbox-posix-spawn-audit-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let launcher_marker = source.join("launcher-marker.txt");
+    let child_marker = source.join("child-marker.txt");
+    let spawnp_marker = source.join("spawnp-marker.txt");
+    let node_marker = source.join("node-marker.txt");
+    let exec_marker = source.join("exec-marker.txt");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(&launcher_marker, b"launcher").unwrap();
+    std::fs::write(&child_marker, b"child\n").unwrap();
+    std::fs::write(&spawnp_marker, b"spawnp\n").unwrap();
+    std::fs::write(&node_marker, b"node\n").unwrap();
+    std::fs::write(&exec_marker, b"exec\n").unwrap();
+    let architecture = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        "arm64"
+    };
+    let node = ["/opt/homebrew/bin/node", "/usr/local/bin/node"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| {
+            // A Rosetta test process cannot inject its x86 Hook into ARM-only Node.
+            path.is_file()
+                && Command::new("/usr/bin/lipo")
+                    .args(["-verify_arch", architecture])
+                    .arg(path)
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+        });
+
+    let events = Arc::new(Mutex::new(Vec::<Event>::new()));
+    let callback = {
+        let events = Arc::clone(&events);
+        move |event| {
+            events.lock().unwrap().push(event);
+            std::future::ready(Decision::Allow)
+        }
+    };
+    let mut command = SandboxCommand::new(std::env::current_exe().unwrap())
+        .arg("posix_spawn_audit_probe")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(
+            "AGORA_SANDBOX_TEST_POSIX_SPAWN_LAUNCHER_MARKER",
+            &launcher_marker,
+        )
+        .env("AGORA_SANDBOX_TEST_POSIX_SPAWN_CHILD_MARKER", &child_marker)
+        .env(
+            "AGORA_SANDBOX_TEST_POSIX_SPAWNP_CHILD_MARKER",
+            &spawnp_marker,
+        )
+        .env("AGORA_SANDBOX_TEST_NODE_CHILD_MARKER", &node_marker)
+        .env("AGORA_SANDBOX_TEST_EXEC_CHILD_MARKER", &exec_marker)
+        .env(
+            "AGORA_SANDBOX_PENDING_PROCESS_EVENT",
+            "untrusted-parent-value",
+        );
+    if let Some(node) = &node {
+        command = command.env("AGORA_SANDBOX_TEST_NODE_EXECUTABLE", node);
+    }
+    let outcome = Sandbox::new(sandbox_config_in(directory.join("cache")), callback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    let events = events.lock().unwrap();
+    let file_pid = |path: &Path| {
+        events
+            .iter()
+            .find_map(|event| match event {
+                Event::File(event)
+                    if event.event_type == EventType::FilesystemOpen
+                        && event.file.path == path.to_string_lossy() =>
+                {
+                    Some(event.process.pid)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing filesystem.open for {}", path.display()))
+    };
+    let launcher_pid = file_pid(&launcher_marker);
+    let child_pid = file_pid(&child_marker);
+    let spawnp_pid = file_pid(&spawnp_marker);
+    let node_pid = node.as_ref().map(|_| file_pid(&node_marker));
+    let exec_pid = file_pid(&exec_marker);
+    assert_ne!(launcher_pid, child_pid);
+    assert_ne!(launcher_pid, spawnp_pid);
+    if let Some(node_pid) = node_pid {
+        assert_ne!(launcher_pid, node_pid);
+    }
+    assert_eq!(launcher_pid, exec_pid);
+    let process = |operation, executable: &str, marker: &str| {
+        events
+            .iter()
+            .find_map(|event| match event {
+                Event::Process(event)
+                    if event.event_type == EventType::ProcessExecAttempt
+                        && event.command.operation == operation
+                        && event.command.executable == executable
+                        && event
+                            .command
+                            .arguments
+                            .iter()
+                            .any(|argument| argument.contains(marker)) =>
+                {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                let available = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Process(event) => Some((
+                            event.command.operation,
+                            event.command.executable.as_str(),
+                            event.command.arguments.as_slice(),
+                            event.process.pid,
+                            event.process.ppid,
+                        )),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                panic!("missing {operation:?} process audit event; available: {available:?}")
+            })
+    };
+    let spawn = process(
+        agora_sandbox::callback::ProcessOperation::PosixSpawn,
+        "/bin/sh",
+        "AGORA_SANDBOX_TEST_POSIX_SPAWN_CHILD_MARKER",
+    );
+    assert_eq!(spawn.command.executable, "/bin/sh");
+    assert_eq!(spawn.process.pid, child_pid);
+    assert_eq!(spawn.process.ppid, launcher_pid);
+    let spawnp = process(
+        agora_sandbox::callback::ProcessOperation::PosixSpawnp,
+        "/bin/sh",
+        "AGORA_SANDBOX_TEST_POSIX_SPAWNP_CHILD_MARKER",
+    );
+    assert_eq!(spawnp.process.pid, spawnp_pid);
+    assert_eq!(spawnp.process.ppid, launcher_pid);
+    if let (Some(node_pid), Some(node_path)) = (node_pid, node.as_ref()) {
+        let node_process = process(
+            agora_sandbox::callback::ProcessOperation::PosixSpawnp,
+            &node_path.to_string_lossy(),
+            "AGORA_SANDBOX_TEST_NODE_CHILD_MARKER",
+        );
+        let node_child = process(
+            agora_sandbox::callback::ProcessOperation::PosixSpawn,
+            "/bin/sh",
+            "AGORA_SANDBOX_TEST_NODE_CHILD_MARKER",
+        );
+        assert_eq!(node_process.process.ppid, launcher_pid);
+        assert_eq!(node_child.process.ppid, node_process.process.pid);
+        assert_eq!(node_child.process.pid, node_pid);
+    }
+    let exec = process(
+        agora_sandbox::callback::ProcessOperation::Execv,
+        "/bin/sh",
+        "AGORA_SANDBOX_TEST_EXEC_CHILD_MARKER",
+    );
+    assert_eq!(exec.process.pid, exec_pid);
+    assert_eq!(exec.process.executable, "/bin/sh");
+    drop(events);
     std::fs::remove_dir_all(directory).unwrap();
 }
 

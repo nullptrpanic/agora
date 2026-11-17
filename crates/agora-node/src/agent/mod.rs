@@ -18,6 +18,11 @@ use custom::CustomAgent;
 pub use run::{AgentRunCancellation, AgentRunControl, AgentRunOutcome};
 
 pub trait AgentOutput {
+    /// Observed before any subsequent await, independently of execution completion.
+    fn session_started(&mut self, _session_id: &str) -> Result<()> {
+        Ok(())
+    }
+
     fn write(&mut self, event: OutputEvent) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -146,7 +151,12 @@ pub struct ConfiguredAgent {
 }
 
 impl ConfiguredAgent {
-    pub fn from_config(config: AgentConfig) -> Result<Self> {
+    pub fn from_config(mut config: AgentConfig) -> Result<Self> {
+        config.path =
+            crate::config::resolve_agent_executable(&config.name, Path::new(&config.path))?
+                .to_str()
+                .context("agent executable path is not valid UTF-8")?
+                .to_string();
         let workspace_key = normalize_workspace_key(&config.workdir())?;
         let canonical_workspace = workspace_key
             .to_str()
@@ -173,14 +183,6 @@ impl ConfiguredAgent {
             )),
             AgentType::Custom => {
                 AgentBackend::Custom(CustomAgent::new(config.path.clone(), env, limits))
-            }
-            AgentType::Coco => {
-                return Err(anyhow!("one-shot coco agent execution is not implemented"));
-            }
-            AgentType::ClaudeCode => {
-                return Err(anyhow!(
-                    "one-shot claude code agent execution is not implemented"
-                ));
             }
         };
         Ok(Self {

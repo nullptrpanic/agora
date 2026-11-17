@@ -262,6 +262,21 @@ fn framed_transport_rejects_an_invalid_marker() {
 }
 
 #[test]
+fn invalid_marker_releases_received_descriptors() {
+    let (sender, mut receiver) = UnixStream::pair().unwrap();
+    let (endpoint, mut peer) = UnixStream::pair().unwrap();
+    peer.set_nonblocking(true).unwrap();
+    send_descriptor_marker_value(&sender, &[endpoint.as_raw_fd()], 0xff);
+    drop(endpoint);
+
+    let error = receive::<ResponseEnvelope>(&mut receiver).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    // EOF proves the transferred endpoint was closed, independently of other
+    // tests allocating descriptors concurrently in this process.
+    assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+}
+
+#[test]
 fn framed_transport_reports_truncated_frames() {
     for frame in [&[0_u8, 0, 0][..], &[0_u8, 0, 0, 0, 2, b'{'][..]] {
         let (mut sender, mut receiver) = UnixStream::pair().unwrap();
@@ -334,7 +349,11 @@ fn request_id() -> RequestId {
 }
 
 fn send_descriptor_marker(stream: &UnixStream, descriptors: &[RawFd]) {
-    let mut marker = [0_u8];
+    send_descriptor_marker_value(stream, descriptors, 0);
+}
+
+fn send_descriptor_marker_value(stream: &UnixStream, descriptors: &[RawFd], value: u8) {
+    let mut marker = [value];
     let mut iov = libc::iovec {
         iov_base: marker.as_mut_ptr().cast(),
         iov_len: marker.len(),

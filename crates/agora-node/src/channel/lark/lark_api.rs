@@ -1,8 +1,11 @@
 use super::LarkReplyTarget;
-use super::channel::{LarkDelivery, LarkEvent};
+#[cfg(test)]
+use super::channel::LarkDelivery;
+use super::channel::{LarkEvent, LarkEventSender};
 use super::proxy;
 use crate::config::LarkChannelConfig;
 use crate::http;
+use crate::task::OutputImage;
 use agora_core::logger;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
@@ -19,7 +22,70 @@ use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::{client_async_tls, connect_async};
 
+mod fragments;
+use fragments::LarkFragments;
+
+// Report actionable categories/codes, never peer-provided text or credential-bearing URLs.
+fn websocket_failure_reason(error: &anyhow::Error) -> String {
+    use tokio_tungstenite::tungstenite::Error as WsError;
+    for cause in error.chain() {
+        if let Some(api) = cause.downcast_ref::<LarkApiError>() {
+            return match api {
+                LarkApiError::Http(status) => format!("http_status_{}", status.as_u16()),
+                LarkApiError::Business { code, .. } => format!("lark_code_{code}"),
+            };
+        }
+        if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
+            return if http.is_timeout() {
+                "http_timeout"
+            } else if http.is_connect() {
+                "http_connect_or_tls"
+            } else if http.is_decode() {
+                "http_decode"
+            } else {
+                "http_transport"
+            }
+            .to_string();
+        }
+        if let Some(ws) = cause.downcast_ref::<WsError>() {
+            return match ws {
+                WsError::Io(io) => format!("websocket_io_{:?}", io.kind()),
+                WsError::Http(response) => format!("websocket_http_{}", response.status().as_u16()),
+                WsError::Tls(_) => "websocket_tls".to_string(),
+                WsError::Url(_) => "websocket_url".to_string(),
+                _ => "websocket_protocol".to_string(),
+            };
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return format!("io_{:?}", io.kind());
+        }
+        if cause.is::<prost::DecodeError>() {
+            return "frame_decode".to_string();
+        }
+    }
+    let message = error.to_string();
+    for (prefix, reason) in [
+        ("connect lark websocket timed out", "connect_timeout"),
+        ("write lark websocket timed out:", "write_timeout"),
+        (
+            "lark websocket inbound idle timed out",
+            "inbound_idle_timeout",
+        ),
+        (
+            "lark websocket endpoint response missing data",
+            "endpoint_missing_data",
+        ),
+        ("agora lark receiver closed", "receiver_closed"),
+    ] {
+        if message.starts_with(prefix) {
+            return reason.to_string();
+        }
+    }
+    "unclassified_connection_error".to_string()
+}
+
 const LARK_OPENAPI: &str = "https://open.feishu.cn";
+pub(super) const LARK_CARD_MAX_BYTES: usize = 30_000;
 const LARK_WS_ENDPOINT_PATH: &str = "/callback/ws/endpoint";
 const LARK_FRAME_TYPE_CONTROL: i32 = 0;
 const LARK_FRAME_TYPE_DATA: i32 = 1;
@@ -35,13 +101,13 @@ const LARK_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 const LARK_PATCH_MAX_ATTEMPTS: usize = 3;
 const LARK_PATCH_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(100);
 const LARK_MAX_IN_FLIGHT_EVENTS: usize = 64;
+const LARK_MAX_IN_FLIGHT_INTERRUPTS: usize = 8;
 const LARK_EVENT_CACHE_CAPACITY: usize = 4096;
 const LARK_EVENT_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const LARK_PENDING_EVENT_TTL: Duration = Duration::from_secs(2 * 60);
 const LARK_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LARK_WS_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const LARK_WS_MINIMUM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const LARK_TENANT_TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
 
 #[derive(Clone)]
 struct LarkWebSocketTiming {
@@ -73,9 +139,11 @@ pub(super) struct LarkApi {
     token_cache: Arc<Mutex<Option<LarkCachedToken>>>,
     event_cache: Arc<Mutex<LarkEventCache>>,
     event_slots: Arc<Semaphore>,
+    interrupt_slots: Arc<Semaphore>,
     websocket_timing: LarkWebSocketTiming,
 }
 
+#[derive(Debug)]
 struct LarkCachedToken {
     value: String,
     expires_at: Instant,
@@ -242,21 +310,36 @@ impl std::fmt::Display for LarkImageDownloadError {
 impl std::error::Error for LarkImageDownloadError {}
 
 #[derive(Debug)]
-pub(super) struct LarkHttpStatusError(StatusCode);
+pub(super) enum LarkApiError {
+    Http(StatusCode),
+    Business { code: i32, message: String },
+}
 
-impl LarkHttpStatusError {
+impl LarkApiError {
     pub(super) fn is_unauthorized(&self) -> bool {
-        self.0 == StatusCode::UNAUTHORIZED
+        matches!(
+            self,
+            Self::Http(StatusCode::UNAUTHORIZED)
+                | Self::Business {
+                    code: 99991663 | 99991664 | 99991671,
+                    ..
+                }
+        )
     }
 }
 
-impl std::fmt::Display for LarkHttpStatusError {
+impl std::fmt::Display for LarkApiError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "lark HTTP request failed: {}", self.0)
+        match self {
+            Self::Http(status) => write!(formatter, "lark HTTP request failed: {status}"),
+            Self::Business { code, message } => {
+                write!(formatter, "lark API failed code={code}: {message}")
+            }
+        }
     }
 }
 
-impl std::error::Error for LarkHttpStatusError {}
+impl std::error::Error for LarkApiError {}
 
 impl LarkApi {
     pub(super) fn new(config: LarkChannelConfig) -> Result<Self> {
@@ -275,6 +358,7 @@ impl LarkApi {
             token_cache: Arc::new(Mutex::new(None)),
             event_cache: Arc::new(Mutex::new(LarkEventCache::default())),
             event_slots: Arc::new(Semaphore::new(LARK_MAX_IN_FLIGHT_EVENTS)),
+            interrupt_slots: Arc::new(Semaphore::new(LARK_MAX_IN_FLIGHT_INTERRUPTS)),
             websocket_timing: LarkWebSocketTiming::default(),
         })
     }
@@ -289,10 +373,7 @@ impl LarkApi {
         &self.name
     }
 
-    pub(super) async fn run_websocket_loop(
-        &self,
-        events: mpsc::Sender<LarkDelivery>,
-    ) -> Result<()> {
+    pub(super) async fn run_websocket_loop(&self, events: LarkEventSender) -> Result<()> {
         let mut backoff = LarkReconnectBackoff::default();
         logger::info!("lark channel starting channel={}", self.name);
         loop {
@@ -308,16 +389,19 @@ impl LarkApi {
                         self.name
                     );
                 }
-                Err(_) => {
+                Err(error) => {
+                    let reason = websocket_failure_reason(&error);
                     if connected {
                         logger::error!(
-                            "lark websocket disconnected channel={} reason=connection_error",
-                            self.name
+                            "lark websocket disconnected channel={} reason={}",
+                            self.name,
+                            reason
                         );
                     } else {
                         logger::error!(
-                            "lark channel startup failed channel={} reason=connection_error",
-                            self.name
+                            "lark channel startup failed channel={} reason={}",
+                            self.name,
+                            reason
                         );
                     }
                 }
@@ -338,7 +422,7 @@ impl LarkApi {
 
     async fn run_websocket_once(
         &self,
-        events: mpsc::Sender<LarkDelivery>,
+        events: LarkEventSender,
         connected: &mut bool,
     ) -> Result<()> {
         let (endpoint_url, client_config) = self.websocket_endpoint().await?;
@@ -375,6 +459,7 @@ impl LarkApi {
         tokio::pin!(inbound_idle);
         let (acknowledgements, mut acknowledged) =
             mpsc::channel::<Result<LarkFrame>>(LARK_MAX_IN_FLIGHT_EVENTS);
+        let mut fragments = LarkFragments::default();
 
         loop {
             tokio::select! {
@@ -399,12 +484,29 @@ impl LarkApi {
                         .reset(tokio::time::Instant::now() + idle_timeout);
                     match message {
                         WebSocketMessage::Binary(payload) => {
-                            let frame = LarkFrame::decode(payload)
+                            let mut frame = LarkFrame::decode(payload)
                                 .context("decode lark websocket frame failed")?;
                             if frame.method == LARK_FRAME_TYPE_DATA
                                 && frame.header("type") == Some(LARK_MESSAGE_TYPE_EVENT)
                             {
-                                let Ok(permit) = Arc::clone(&self.event_slots).try_acquire_owned() else {
+                                match fragments.reassemble(&mut frame) {
+                                    Ok(false) => continue,
+                                    Ok(true) => {}
+                                    Err(error) => {
+                                        logger::error!("lark fragment rejected channel={} error={}", self.name, error);
+                                        let ack = frame.into_ack(500, 0)?;
+                                        self.write_websocket(
+                                            socket.send(WebSocketMessage::Binary(ack.encode_to_vec().into())),
+                                            "send rejected lark fragment ack failed",
+                                        ).await?;
+                                        continue;
+                                    }
+                                }
+                                let event = LarkEvent::from_lark_event_payload(&frame.payload);
+                                let slots = if matches!(event, Ok(LarkEvent::Interrupt(_))) {
+                                    &self.interrupt_slots
+                                } else { &self.event_slots };
+                                let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
                                     let ack = frame.into_ack(500, 0)?;
                                     self.write_websocket(
                                         socket.send(WebSocketMessage::Binary(
@@ -420,7 +522,7 @@ impl LarkApi {
                                 let acknowledgements = acknowledgements.clone();
                                 tokio::spawn(async move {
                                     let _permit = permit;
-                                    match api.handle_data_frame(frame, &events).await {
+                                    match api.handle_data_frame(frame, &events, event).await {
                                         Ok(Some(acknowledgement)) => {
                                             let _ = acknowledgements.send(Ok(acknowledgement)).await;
                                         }
@@ -483,18 +585,18 @@ impl LarkApi {
             .context("request lark websocket endpoint failed")?;
         let status = response.status();
         if !status.is_success() {
-            return Err(anyhow!("lark websocket endpoint http failed: {status}"));
+            return Err(LarkApiError::Http(status).into());
         }
         let endpoint = response
             .json::<LarkWebSocketEndpointResponse>()
             .await
             .context("parse lark websocket endpoint response failed")?;
         if endpoint.code != 0 {
-            return Err(anyhow!(
-                "lark websocket endpoint failed: code={}, msg={}",
-                endpoint.code,
-                endpoint.msg
-            ));
+            return Err(LarkApiError::Business {
+                code: endpoint.code,
+                message: endpoint.msg,
+            }
+            .into());
         }
         let data = endpoint
             .data
@@ -528,7 +630,11 @@ impl LarkApi {
         let frame = LarkFrame::decode(payload).context("decode lark websocket frame failed")?;
         match frame.method {
             LARK_FRAME_TYPE_CONTROL => Ok(None),
-            LARK_FRAME_TYPE_DATA => self.handle_data_frame(frame, events).await,
+            LARK_FRAME_TYPE_DATA => {
+                let event = LarkEvent::from_lark_event_payload(&frame.payload);
+                self.handle_data_frame(frame, &events.clone().into(), event)
+                    .await
+            }
             _ => Ok(None),
         }
     }
@@ -536,14 +642,15 @@ impl LarkApi {
     async fn handle_data_frame(
         &self,
         frame: LarkFrame,
-        events: &mpsc::Sender<LarkDelivery>,
+        events: &LarkEventSender,
+        event: Result<LarkEvent>,
     ) -> Result<Option<LarkFrame>> {
         if frame.header("type") != Some(LARK_MESSAGE_TYPE_EVENT) {
             return Ok(None);
         }
 
         let started = Instant::now();
-        let status_code = match LarkEvent::from_lark_event_payload(&frame.payload) {
+        let status_code = match event {
             Ok(
                 event
                 @ (LarkEvent::Message(_) | LarkEvent::CardAction(_) | LarkEvent::Interrupt(_)),
@@ -558,7 +665,7 @@ impl LarkApi {
                 };
                 match decision {
                     LarkEventCacheDecision::Execute(generation) => {
-                        let admitted = self.deliver_event(event, events).await;
+                        let admitted = events.deliver(event).await;
                         let status_code = admitted.as_ref().copied().unwrap_or(500);
                         self.event_cache
                             .lock()
@@ -582,28 +689,11 @@ impl LarkApi {
         ))
     }
 
-    async fn deliver_event(
-        &self,
-        event: LarkEvent,
-        events: &mpsc::Sender<LarkDelivery>,
-    ) -> Result<u16> {
-        let (delivery, acknowledged) = LarkDelivery::new(event);
-        let deadline = delivery.deadline();
-        match tokio::time::timeout_at(deadline, async {
-            events
-                .send(delivery)
-                .await
-                .map_err(|_| anyhow!("agora lark receiver closed"))?;
-            Ok(acknowledged.await.unwrap_or(500))
-        })
-        .await
-        {
-            Ok(status_code) => status_code,
-            Err(_) => Ok(500),
-        }
+    pub(super) async fn tenant_access_token(&self) -> Result<String> {
+        Ok(self.request_tenant_access_token().await?.value)
     }
 
-    pub(super) async fn tenant_access_token(&self) -> Result<String> {
+    async fn request_tenant_access_token(&self) -> Result<LarkCachedToken> {
         let response = self
             .client
             .post(format!(
@@ -615,9 +705,11 @@ impl LarkApi {
                 "app_secret": self.secret,
             }))
             .send()
-            .await?
-            .json::<TenantTokenResponse>()
             .await?;
+        if !response.status().is_success() {
+            return Err(LarkApiError::Http(response.status()).into());
+        }
+        let response = response.json::<TenantTokenResponse>().await?;
         response.into_result()
     }
 
@@ -628,11 +720,9 @@ impl LarkApi {
         {
             return Ok(token.value.clone());
         }
-        let value = self.tenant_access_token().await?;
-        *cache = Some(LarkCachedToken {
-            value: value.clone(),
-            expires_at: Instant::now() + LARK_TENANT_TOKEN_CACHE_TTL,
-        });
+        let token = self.request_tenant_access_token().await?;
+        let value = token.value.clone();
+        *cache = Some(token);
         Ok(value)
     }
 
@@ -714,8 +804,17 @@ impl LarkApi {
         target: &LarkReplyTarget,
         card: &Value,
     ) -> Result<String> {
-        self.reply_message(token, target, "interactive", serde_json::to_string(card)?)
+        self.reply_message(token, target, "interactive", Self::serialize_card(card)?)
             .await
+    }
+
+    fn serialize_card(card: &Value) -> Result<String> {
+        let content = serde_json::to_string(card)?;
+        anyhow::ensure!(
+            content.len() <= LARK_CARD_MAX_BYTES,
+            "lark card exceeds serialized byte limit"
+        );
+        Ok(content)
     }
 
     pub(super) async fn reply_text(
@@ -732,6 +831,88 @@ impl LarkApi {
         )
         .await?;
         Ok(())
+    }
+
+    pub(super) async fn reply_image(
+        &self,
+        target: &LarkReplyTarget,
+        image: &OutputImage,
+    ) -> Result<()> {
+        let result = async {
+            let mut token = self.cached_tenant_access_token().await?;
+            let mut image_key = None;
+            for attempt in 0..2 {
+                let result = async {
+                    if image_key.is_none() {
+                        image_key = Some(self.upload_image(&token, image).await?);
+                    }
+                    self.reply_message(
+                        &token,
+                        target,
+                        "image",
+                        json!({"image_key": image_key}).to_string(),
+                    )
+                    .await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if attempt == 0
+                    && result
+                        .as_ref()
+                        .err()
+                        .and_then(|error| error.downcast_ref::<LarkApiError>())
+                        .is_some_and(LarkApiError::is_unauthorized)
+                {
+                    self.invalidate_cached_tenant_access_token(&token).await;
+                    token = self.cached_tenant_access_token().await?;
+                    continue;
+                }
+                // Only an explicit authentication rejection is safe to retry.
+                return result;
+            }
+            unreachable!("the final attempt always returns")
+        }
+        .await;
+        // Never include provider-supplied text or credential-bearing URLs in logs.
+        result.map_err(|error| {
+            anyhow!(
+                "lark image delivery failed: {}",
+                websocket_failure_reason(&error)
+            )
+        })
+    }
+
+    async fn upload_image(&self, token: &str, image: &OutputImage) -> Result<String> {
+        let part = reqwest::multipart::Part::bytes(image.data().to_vec())
+            .file_name(image.file_name().to_string())
+            .mime_str(image.media_type())?;
+        let response = self
+            .client
+            .post(format!("{}/open-apis/im/v1/images", self.base_url))
+            .bearer_auth(token)
+            .multipart(
+                reqwest::multipart::Form::new()
+                    .text("image_type", "message")
+                    .part("image", part),
+            )
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(LarkApiError::Http(response.status()).into());
+        }
+        let response = response.json::<UploadImageResponse>().await?;
+        if response.code != 0 {
+            return Err(LarkApiError::Business {
+                code: response.code,
+                message: response.msg,
+            }
+            .into());
+        }
+        response
+            .data
+            .map(|data| data.image_key)
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| anyhow!("lark image upload response missing image_key"))
     }
 
     async fn reply_message(
@@ -756,7 +937,7 @@ impl LarkApi {
             .send()
             .await?;
         if !response.status().is_success() {
-            return Err(LarkHttpStatusError(response.status()).into());
+            return Err(LarkApiError::Http(response.status()).into());
         }
         let response = response.json::<SendCardResponse>().await?;
         response.into_result()
@@ -769,7 +950,7 @@ impl LarkApi {
         card: &Value,
     ) -> Result<()> {
         let url = format!("{}/open-apis/im/v1/messages/{}", self.base_url, message_id);
-        let content = serde_json::to_string(card)?;
+        let content = Self::serialize_card(card)?;
         let mut delay = LARK_PATCH_RETRY_INITIAL_DELAY;
 
         for attempt in 1..=LARK_PATCH_MAX_ATTEMPTS {
@@ -789,7 +970,7 @@ impl LarkApi {
                             || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS) => {}
                 Ok(response) => {
                     if !response.status().is_success() {
-                        return Err(LarkHttpStatusError(response.status()).into());
+                        return Err(LarkApiError::Http(response.status()).into());
                     }
                     return response.json::<LarkEmptyResponse>().await?.into_result();
                 }
@@ -965,13 +1146,26 @@ struct TenantTokenResponse {
     code: i32,
     msg: String,
     tenant_access_token: Option<String>,
+    #[serde(default)]
+    expire: u64,
 }
 
 impl TenantTokenResponse {
-    fn into_result(self) -> Result<String> {
+    fn into_result(self) -> Result<LarkCachedToken> {
         if self.code == 0 {
-            self.tenant_access_token
-                .ok_or_else(|| anyhow!("lark response missing tenant_access_token"))
+            let value = self
+                .tenant_access_token
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow!("lark response missing tenant_access_token"))?;
+            anyhow::ensure!(
+                self.expire > 0,
+                "lark token response missing positive expire"
+            );
+            let early_refresh = (self.expire / 10).min(60);
+            let expires_at = Instant::now()
+                .checked_add(Duration::from_secs(self.expire - early_refresh))
+                .ok_or_else(|| anyhow!("lark token expiry is out of range"))?;
+            Ok(LarkCachedToken { value, expires_at })
         } else {
             Err(anyhow!("lark tenant token failed: {}", self.msg))
         }
@@ -1018,6 +1212,18 @@ struct SendCardResponse {
 }
 
 #[derive(Deserialize)]
+struct UploadImageResponse {
+    code: i32,
+    msg: String,
+    data: Option<UploadedImage>,
+}
+
+#[derive(Deserialize)]
+struct UploadedImage {
+    image_key: String,
+}
+
+#[derive(Deserialize)]
 struct SendCardData {
     message_id: String,
 }
@@ -1029,7 +1235,11 @@ impl SendCardResponse {
                 .map(|data| data.message_id)
                 .ok_or_else(|| anyhow!("lark response missing message_id"))
         } else {
-            Err(anyhow!("lark reply message failed: {}", self.msg))
+            Err(LarkApiError::Business {
+                code: self.code,
+                message: self.msg,
+            }
+            .into())
         }
     }
 }
@@ -1050,7 +1260,11 @@ impl LarkEmptyResponse {
         if self.code == 0 {
             Ok(())
         } else {
-            Err(anyhow!("lark patch card failed: {}", self.msg))
+            Err(LarkApiError::Business {
+                code: self.code,
+                message: self.msg,
+            }
+            .into())
         }
     }
 }

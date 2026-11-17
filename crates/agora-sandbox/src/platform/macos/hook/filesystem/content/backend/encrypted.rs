@@ -39,7 +39,9 @@ impl EagerEncryptedContent {
         if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        runtime.filesystem.refresh_timestamps(&logical, &status)
+        runtime
+            .filesystem
+            .refresh_timestamps(&logical, &status, None)
     }
 }
 
@@ -289,6 +291,33 @@ impl ContentBackend for EncryptedContent {
 
     fn is_broker_managed(&self) -> bool {
         true
+    }
+
+    fn prepare_close(
+        &self,
+        state: &ContentState,
+        runtime: &FilesystemHookRuntime,
+        descriptor: libc::c_int,
+        open: &OpenFile,
+    ) -> Result<()> {
+        runtime.refresh_open_attributes(descriptor, open)?;
+        let mut dirty = lock(&state.dirty);
+        runtime
+            .local
+            .as_ref()
+            .context("local filesystem runtime is unavailable")?
+            .prepare_close(&self.handle, dirty.to_vec())?;
+        dirty.clear();
+        Ok(())
+    }
+
+    fn complete_close(&self, runtime: &FilesystemHookRuntime) -> Result<()> {
+        runtime
+            .local
+            .as_ref()
+            .context("local filesystem runtime is unavailable")?
+            .release_retained(vec![self.handle.clone()])?;
+        Ok(())
     }
 
     fn publishes_writes(&self) -> bool {

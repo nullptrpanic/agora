@@ -1,5 +1,33 @@
 use super::*;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn hardening_relative_executable_is_fixed_before_changing_workdir() {
+    use std::os::unix::fs::PermissionsExt;
+    let cwd = std::env::current_dir().unwrap();
+    let temp = tempfile::tempdir_in(&cwd).unwrap();
+    let script = temp.path().join("agent");
+    std::fs::write(&script, "#!/bin/sh\nprintf resolved\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let configured = ConfiguredAgent::from_config(agent(
+        AgentType::Custom,
+        script.strip_prefix(&cwd).unwrap(),
+        temp.path().join("different"),
+    ))
+    .unwrap();
+    let mut output = VecAgentOutput::default();
+    configured
+        .run(
+            AgentTask::new(""),
+            None,
+            AgentRunControl::new(),
+            &mut output,
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.answer_text(), "resolved");
+}
+
 #[tokio::test]
 async fn custom_agent_streams_raw_command_output() {
     let temp = tempfile::tempdir().unwrap();

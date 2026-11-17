@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) use crate::filesystem::ByteRange;
 
-pub(crate) const PROTOCOL_VERSION: u16 = 9;
+pub(crate) const PROTOCOL_VERSION: u16 = 10;
 
 pub(crate) fn valid_request_id(value: &str) -> bool {
     value.len() == 32
@@ -83,6 +83,10 @@ pub(crate) enum Request {
         handles: Vec<String>,
     },
     Close {
+        handle: String,
+        ranges: Vec<ByteRange>,
+    },
+    PrepareClose {
         handle: String,
         ranges: Vec<ByteRange>,
     },

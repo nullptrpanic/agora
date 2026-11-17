@@ -608,7 +608,7 @@ impl EncryptedWorkspace {
                         ..
                     }) => {
                         fs::remove_file(entry.path())?;
-                        let lease = MetadataStore::lease_path(&entry.path())?;
+                        let lease = namespace::write_lease_path(&entry.path())?;
                         match fs::remove_file(lease) {
                             Ok(()) => {}
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

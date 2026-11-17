@@ -6,7 +6,7 @@ use super::config::{
 };
 use super::dyld::{dyld_interpose, function_from_interpose};
 use super::set_errno;
-use crate::audit::{AuditClient, AuditEventRequest};
+use crate::audit::{AuditClient, AuditEventRequest, PENDING_PROCESS_EVENT_ENVIRONMENT};
 use crate::callback::{CommandContext, ProcessContext, ProcessOperation};
 use crate::execution::{
     DEFAULT_EXECUTABLE_PATH, PrepareResponse, encode_prepare_request, resolve_shebang,
@@ -14,6 +14,7 @@ use crate::execution::{
 use crate::ipc::InheritedControlStream;
 use crate::network::client_trust::{JAVA_TOOL_OPTIONS_ENVIRONMENT, merged_java_tool_options};
 use crate::trace::TraceContext;
+use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io;
@@ -25,8 +26,13 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+pub(super) mod file_actions;
+use file_actions::SpawnFileActions;
+
 const MAX_RECORDED_ARGUMENTS: usize = 256;
 const MAX_RECORDED_ARGUMENT_BYTES: usize = 32 * 1024;
+const MAX_PENDING_PROCESS_EVENT_BYTES: usize = 48 * 1024;
+const PENDING_PROCESS_EVENT_VERSION: u16 = 1;
 const TRUNCATED_ARGUMENTS: &str = "[truncated]";
 
 type PosixSpawnFn = unsafe extern "C" fn(
@@ -37,9 +43,6 @@ type PosixSpawnFn = unsafe extern "C" fn(
     *const *mut libc::c_char,
     *const *mut libc::c_char,
 ) -> libc::c_int;
-
-type PosixSpawnFileActionsInitFn =
-    unsafe extern "C" fn(*mut libc::posix_spawn_file_actions_t) -> libc::c_int;
 
 type ExecveFn = unsafe extern "C" fn(
     *const libc::c_char,
@@ -62,134 +65,6 @@ thread_local! {
 
 struct ProcessHookGuard {
     _signals: super::SignalMaskGuard,
-}
-
-struct SpawnFileActions {
-    borrowed: *const libc::posix_spawn_file_actions_t,
-    owned: Option<libc::posix_spawn_file_actions_t>,
-}
-
-impl SpawnFileActions {
-    unsafe fn prepare(
-        file_actions: *const libc::posix_spawn_file_actions_t,
-        attributes: *const libc::posix_spawnattr_t,
-    ) -> Result<Self, libc::c_int> {
-        if attributes.is_null() {
-            return Ok(Self {
-                borrowed: file_actions,
-                owned: None,
-            });
-        }
-        let mut flags = 0;
-        let result = unsafe { libc::posix_spawnattr_getflags(attributes, &mut flags) };
-        if result != 0 {
-            return Err(result);
-        }
-        if i32::from(flags) & libc::POSIX_SPAWN_CLOEXEC_DEFAULT == 0 {
-            return Ok(Self {
-                borrowed: file_actions,
-                owned: None,
-            });
-        }
-
-        // Caller-owned actions have already received Agora's inherit actions
-        // from the interposed initializer. Appending them here would place an
-        // inherit after a caller close/dup2 action and make native spawn fail
-        // with EBADF. Only actions allocated here can be populated safely.
-        let descriptors = file_actions
-            .is_null()
-            .then(inheritable_spawn_descriptors)
-            .unwrap_or_default();
-        if descriptors.is_empty() {
-            return Ok(Self {
-                borrowed: file_actions,
-                owned: None,
-            });
-        }
-
-        let mut prepared = if file_actions.is_null() {
-            let mut owned = std::ptr::null_mut();
-            let Some(original) = original_posix_spawn_file_actions_init() else {
-                return Err(libc::ENOSYS);
-            };
-            let result = unsafe { original(&mut owned) };
-            if result != 0 {
-                return Err(result);
-            }
-            Self {
-                borrowed: std::ptr::null(),
-                owned: Some(owned),
-            }
-        } else {
-            Self {
-                borrowed: file_actions,
-                owned: None,
-            }
-        };
-        for descriptor in descriptors {
-            let result = unsafe {
-                posix_spawn_file_actions_addinherit_np(prepared.as_mut_ptr(), descriptor)
-            };
-            if result != 0 {
-                return Err(result);
-            }
-        }
-        Ok(prepared)
-    }
-
-    fn as_ptr(&self) -> *const libc::posix_spawn_file_actions_t {
-        self.owned
-            .as_ref()
-            .map_or(self.borrowed, |owned| owned as *const _)
-    }
-
-    fn as_mut_ptr(&mut self) -> *mut libc::posix_spawn_file_actions_t {
-        self.owned
-            .as_mut()
-            .map_or(self.borrowed.cast_mut(), |owned| owned as *mut _)
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn agora_sandbox_posix_spawn_file_actions_init(
-    actions: *mut libc::posix_spawn_file_actions_t,
-) -> libc::c_int {
-    let Some(original) = original_posix_spawn_file_actions_init() else {
-        return libc::ENOSYS;
-    };
-    let result = unsafe { original(actions) };
-    if result != 0 || !super::initialized() {
-        return result;
-    }
-    // Prefix the hidden-descriptor actions before the caller appends close,
-    // dup2, or open actions. The caller can then deliberately replace one of
-    // those descriptors without a trailing addinherit_np resurrecting it.
-    for descriptor in inheritable_spawn_descriptors() {
-        let result = unsafe { posix_spawn_file_actions_addinherit_np(actions, descriptor) };
-        if result != 0 {
-            unsafe { libc::posix_spawn_file_actions_destroy(actions) };
-            return result;
-        }
-    }
-    0
-}
-
-fn inheritable_spawn_descriptors() -> Vec<libc::c_int> {
-    let mut descriptors = super::control::inheritable_descriptors();
-    descriptors.extend(super::filesystem::inheritable_internal_descriptors());
-    descriptors.sort_unstable();
-    descriptors.dedup();
-    descriptors
-}
-
-impl Drop for SpawnFileActions {
-    fn drop(&mut self) {
-        if let Some(actions) = self.owned.as_mut() {
-            unsafe {
-                libc::posix_spawn_file_actions_destroy(actions);
-            }
-        }
-    }
 }
 
 impl ProcessHookGuard {
@@ -248,6 +123,75 @@ struct ProcessHookRuntime {
 struct PreparedExecutable {
     program: CString,
     arguments: Vec<CString>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingProcessEvent {
+    version: u16,
+    trace_id: String,
+    command: CommandContext,
+}
+
+impl PendingProcessEvent {
+    fn environment_entry(&self) -> Result<CString, PrepareError> {
+        let value = serde_json::to_string(self).map_err(|error| {
+            PrepareError::new(
+                libc::EINVAL,
+                format!("failed to encode pending process event: {error}"),
+            )
+        })?;
+        if value.len() > MAX_PENDING_PROCESS_EVENT_BYTES {
+            return Err(PrepareError::new(
+                libc::E2BIG,
+                "pending process event exceeds the environment limit",
+            ));
+        }
+        CString::new(format!("{PENDING_PROCESS_EVENT_ENVIRONMENT}={value}"))
+            .map_err(|_| PrepareError::new(libc::EINVAL, "pending process event contains NUL"))
+    }
+
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    fn decode(value: &str) -> Result<Self, PrepareError> {
+        if value.len() > MAX_PENDING_PROCESS_EVENT_BYTES {
+            return Err(PrepareError::new(
+                libc::E2BIG,
+                "pending process event exceeds the environment limit",
+            ));
+        }
+        let pending = serde_json::from_str::<Self>(value).map_err(|error| {
+            PrepareError::new(
+                libc::EINVAL,
+                format!("invalid pending process event: {error}"),
+            )
+        })?;
+        if pending.version != PENDING_PROCESS_EVENT_VERSION {
+            return Err(PrepareError::new(
+                libc::EINVAL,
+                "unsupported pending process event version",
+            ));
+        }
+        TraceContext::parse(&pending.trace_id).map_err(|error| {
+            PrepareError::new(
+                libc::EINVAL,
+                format!("invalid pending process trace: {error}"),
+            )
+        })?;
+        if !Path::new(&pending.command.executable).is_absolute()
+            || !Path::new(&pending.command.current_dir).is_absolute()
+        {
+            return Err(PrepareError::new(
+                libc::EINVAL,
+                "pending process paths must be absolute",
+            ));
+        }
+        if pending.command.arguments.len() > MAX_RECORDED_ARGUMENTS + 1 {
+            return Err(PrepareError::new(
+                libc::EINVAL,
+                "pending process event contains too many arguments",
+            ));
+        }
+        Ok(pending)
+    }
 }
 
 #[derive(Debug)]
@@ -375,7 +319,6 @@ impl ChildArguments {
 struct ChildEnvironment {
     values: Vec<CString>,
     pointers: Vec<*mut libc::c_char>,
-    inherited_local_handles: Vec<String>,
 }
 
 impl ChildEnvironment {
@@ -383,7 +326,28 @@ impl ChildEnvironment {
         environment: *const *const libc::c_char,
         config: &HookConfig,
         trace: &TraceContext,
+        pending_process_event: &CStr,
         remote_current_directory: Option<&Path>,
+    ) -> Option<Self> {
+        unsafe {
+            Self::with_inheritance(
+                environment,
+                config,
+                trace,
+                pending_process_event,
+                remote_current_directory,
+                super::filesystem::inherited_local_descriptors().as_ref(),
+            )
+        }
+    }
+
+    unsafe fn with_inheritance(
+        environment: *const *const libc::c_char,
+        config: &HookConfig,
+        trace: &TraceContext,
+        pending_process_event: &CStr,
+        remote_current_directory: Option<&Path>,
+        inherited: Option<&super::filesystem::InheritedLocalEnvironment>,
     ) -> Option<Self> {
         let mut values = Vec::new();
         let mut java_tool_options = None;
@@ -434,9 +398,7 @@ impl ChildEnvironment {
         for (key, value) in super::control::child_environment() {
             values.push(CString::new(format!("{key}={value}")).ok()?);
         }
-        let mut inherited_local_handles = Vec::new();
-        if let Some(inherited) = super::filesystem::inherited_local_descriptors() {
-            inherited_local_handles = inherited.handles;
+        if let Some(inherited) = inherited {
             values.push(
                 CString::new(format!(
                     "{INHERITED_LOCAL_DESCRIPTORS}={}",
@@ -454,6 +416,7 @@ impl ChildEnvironment {
             entry.extend_from_slice(directory.as_os_str().as_bytes());
             values.push(CString::new(entry).ok()?);
         }
+        values.push(pending_process_event.to_owned());
         values
             .push(CString::new(format!("DYLD_INSERT_LIBRARIES={}", config.hook_libraries())).ok()?);
         let mut pointers = values
@@ -461,11 +424,7 @@ impl ChildEnvironment {
             .map(|value| value.as_ptr().cast_mut())
             .collect::<Vec<_>>();
         pointers.push(std::ptr::null_mut());
-        Some(Self {
-            values,
-            pointers,
-            inherited_local_handles,
-        })
+        Some(Self { values, pointers })
     }
 
     fn as_posix_ptr(&self) -> *const *mut libc::c_char {
@@ -730,23 +689,28 @@ unsafe fn prepared_executable(
     search_path: bool,
     arguments: *const *const libc::c_char,
     operation: ProcessOperation,
-) -> Result<(PreparedExecutable, TraceContext), PrepareError> {
+) -> Result<(PreparedExecutable, TraceContext, PendingProcessEvent), PrepareError> {
     let runtime = ProcessHookRuntime::global()
         .ok_or_else(|| PrepareError::new(libc::EACCES, "sandbox process runtime is unavailable"))?;
     let executable = unsafe { requested_executable(path, search_path) }?;
     let trace = runtime.config.trace().child();
-    let event = unsafe { process_event_request(&executable, arguments, operation, &trace) }?;
-    runtime.publish(event)?;
-    let prepared = runtime.prepare_executable(&executable)?;
-    Ok((prepared, trace))
+    let pending = unsafe { pending_process_event(&executable, arguments, operation, &trace) }?;
+    let prepared = match runtime.prepare_executable(&executable) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            runtime.publish(process_event_request(&pending)?)?;
+            return Err(error);
+        }
+    };
+    Ok((prepared, trace, pending))
 }
 
-unsafe fn process_event_request(
+unsafe fn pending_process_event(
     executable: &Path,
     arguments: *const *const libc::c_char,
     operation: ProcessOperation,
     trace: &TraceContext,
-) -> Result<AuditEventRequest, PrepareError> {
+) -> Result<PendingProcessEvent, PrepareError> {
     let mut values = Vec::new();
     let mut recorded_bytes = 0_usize;
     if !arguments.is_null() {
@@ -765,12 +729,6 @@ unsafe fn process_event_request(
             values.push(TRUNCATED_ARGUMENTS.to_string());
         }
     }
-    let process_executable = super::try_current_process_executable().map_err(|error| {
-        PrepareError::new(
-            io_errno(&error),
-            format!("failed to resolve current executable: {error}"),
-        )
-    })?;
     let current_dir = resolve_current_directory(
         super::filesystem::tracked_current_directory(),
         std::env::current_dir,
@@ -782,13 +740,9 @@ unsafe fn process_event_request(
             format!("failed to resolve current directory: {error}"),
         )
     })?;
-    Ok(AuditEventRequest::Process {
+    Ok(PendingProcessEvent {
+        version: PENDING_PROCESS_EVENT_VERSION,
         trace_id: trace.encode(),
-        process: ProcessContext {
-            pid: std::process::id(),
-            ppid: unsafe { libc::getppid() as u32 },
-            executable: process_executable,
-        },
         command: CommandContext {
             executable: executable.to_string_lossy().into_owned(),
             arguments: values,
@@ -796,6 +750,64 @@ unsafe fn process_event_request(
             operation,
         },
     })
+}
+
+fn process_event_request(pending: &PendingProcessEvent) -> Result<AuditEventRequest, PrepareError> {
+    let process_executable = super::try_current_process_executable().map_err(|error| {
+        PrepareError::new(
+            io_errno(&error),
+            format!("failed to resolve current executable: {error}"),
+        )
+    })?;
+    Ok(AuditEventRequest::Process {
+        trace_id: pending.trace_id.clone(),
+        process: ProcessContext {
+            pid: std::process::id(),
+            ppid: unsafe { libc::getppid() as u32 },
+            executable: process_executable,
+        },
+        command: pending.command.clone(),
+    })
+}
+
+fn publish_process_attempt(
+    runtime: &ProcessHookRuntime,
+    pending: &PendingProcessEvent,
+) -> Result<(), PrepareError> {
+    runtime.publish(process_event_request(pending)?)
+}
+
+fn report_process_attempt_error(
+    runtime: &ProcessHookRuntime,
+    pending: &PendingProcessEvent,
+    errno: libc::c_int,
+) -> libc::c_int {
+    publish_process_attempt(runtime, pending).map_or_else(|error| error.errno, |()| errno)
+}
+
+unsafe fn report_exec_failure(
+    runtime: &ProcessHookRuntime,
+    pending: &PendingProcessEvent,
+    errno: libc::c_int,
+) -> libc::c_int {
+    let errno = report_process_attempt_error(runtime, pending, errno);
+    unsafe { set_errno(errno) };
+    -1
+}
+
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
+pub(super) fn publish_pending_event() -> Result<(), String> {
+    let Some(value) = std::env::var_os(PENDING_PROCESS_EVENT_ENVIRONMENT) else {
+        return Ok(());
+    };
+    unsafe { config::clear_startup_variable(PENDING_PROCESS_EVENT_ENVIRONMENT) };
+    let value = value
+        .into_string()
+        .map_err(|_| "pending process event is not valid UTF-8".to_string())?;
+    let pending = PendingProcessEvent::decode(&value).map_err(|error| error.to_string())?;
+    let runtime = ProcessHookRuntime::global()
+        .ok_or_else(|| "sandbox process runtime is unavailable".to_string())?;
+    publish_process_attempt(runtime, &pending).map_err(|error| error.to_string())
 }
 
 fn resolve_current_directory(
@@ -818,73 +830,16 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
     arguments: *const *mut libc::c_char,
     environment: *const *mut libc::c_char,
 ) -> libc::c_int {
-    let Some(original) = original_posix_spawn() else {
-        return libc::ENOSYS;
-    };
-    let Some(guard) = ProcessHookGuard::enter() else {
-        return libc::EACCES;
-    };
-    let remote_current_directory = match super::filesystem::prepare_child_current_directory() {
-        Ok(directory) => directory,
-        Err(error) => return PrepareError::from_anyhow(error, libc::EIO).errno,
-    };
-    let (prepared, trace) = match unsafe {
-        prepared_executable(
-            path,
-            false,
-            arguments.cast::<*const libc::c_char>(),
-            ProcessOperation::PosixSpawn,
-        )
-    } {
-        Ok(prepared) => prepared,
-        Err(error) => return error.errno,
-    };
-    let Some(runtime) = ProcessHookRuntime::global() else {
-        return libc::EACCES;
-    };
-    let Some(environment) = (unsafe {
-        ChildEnvironment::new(
-            environment.cast::<*const libc::c_char>(),
-            &runtime.config,
-            &trace,
-            remote_current_directory.as_deref(),
-        )
-    }) else {
-        return libc::EACCES;
-    };
-    let Some(arguments) =
-        (unsafe { ChildArguments::new(arguments.cast::<*const libc::c_char>(), &prepared) })
-    else {
-        return libc::EACCES;
-    };
-    let file_actions = match unsafe { SpawnFileActions::prepare(file_actions, attributes) } {
-        Ok(file_actions) => file_actions,
-        Err(error) => return error,
-    };
-    let retained = match super::filesystem::retain_local_files_for_spawn(
-        environment.inherited_local_handles.clone(),
-    ) {
-        Ok(retained) => retained,
-        Err(error) => return PrepareError::from_anyhow(error, libc::EIO).errno,
-    };
-    drop(guard);
-    let result = unsafe {
-        original(
+    unsafe {
+        spawn(
             pid,
-            prepared.program.as_ptr(),
-            file_actions.as_ptr(),
+            path,
+            file_actions,
             attributes,
-            arguments.as_posix_ptr(),
-            environment.as_posix_ptr(),
+            arguments,
+            environment,
+            false,
         )
-    };
-    if result == 0 {
-        retained.commit();
-        return 0;
-    }
-    match retained.rollback() {
-        Ok(()) => result,
-        Err(error) => PrepareError::from_anyhow(error, libc::EIO).errno,
     }
 }
 
@@ -897,6 +852,28 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
     arguments: *const *mut libc::c_char,
     environment: *const *mut libc::c_char,
 ) -> libc::c_int {
+    unsafe {
+        spawn(
+            pid,
+            file,
+            file_actions,
+            attributes,
+            arguments,
+            environment,
+            true,
+        )
+    }
+}
+
+unsafe fn spawn(
+    pid: *mut libc::pid_t,
+    path: *const libc::c_char,
+    file_actions: *const libc::posix_spawn_file_actions_t,
+    attributes: *const libc::posix_spawnattr_t,
+    arguments: *const *mut libc::c_char,
+    environment: *const *mut libc::c_char,
+    search_path: bool,
+) -> libc::c_int {
     let Some(original) = original_posix_spawn() else {
         return libc::ENOSYS;
     };
@@ -907,12 +884,16 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
         Ok(directory) => directory,
         Err(error) => return PrepareError::from_anyhow(error, libc::EIO).errno,
     };
-    let (prepared, trace) = match unsafe {
+    let (prepared, trace, pending) = match unsafe {
         prepared_executable(
-            file,
-            true,
+            path,
+            search_path,
             arguments.cast::<*const libc::c_char>(),
-            ProcessOperation::PosixSpawnp,
+            if search_path {
+                ProcessOperation::PosixSpawnp
+            } else {
+                ProcessOperation::PosixSpawn
+            },
         )
     } {
         Ok(prepared) => prepared,
@@ -921,31 +902,40 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
     let Some(runtime) = ProcessHookRuntime::global() else {
         return libc::EACCES;
     };
+    let pending_environment = match pending.environment_entry() {
+        Ok(environment) => environment,
+        Err(error) => return report_process_attempt_error(runtime, &pending, error.errno),
+    };
+    let mut file_actions = match unsafe { SpawnFileActions::prepare(file_actions, attributes) } {
+        Ok(file_actions) => file_actions,
+        Err(error) => return report_process_attempt_error(runtime, &pending, error),
+    };
     let Some(environment) = (unsafe {
-        ChildEnvironment::new(
+        ChildEnvironment::with_inheritance(
             environment.cast::<*const libc::c_char>(),
             &runtime.config,
             &trace,
+            pending_environment.as_c_str(),
             remote_current_directory.as_deref(),
+            file_actions.local.environment.as_ref(),
         )
     }) else {
-        return libc::EACCES;
+        return report_process_attempt_error(runtime, &pending, libc::EACCES);
     };
     let Some(arguments) =
         (unsafe { ChildArguments::new(arguments.cast::<*const libc::c_char>(), &prepared) })
     else {
-        return libc::EACCES;
+        return report_process_attempt_error(runtime, &pending, libc::EACCES);
     };
-    let file_actions = match unsafe { SpawnFileActions::prepare(file_actions, attributes) } {
-        Ok(file_actions) => file_actions,
-        Err(error) => return error,
-    };
-    let retained = match super::filesystem::retain_local_files_for_spawn(
-        environment.inherited_local_handles.clone(),
-    ) {
-        Ok(retained) => retained,
-        Err(error) => return PrepareError::from_anyhow(error, libc::EIO).errno,
-    };
+    if file_actions.replaces_process
+        && let Err(error) = super::filesystem::flush_before_exec()
+    {
+        return report_process_attempt_error(
+            runtime,
+            &pending,
+            PrepareError::from_anyhow(error, libc::EIO).errno,
+        );
+    }
     drop(guard);
     let result = unsafe {
         original(
@@ -958,12 +948,21 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
         )
     };
     if result == 0 {
-        retained.commit();
+        if let Some(retained) = file_actions.local.retained.take() {
+            retained.commit();
+        }
         return 0;
     }
-    match retained.rollback() {
-        Ok(()) => result,
-        Err(error) => PrepareError::from_anyhow(error, libc::EIO).errno,
+    let rollback = file_actions
+        .local
+        .retained
+        .take()
+        .map_or(Ok(()), super::filesystem::SpawnLocalRetain::rollback)
+        .map_err(|error| PrepareError::from_anyhow(error, libc::EIO));
+    let publication = publish_process_attempt(runtime, &pending);
+    match (rollback, publication) {
+        (Err(error), _) | (Ok(()), Err(error)) => error.errno,
+        (Ok(()), Ok(())) => result,
     }
 }
 
@@ -1039,7 +1038,7 @@ unsafe fn execute(
             return -1;
         }
     };
-    let (prepared, trace) =
+    let (prepared, trace, pending) =
         match unsafe { prepared_executable(path, search_path, arguments, operation) } {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1051,25 +1050,29 @@ unsafe fn execute(
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };
+    let pending_environment = match pending.environment_entry() {
+        Ok(environment) => environment,
+        Err(error) => {
+            return unsafe { report_exec_failure(runtime, &pending, error.errno) };
+        }
+    };
     let Some(environment) = (unsafe {
         ChildEnvironment::new(
             environment,
             &runtime.config,
             &trace,
+            pending_environment.as_c_str(),
             remote_current_directory.as_deref(),
         )
     }) else {
-        unsafe { set_errno(libc::EACCES) };
-        return -1;
+        return unsafe { report_exec_failure(runtime, &pending, libc::EACCES) };
     };
     let Some(child_arguments) = (unsafe { ChildArguments::new(arguments, &prepared) }) else {
-        unsafe { set_errno(libc::EACCES) };
-        return -1;
+        return unsafe { report_exec_failure(runtime, &pending, libc::EACCES) };
     };
     if let Err(error) = super::filesystem::flush_before_exec() {
         let error = PrepareError::from_anyhow(error, libc::EIO);
-        unsafe { set_errno(error.errno) };
-        return -1;
+        return unsafe { report_exec_failure(runtime, &pending, error.errno) };
     }
     drop(guard);
     let result = unsafe {
@@ -1079,34 +1082,37 @@ unsafe fn execute(
             environment.as_exec_ptr(),
         )
     };
-    if !search_path || result != -1 || unsafe { *libc::__error() } != libc::ENOEXEC {
+    if result != -1 {
         return result;
     }
+    let native_errno = unsafe { *libc::__error() };
+    if !search_path || native_errno != libc::ENOEXEC {
+        return unsafe { report_exec_failure(runtime, &pending, native_errno) };
+    }
     let Some(fallback_guard) = ProcessHookGuard::enter() else {
-        unsafe { set_errno(libc::EACCES) };
-        return -1;
+        return unsafe { report_exec_failure(runtime, &pending, libc::EACCES) };
     };
     let shell = match runtime.prepare_executable(Path::new("/bin/sh")) {
         Ok(shell) => shell,
-        Err(error) => {
-            unsafe { set_errno(error.errno) };
-            return -1;
-        }
+        Err(error) => return unsafe { report_exec_failure(runtime, &pending, error.errno) },
     };
     let Some(arguments) =
         (unsafe { ChildArguments::shell_fallback(arguments, prepared.program.as_c_str()) })
     else {
-        unsafe { set_errno(libc::EACCES) };
-        return -1;
+        return unsafe { report_exec_failure(runtime, &pending, libc::EACCES) };
     };
     drop(fallback_guard);
-    unsafe {
+    let result = unsafe {
         original(
             shell.program.as_ptr(),
             arguments.as_exec_ptr(),
             environment.as_exec_ptr(),
         )
+    };
+    if result == -1 {
+        return unsafe { report_exec_failure(runtime, &pending, *libc::__error()) };
     }
+    result
 }
 
 unsafe fn current_environment() -> *const *const libc::c_char {
@@ -1122,10 +1128,6 @@ fn original_posix_spawn() -> Option<PosixSpawnFn> {
     function_from_interpose(&INTERPOSE_POSIX_SPAWN)
 }
 
-fn original_posix_spawn_file_actions_init() -> Option<PosixSpawnFileActionsInitFn> {
-    function_from_interpose(&INTERPOSE_POSIX_SPAWN_FILE_ACTIONS_INIT)
-}
-
 fn original_execve() -> Option<ExecveFn> {
     function_from_interpose(&INTERPOSE_EXECVE)
 }
@@ -1139,11 +1141,6 @@ dyld_interpose!(
     INTERPOSE_POSIX_SPAWNP,
     agora_sandbox_posix_spawnp,
     libc::posix_spawnp
-);
-dyld_interpose!(
-    INTERPOSE_POSIX_SPAWN_FILE_ACTIONS_INIT,
-    agora_sandbox_posix_spawn_file_actions_init,
-    libc::posix_spawn_file_actions_init
 );
 dyld_interpose!(INTERPOSE_EXECVE, agora_sandbox_execve, libc::execve);
 dyld_interpose!(INTERPOSE_EXECV, agora_sandbox_execv, libc::execv);

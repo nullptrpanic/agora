@@ -5,6 +5,34 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+
+int agora_sandbox_readonly_mapping(void *address, size_t length) {
+    mach_vm_address_t cursor = (mach_vm_address_t)address;
+    mach_vm_address_t end = cursor + length;
+    while (cursor < end) {
+        mach_vm_address_t region = cursor;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        kern_return_t result = mach_vm_region(mach_task_self(), &region, &size,
+            VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object);
+        if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+        if (result != KERN_SUCCESS || region > cursor || size == 0)
+            return -1;
+        mach_vm_address_t next = region + size;
+        if (next > end) next = end;
+        result = mach_vm_protect(mach_task_self(), cursor, next - cursor, TRUE,
+            info.max_protection & ~VM_PROT_WRITE);
+        if (result != KERN_SUCCESS) return -1;
+        cursor = next;
+    }
+    return 0;
+}
 
 typedef uint64_t guardid_t;
 
@@ -37,6 +65,8 @@ extern int agora_sandbox_fcntl_setfl_argument(int descriptor, int flags);
 extern int agora_sandbox_fcntl_commit_setfl(int descriptor, int flags);
 extern int agora_sandbox_validate_content_fcntl(int descriptor);
 extern int agora_sandbox_lock_descriptor(int descriptor);
+extern off_t agora_sandbox_lseek(int descriptor, off_t offset, int whence);
+extern int agora_sandbox_fstat(int descriptor, struct stat *status);
 extern int agora_sandbox_data_descriptor_requires_hook(int descriptor);
 extern const void *agora_sandbox_original_read(void);
 extern const void *agora_sandbox_original_pread(void);
@@ -640,6 +670,59 @@ int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
 #endif
     int operation_descriptor =
         lock_command ? agora_sandbox_lock_descriptor(descriptor) : descriptor;
+    if (lock_command && operation_descriptor != descriptor) {
+        va_list arguments;
+        va_start(arguments, command);
+        struct flock *argument = va_arg(arguments, struct flock *);
+        va_end(arguments);
+        struct flock request;
+        mach_vm_size_t copied = 0;
+        if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)argument,
+                sizeof(request), (mach_vm_address_t)&request, &copied) != KERN_SUCCESS
+            || copied != sizeof(request)) {
+            errno = EFAULT;
+            return -1;
+        }
+        int query = command == F_GETLK;
+#ifdef F_OFD_GETLK
+        query = query || command == F_OFD_GETLK;
+#endif
+        int flags = original_fcntl(descriptor, F_GETFL);
+        if (flags < 0) return -1;
+        flags = agora_sandbox_fcntl_getfl(descriptor, flags);
+        if (flags < 0) return -1;
+        if (!query && ((request.l_type == F_WRLCK && (flags & O_ACCMODE) == O_RDONLY)
+            || (request.l_type == F_RDLCK && (flags & O_ACCMODE) == O_WRONLY))) {
+            errno = EBADF;
+            return -1;
+        }
+        off_t base = 0;
+        if (request.l_whence == SEEK_CUR) {
+            base = agora_sandbox_lseek(descriptor, 0, SEEK_CUR);
+            if (base < 0) return -1;
+        } else if (request.l_whence == SEEK_END) {
+            struct stat status;
+            if (agora_sandbox_fstat(descriptor, &status) != 0) return -1;
+            base = status.st_size;
+        } else if (request.l_whence != SEEK_SET) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (__builtin_add_overflow(request.l_start, base, &request.l_start)) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        request.l_whence = SEEK_SET;
+        // No Rust guard or content lock survives across this potentially blocking call.
+        int result = original_fcntl(operation_descriptor, command, &request);
+        if (result == 0 && query
+            && mach_vm_write(mach_task_self(), (mach_vm_address_t)argument,
+                (vm_offset_t)&request, sizeof(request)) != KERN_SUCCESS) {
+            errno = EFAULT;
+            return -1;
+        }
+        return result;
+    }
     int duplicate_command = command == F_DUPFD || command == F_DUPFD_CLOEXEC;
     void *duplicate_transaction = duplicate_command
         ? agora_sandbox_begin_fcntl_duplicate(descriptor)

@@ -240,7 +240,6 @@ impl Server {
                         .context("local filesystem writeback task failed")??;
                 }
                 _ = expiry.tick() => {
-                    self.state.broker.expire_closed();
                     self.state.broker.expire_requests();
                 },
                 _ = writeback.tick(), if writebacks.is_empty() => {

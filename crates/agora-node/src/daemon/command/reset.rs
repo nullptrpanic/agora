@@ -21,12 +21,13 @@ impl ResetCommand {
 
     pub(super) fn command(&self) -> CommandNode<CommandHandler> {
         let command = self.clone();
-        CommandNode::new("reset", i18n::RESET_COMMAND_DESCRIPTION).handler(CommandHandler::new(
-            move |context, arguments| {
+        CommandNode::new("reset", i18n::RESET_COMMAND_DESCRIPTION).handler(
+            CommandHandler::new(move |context, arguments| {
                 let command = command.clone();
                 async move { command.reset(context, arguments).await }
-            },
-        ))
+            })
+            .control(),
+        )
     }
 
     async fn reset(
@@ -39,6 +40,7 @@ impl ResetCommand {
                 context.channel_identity(),
                 context.session_id(),
                 context.agents(),
+                &context.admission,
             )
             .await;
         Ok(Some(if failed.is_empty() {
@@ -53,6 +55,7 @@ impl ResetCommand {
         channel: &crate::store::ChannelIdentity,
         session_id: &str,
         agents: &[ConfiguredAgent],
+        admission: &crate::daemon::RouteAdmission,
     ) -> Vec<String> {
         let mut resets = agents
             .iter()
@@ -71,6 +74,7 @@ impl ResetCommand {
             .map(|(_, key, _, _)| key.clone())
             .collect::<Vec<_>>();
         self.scheduler.stop_session_keys(&keys);
+        admission.complete();
 
         let mut failed = Vec::new();
         while let Some((agent, key, store_key, barrier)) = resets.pop_front() {

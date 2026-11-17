@@ -34,6 +34,7 @@ fn run() -> Result<()> {
     }
     if inner_build {
         println!("cargo:rerun-if-changed=src/platform/macos/hook/filesystem/filesystem_shim.c");
+        println!("cargo:rerun-if-changed=src/platform/macos/hook/process/file_actions_shim.c");
     } else {
         println!("cargo:rerun-if-changed=src");
     }
@@ -55,6 +56,7 @@ fn run() -> Result<()> {
 fn compile_filesystem_shim() {
     cc::Build::new()
         .file("src/platform/macos/hook/filesystem/filesystem_shim.c")
+        .file("src/platform/macos/hook/process/file_actions_shim.c")
         .warnings(true)
         .compile("agora_sandbox_filesystem_shim");
 }

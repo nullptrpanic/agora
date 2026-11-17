@@ -1,4 +1,5 @@
 use super::{OverlayStore, SourceIdentity, StagedWrite, WriteReservation};
+use crate::filesystem::namespace;
 use crate::filesystem::{EntryState, FileAttributes, FileCipher, Materializer};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -107,7 +108,7 @@ fn encrypted_exclusive_reservation_is_removed_when_the_lease_cannot_open() {
         Some(libc::ENOENT)
     );
     let destination = fixture.store.file_destination(&logical, true).unwrap();
-    let lease = OverlayStore::write_lease_path(&destination).unwrap();
+    let lease = namespace::write_lease_path(&destination).unwrap();
     std::fs::create_dir(&lease).unwrap();
 
     assert!(fixture.store.stage_file_open(&logical, true, true).is_err());
@@ -119,7 +120,7 @@ fn encrypted_write_lease_rejects_a_symlink_without_touching_its_target() {
     let (fixture, _) = Fixture::encrypted();
     let logical = fixture.lower.join("symlinked-lease");
     let destination = fixture.store.file_destination(&logical, true).unwrap();
-    let lease = OverlayStore::write_lease_path(&destination).unwrap();
+    let lease = namespace::write_lease_path(&destination).unwrap();
     let external = fixture.directory.join("external-lease");
     std::fs::write(&external, b"external").unwrap();
     symlink(&external, &lease).unwrap();
@@ -894,7 +895,7 @@ fn encrypted_writeback_rejects_invalid_or_stale_lease_destinations() {
     let replaced_destination = fixture.store.root().join("replaced-current-lease");
     let held_lease = tempfile::tempfile().unwrap();
     OverlayStore::write_write_lease_destination(&held_lease, &replaced_destination).unwrap();
-    let current_lease = OverlayStore::write_lease_path(&replaced_destination).unwrap();
+    let current_lease = namespace::write_lease_path(&replaced_destination).unwrap();
     std::fs::write(
         &current_lease,
         replaced_destination.as_os_str().as_encoded_bytes(),
@@ -939,7 +940,7 @@ fn encrypted_namespace_leases_cover_file_directory_and_contention_paths() {
     let directory = fixture.store.root().join("lease-directory");
     std::fs::create_dir(&directory).unwrap();
     let child_destination = directory.join("child");
-    let child_lease_path = OverlayStore::write_lease_path(&child_destination).unwrap();
+    let child_lease_path = namespace::write_lease_path(&child_destination).unwrap();
     std::fs::write(
         &child_lease_path,
         child_destination.as_os_str().as_encoded_bytes(),
@@ -1177,10 +1178,9 @@ fn directory_view_keeps_lower_entries_lazy_and_tracks_whiteouts() {
     let view = fixture.store.directory_view(&fixture.lower).unwrap();
     let upper_names = std::fs::read_dir(view.primary())
         .unwrap()
-        .map(|entry| {
-            let name = entry.unwrap().file_name();
-            view.aliases().get(&name).cloned().unwrap_or(name)
-        })
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| !view.hidden_upper().contains(name))
+        .map(|name| view.aliases().get(&name).cloned().unwrap_or(name))
         .filter(|name| !view.hidden().contains(name))
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(upper_names.len(), 1);
@@ -1341,6 +1341,7 @@ fn case_only_file_rename_updates_the_physical_directory_entry() {
     let visible = std::fs::read_dir(view.primary())
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
+        .filter(|name| !view.hidden_upper().contains(name))
         .filter(|name| !view.hidden().contains(name))
         .collect::<std::collections::BTreeSet<_>>();
     assert!(visible.contains(target.file_name().unwrap()));
@@ -1411,7 +1412,7 @@ fn whiteout_reconciliation_cleans_an_interrupted_encrypted_unlink() {
     std::fs::write(&logical, b"lower").unwrap();
     let destination = fixture.store.prepare_write(&logical, false).unwrap();
     std::fs::write(&destination, b"upper").unwrap();
-    let lease = OverlayStore::write_lease_path(&destination).unwrap();
+    let lease = namespace::write_lease_path(&destination).unwrap();
     std::fs::write(&lease, destination.as_os_str().as_bytes()).unwrap();
     fixture
         .store
@@ -1816,6 +1817,57 @@ fn loader_image_preparation_respects_sandbox_whiteouts() {
 }
 
 #[test]
+fn unchanged_loader_trees_do_not_reread_bodies_but_revalidate_mutations() {
+    let fixture = Fixture::new();
+    let source = fixture.lower.join("Signed.framework");
+    std::fs::create_dir(&source).unwrap();
+    let original = vec![b'x'; 4 * 1024 * 1024];
+    std::fs::write(source.join("Signed"), &original).unwrap();
+    let destination = fixture.store.prepare_loader_tree(&source).unwrap();
+    // Allow the first reuse to validate the published destination's new identity.
+    fixture.store.prepare_loader_tree(&source).unwrap();
+    let before = fixture
+        .store
+        .tree_read_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let start = std::time::Instant::now();
+    for _ in 0..10 {
+        fixture.store.prepare_loader_tree(&source).unwrap();
+    }
+    let read = fixture
+        .store
+        .tree_read_bytes
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - before;
+    eprintln!(
+        "10 warm loader prepares: {:?}, body bytes read: {read}",
+        start.elapsed()
+    );
+    assert_eq!(
+        read, 0,
+        "unchanged trees should use metadata identities, not body reads"
+    );
+
+    let target = destination.join("Signed");
+    let timestamp = target.metadata().unwrap().modified().unwrap();
+    std::fs::write(&target, vec![b'y'; original.len()]).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&target)
+        .unwrap()
+        .set_modified(timestamp)
+        .unwrap();
+    fixture.store.prepare_loader_tree(&source).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), original);
+    std::fs::write(source.join("Added"), b"new resource").unwrap();
+    fixture.store.prepare_loader_tree(&source).unwrap();
+    assert_eq!(
+        std::fs::read(destination.join("Added")).unwrap(),
+        b"new resource"
+    );
+}
+
+#[test]
 fn loader_trees_are_clean_cached_wrappers_and_preserve_symlinks() {
     let fixture = Fixture::new();
     let source = fixture
@@ -2209,7 +2261,7 @@ fn overlay_handles_missing_cached_entries_cow_ancestors_and_type_errors() {
             .store
             .directory_view(Path::new("/"))
             .unwrap()
-            .hidden()
+            .hidden_upper()
             .contains(std::ffi::OsStr::new(".vfs.lock"))
     );
 }

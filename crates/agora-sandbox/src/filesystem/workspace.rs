@@ -1,5 +1,5 @@
 use super::{EncryptedWorkspace, FilesystemMode};
-#[cfg(not(agora_sandbox_hook_build))]
+#[cfg(all(not(agora_sandbox_hook_build), feature = "remote-smb"))]
 use super::{FileCipher, OverlayStore};
 use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions};
@@ -49,7 +49,7 @@ impl FilesystemWorkspace {
         }
     }
 
-    #[cfg(not(agora_sandbox_hook_build))]
+    #[cfg(all(not(agora_sandbox_hook_build), feature = "remote-smb"))]
     pub(crate) fn visible_directory(&self, path: &Path) -> Result<Option<bool>> {
         let overlay = match self {
             Self::Encrypted(workspace) => OverlayStore::encrypted(

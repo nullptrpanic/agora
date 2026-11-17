@@ -1,10 +1,10 @@
 use super::rich_message::TelegramRichMessage;
 use super::telegram_api::{TelegramApi, TelegramBotCommand, TelegramFileDownloadError};
-use crate::channel::permission::{AccessContext, PermissionDenial, PermissionGate};
+use crate::channel::permission::{AccessContext, PermissionGate};
 use crate::channel::{
     CHANNEL_ADMISSION_TIMEOUT, Channel, ChannelDelivery, ChannelReply, ChannelRun,
-    ChannelRunContext, ChannelTask, DeliveryDisposition, InterruptCallback, InterruptCallbacks,
-    InterruptRegistration, RunEvent,
+    ChannelRunContext, ChannelSender, ChannelTask, DeliveryDisposition, InterruptCallback,
+    InterruptCallbacks, InterruptRegistration, RunEvent,
 };
 #[cfg(test)]
 use crate::config::ChannelPermissionConfig;
@@ -25,6 +25,7 @@ const TELEGRAM_COMMANDS: &[TelegramBotCommand<'static>] = &[
     TelegramBotCommand::new("stop", i18n::STOP_COMMAND_DESCRIPTION),
     TelegramBotCommand::new("reset", i18n::RESET_COMMAND_DESCRIPTION),
     TelegramBotCommand::new("ask", i18n::ASK_COMMAND_DESCRIPTION),
+    TelegramBotCommand::new("agent", i18n::AGENT_COMMAND_DESCRIPTION),
     TelegramBotCommand::new("help", i18n::HELP_DESCRIPTION),
 ];
 
@@ -40,20 +41,11 @@ pub struct TelegramChannel {
     bot_username: Option<String>,
 }
 
-impl Clone for TelegramChannel {
-    fn clone(&self) -> Self {
-        Self {
-            api: self.api.clone(),
-            identity: self.identity.clone(),
-            permission: self.permission.clone(),
-            interrupts: self.interrupts.clone(),
-            pending_updates: VecDeque::new(),
-            pending_acknowledgement: None,
-            next_offset: None,
-            image_retry: None,
-            bot_username: None,
-        }
-    }
+#[derive(Clone)]
+pub struct TelegramChannelSender {
+    api: TelegramApi,
+    identity: ChannelIdentity,
+    interrupts: TelegramInterruptCallbacks,
 }
 
 #[derive(Clone)]
@@ -178,8 +170,7 @@ impl TelegramChannel {
                             let api = self.api.clone();
                             self.permission
                                 .admit(self.api.name(), &context, move |denial| async move {
-                                    let markdown =
-                                        TelegramChannel::render_permission_denial(&denial);
+                                    let markdown = denial.markdown();
                                     api.send_rich_message(&target, &markdown, None).await
                                 })
                                 .await
@@ -213,7 +204,7 @@ impl TelegramChannel {
                         if !self
                             .permission
                             .admit(self.api.name(), &context, move |denial| async move {
-                                let markdown = TelegramChannel::render_permission_denial(&denial);
+                                let markdown = denial.markdown();
                                 api.send_rich_message(&target, &markdown, None).await
                             })
                             .await
@@ -277,10 +268,15 @@ impl TelegramChannel {
     }
 
     async fn settle_pending_delivery(&mut self) {
-        let Some((update_id, acknowledged)) = self.pending_acknowledgement.take() else {
+        let Some((update_id, acknowledged)) = self.pending_acknowledgement.as_mut() else {
             return;
         };
-        match acknowledged.await.unwrap_or(DeliveryDisposition::Retry) {
+        // recv may be cancelled while another daemon task completes. Keep the
+        // receiver owned by the channel until its disposition can be applied.
+        let disposition = acknowledged.await.unwrap_or(DeliveryDisposition::Retry);
+        let update_id = *update_id;
+        self.pending_acknowledgement = None;
+        match disposition {
             DeliveryDisposition::Accepted => self.advance_offset(update_id),
             DeliveryDisposition::Retry => {
                 self.pending_updates.clear();
@@ -396,26 +392,6 @@ impl TelegramChannel {
         }
     }
 
-    pub(super) fn render_permission_denial(denial: &PermissionDenial) -> String {
-        let mut identifiers = vec![
-            format!("- Channel：`{}`", denial.channel_name()),
-            format!("- User ID：`{}`", denial.user_id()),
-        ];
-        if let Some(group_id) = denial.group_id() {
-            identifiers.push(format!("- Group ID：`{group_id}`"));
-        }
-        let configuration = denial.configuration_example();
-        format!(
-            "**{}**\n\n> {}\n\n**{}**\n{}\n\n**{}**\n```jsonc\n{}\n```",
-            i18n::PERMISSION_DENIED_TITLE,
-            denial.reason(),
-            i18n::PERMISSION_IDENTIFIERS_TITLE,
-            identifiers.join("\n"),
-            i18n::PERMISSION_CONFIG_EXAMPLE_TITLE,
-            configuration
-        )
-    }
-
     fn render_agent_status(agent: &crate::channel::ChannelAgentStatus) -> String {
         let (marker, state, description) = if agent.enabled() {
             ("🟢", i18n::AGENT_ENABLED, i18n::AGENT_ENABLED_DESCRIPTION)
@@ -435,7 +411,7 @@ impl TelegramChannel {
     }
 }
 
-impl Channel for TelegramChannel {
+impl ChannelSender for TelegramChannelSender {
     type Task = TelegramTask;
     type Run = TelegramRun;
 
@@ -445,10 +421,6 @@ impl Channel for TelegramChannel {
 
     fn identity(&self) -> ChannelIdentity {
         self.identity.clone()
-    }
-
-    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
-        self.next_delivery().await.map(Some)
     }
 
     async fn open_run(&self, task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
@@ -467,12 +439,45 @@ impl Channel for TelegramChannel {
 
     async fn reply(&self, task: &Self::Task, reply: ChannelReply) -> Result<()> {
         self.api
-            .send_rich_message(task.reply_target(), &Self::render_reply(&reply), None)
+            .send_rich_message(
+                task.reply_target(),
+                &TelegramChannel::render_reply(&reply),
+                None,
+            )
             .await?;
         Ok(())
     }
 }
 
+impl ChannelSender for TelegramChannel {
+    type Task = TelegramTask;
+    type Run = TelegramRun;
+    fn name(&self) -> &str {
+        self.api.name()
+    }
+    fn identity(&self) -> ChannelIdentity {
+        self.identity.clone()
+    }
+    async fn open_run(&self, task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
+        self.sender().open_run(task, context).await
+    }
+    async fn reply(&self, task: &Self::Task, reply: ChannelReply) -> Result<()> {
+        self.sender().reply(task, reply).await
+    }
+}
+impl Channel for TelegramChannel {
+    type Sender = TelegramChannelSender;
+    fn sender(&self) -> Self::Sender {
+        TelegramChannelSender {
+            api: self.api.clone(),
+            identity: self.identity.clone(),
+            interrupts: self.interrupts.clone(),
+        }
+    }
+    async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
+        self.next_delivery().await.map(Some)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct TelegramReplyTarget {
     pub(super) chat_id: i64,

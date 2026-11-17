@@ -223,7 +223,13 @@ fn authorized_open_preserves_logical_chmod_during_plain_copy_up() {
         0o644
     );
     assert_eq!(
-        filesystem.attributes(&logical).unwrap().unwrap().mode & 0o777,
+        filesystem
+            .overlay
+            .attributes(&logical)
+            .unwrap()
+            .unwrap()
+            .mode
+            & 0o777,
         0o644
     );
     std::fs::OpenOptions::new()
@@ -338,7 +344,10 @@ fn authorized_rename_and_chmod_leave_state_unchanged_on_denial() {
         .unwrap_err();
     assert_eq!(errno(&error), Some(libc::EPERM));
     assert_eq!(filesystem.transaction_count_for_test() - before, 1);
-    assert_eq!(filesystem.attributes(&source).unwrap(), Some(foreign));
+    assert_eq!(
+        filesystem.overlay.attributes(&source).unwrap(),
+        Some(foreign)
+    );
 
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(parent).unwrap();
@@ -556,6 +565,77 @@ fn encrypted_writes_to_special_files_remain_passthrough() {
 
     assert_eq!(filesystem.state_for_test(logical).unwrap(), None);
     assert!(filesystem.exists(logical).unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn encrypted_long_names_round_trip_through_content_and_namespace_operations() {
+    use std::os::unix::ffi::OsStrExt;
+    let (root, filesystem) = fixture("long-names");
+    let directory = Path::new("/tmp/agora-long-names");
+    filesystem.create_directory(directory, 0o700).unwrap();
+    for name in [
+        "x".repeat(146),
+        "x".repeat(147),
+        "x".repeat(160),
+        "x".repeat(161),
+        "x".repeat(255),
+        "汉".repeat(85),
+        format!("enc_{}", "x".repeat(251)),
+    ] {
+        let logical = directory.join(&name);
+        let mut prepared = filesystem
+            .prepare_open(&logical, libc::O_CREAT | libc::O_RDWR, 0o600)
+            .unwrap();
+        let OpenTarget::Descriptor(file) = prepared.target_mut() else {
+            panic!("expected encrypted descriptor")
+        };
+        file.write_all(b"contents").unwrap();
+        filesystem.commit_open(&mut prepared).unwrap();
+        let (_, writeback, _) = prepared.into_parts();
+        filesystem.commit_writeback(&writeback.unwrap()).unwrap();
+        let backing = filesystem.prepare_read(&logical).unwrap();
+        assert_eq!(
+            filesystem
+                .directory_view(directory)
+                .unwrap()
+                .aliases()
+                .get(backing.file_name().unwrap())
+                .map(|name| name.as_os_str()),
+            logical.file_name()
+        );
+        assert!(backing.file_name().unwrap().as_bytes().len() <= 255);
+        let metadata = std::fs::read(backing.parent().unwrap().join(".metadata")).unwrap();
+        assert!(
+            !metadata
+                .windows(name.len())
+                .any(|bytes| bytes == name.as_bytes())
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
+        assert!(
+            metadata["entries"]
+                .get(backing.file_name().unwrap().to_str().unwrap())
+                .is_some()
+        );
+        let mut reopened = filesystem
+            .prepare_open(&logical, libc::O_RDONLY, 0)
+            .unwrap();
+        let OpenTarget::Descriptor(file) = reopened.target_mut() else {
+            panic!("expected encrypted descriptor")
+        };
+        let mut content = Vec::new();
+        file.read_to_end(&mut content).unwrap();
+        assert_eq!(content, b"contents");
+        drop(reopened);
+        let renamed = directory.join("renamed");
+        filesystem.rename(&logical, &renamed).unwrap();
+        assert!(filesystem.prepare_read(&logical).is_err());
+        filesystem.rename(&renamed, &logical).unwrap();
+        assert!(filesystem.prepare_read(&logical).is_ok());
+        filesystem.remove(&logical, false).unwrap();
+        assert!(filesystem.prepare_read(&logical).is_err());
+    }
+    drop(filesystem);
     std::fs::remove_dir_all(root).unwrap();
 }
 

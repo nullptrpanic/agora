@@ -40,6 +40,7 @@ fn completed(outcome: AgentRunOutcome) -> AgentOutcome {
 mod codex;
 mod control;
 mod custom;
+mod images;
 
 fn agent(
     agent_type: AgentType,
@@ -64,20 +65,8 @@ fn agent(
 
 #[test]
 fn configured_agent_rejects_unimplemented_one_shot_backends() {
-    let workspace = tempfile::tempdir().unwrap();
-    for (agent_type, expected) in [
-        (AgentType::Coco, "coco agent execution is not implemented"),
-        (
-            AgentType::ClaudeCode,
-            "claude code agent execution is not implemented",
-        ),
-    ] {
-        let result =
-            ConfiguredAgent::from_config(agent(agent_type, "/bin/false", workspace.path()));
-        let Err(error) = result else {
-            panic!("unimplemented agent backend unexpectedly succeeded");
-        };
-        assert!(error.to_string().contains(expected));
+    for kind in ["coco", "claude_code"] {
+        assert!(serde_json::from_value::<AgentType>(serde_json::json!(kind)).is_err());
     }
 }
 

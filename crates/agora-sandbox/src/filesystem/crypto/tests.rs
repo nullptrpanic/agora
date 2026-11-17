@@ -99,6 +99,40 @@ fn encrypted_file_supports_sparse_extension_and_truncation() {
 }
 
 #[test]
+fn encrypted_reopen_preserves_ciphertext_before_its_length_header_is_published() {
+    use std::os::unix::fs::FileExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("encrypted");
+    let cipher = FileCipher::derive(b"workspace key", b"0123456789abcdef").unwrap();
+    cipher
+        .encrypt(&mut tempfile::tempfile().unwrap(), &path)
+        .unwrap();
+    let old_header = std::fs::read(&path).unwrap();
+    let mut writer = cipher.open_file(&path).unwrap();
+    let expected = vec![b'x'; super::PLAINTEXT_BLOCK_SIZE];
+    writer.write_at(&expected, 0).unwrap();
+    let published = std::fs::read(&path).unwrap();
+
+    // Recreate the valid intermediate state between write_block and
+    // commit_length without relying on thread scheduling.
+    writer.backing_file().write_all_at(&old_header, 0).unwrap();
+    let before_open = std::fs::read(&path).unwrap();
+    let reader = cipher.open_file(&path).unwrap();
+    assert_eq!(reader.len(), 0);
+    assert_eq!(std::fs::read(&path).unwrap(), before_open);
+
+    writer
+        .backing_file()
+        .write_all_at(&published[..old_header.len()], 0)
+        .unwrap();
+    let reader = cipher.open_file(&path).unwrap();
+    let mut actual = vec![0; expected.len()];
+    assert_eq!(reader.read_at(&mut actual, 0).unwrap(), actual.len());
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn encrypted_file_authenticates_each_random_access_block() {
     let root = temporary_directory("block-authentication");
     let encrypted = root.join("encrypted");
@@ -286,7 +320,14 @@ fn decryption_rejects_malformed_headers_and_incomplete_blocks() {
         .write_all(b"trailing bytes")
         .unwrap();
     assert!(std::fs::metadata(&trailing).unwrap().len() > expected_length);
-    drop(cipher.open_file(&trailing).unwrap());
+    let before_open = std::fs::read(&trailing).unwrap();
+    let mut opened = cipher.open_file(&trailing).unwrap();
+    assert_eq!(std::fs::read(&trailing).unwrap(), before_open);
+    let mut restored = [0_u8; 8];
+    assert_eq!(opened.read_at(&mut restored, 0).unwrap(), 8);
+    assert_eq!(&restored, b"contents");
+    // Only an explicit mutation, never a reader, may discard physical tail bytes.
+    opened.set_len(7).unwrap();
     assert_eq!(std::fs::metadata(&trailing).unwrap().len(), expected_length);
 
     let incomplete_header = root.join("incomplete-header");

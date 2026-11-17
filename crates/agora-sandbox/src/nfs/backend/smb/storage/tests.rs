@@ -14,8 +14,8 @@ use smb2::msg::create::{CreateAction, CreateDisposition, CreateResponse, ShareAc
 use smb2::msg::header::Header;
 use smb2::pack::FileTime;
 use smb2::types::flags::FileAccessMask;
-use smb2::types::{Command, FileId, OplockLevel, TreeId, status::NtStatus};
-use smb2::{Error, ErrorKind, Frame, Tree};
+use smb2::types::{Command, FileId, OplockLevel, status::NtStatus};
+use smb2::{Error, ErrorKind, Frame};
 
 fn assert_errno<T>(result: StorageResult<T>, expected: libc::c_int) {
     match result {
@@ -79,13 +79,11 @@ fn smb_paths_are_root_relative_and_never_escape_the_configured_prefix() {
 
 #[test]
 fn smb_metadata_uses_stable_remote_identity_fields() {
-    let info = FileInfo {
-        size: 42,
-        is_directory: false,
-        created: FileTime(133_485_408_000_000_000),
-        modified: FileTime(133_485_408_001_234_567),
-        accessed: FileTime(133_485_408_002_000_000),
-    };
+    let mut info = FileInfo::default();
+    info.size = 42;
+    info.created = FileTime(133_485_408_000_000_000);
+    info.modified = FileTime(133_485_408_001_234_567);
+    info.accessed = FileTime(133_485_408_002_000_000);
 
     let metadata = metadata_from_file(&info);
 
@@ -101,23 +99,11 @@ fn smb_metadata_uses_stable_remote_identity_fields() {
 
 #[test]
 fn smb_connection_probe_requires_the_configured_remote_path_to_be_a_directory() {
-    let directory = FileInfo {
-        size: 0,
-        is_directory: true,
-        created: FileTime(0),
-        modified: FileTime(0),
-        accessed: FileTime(0),
-    };
+    let mut directory = FileInfo::default();
+    directory.is_directory = true;
     validate_remote_root(Ok(directory)).unwrap();
 
-    let file = FileInfo {
-        size: 0,
-        is_directory: false,
-        created: FileTime(0),
-        modified: FileTime(0),
-        accessed: FileTime(0),
-    };
-    assert_errno(validate_remote_root(Ok(file)), libc::ENOTDIR);
+    assert_errno(validate_remote_root(Ok(FileInfo::default())), libc::ENOTDIR);
     assert_errno(
         validate_remote_root(Err(Error::Protocol {
             status: NtStatus::OBJECT_NAME_NOT_FOUND,
@@ -170,15 +156,10 @@ fn smb_rename_information_requests_atomic_target_replacement() {
     assert_eq!(create[0], 0, "new files must not replace a raced target");
 }
 
-#[test]
-fn smb_rename_opens_both_files_and_directories() {
-    let tree = Tree {
-        tree_id: TreeId(7),
-        share_name: "share".to_string(),
-        server: "server:445".to_string(),
-        is_dfs: false,
-        encrypt_data: false,
-    };
+#[tokio::test]
+async fn smb_rename_opens_both_files_and_directories() {
+    let (session, _mock) = mock::session().await;
+    let tree = session.tree;
     let request = build_open_request(
         &tree,
         "folder",
@@ -380,8 +361,8 @@ async fn smb_storage_propagates_connection_failures_for_every_remote_operation()
     assert!(storage.rename(&path, &renamed).await.is_err());
 }
 
-#[test]
-fn smb_root_and_wire_paths_keep_backend_details_inside_the_backend() {
+#[tokio::test]
+async fn smb_root_and_wire_paths_keep_backend_details_inside_the_backend() {
     let config = SmbRemoteConfig::new("/remote", "server", "share")
         .unwrap()
         .with_remote_path("base/team")
@@ -393,13 +374,9 @@ fn smb_root_and_wire_paths_keep_backend_details_inside_the_backend() {
         "base/team/child.txt"
     );
 
-    let mut tree = Tree {
-        tree_id: TreeId(7),
-        share_name: "share".to_string(),
-        server: "server:445".to_string(),
-        is_dfs: false,
-        encrypt_data: false,
-    };
+    let (session, _mock) = mock::session().await;
+    let mut tree = session.tree;
+    tree.server = "server:445".to_string();
     assert_eq!(wire_path(&tree, "folder/file.txt"), "folder\\file.txt");
     tree.is_dfs = true;
     assert_eq!(wire_path(&tree, ""), "server\\share");
@@ -488,7 +465,7 @@ fn smb_frame_and_error_translation_covers_protocol_and_transport_failures() {
         (
             Error::FileTooLargeForSingleRead {
                 size: u64::MAX,
-                max_read: 1,
+                requested: 1,
             },
             libc::EFBIG,
         ),

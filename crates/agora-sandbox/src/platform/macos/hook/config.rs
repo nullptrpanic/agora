@@ -1,3 +1,4 @@
+use crate::audit::PENDING_PROCESS_EVENT_ENVIRONMENT;
 use crate::network::client_trust::JAVA_TRUST_STORE_ENVIRONMENT;
 use crate::trace::{TRACE_ID_ENVIRONMENT, TraceContext};
 use base64::Engine;
@@ -43,7 +44,7 @@ const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 6] = [
     "GIT_SSL_CAINFO",
 ];
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 34] = [
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 35] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
@@ -71,6 +72,7 @@ pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 34] = [
     TLS_TRUST_ANCHOR_DER,
     TLS_TRUST_BUNDLE,
     JAVA_TRUST_STORE_ENVIRONMENT,
+    PENDING_PROCESS_EVENT_ENVIRONMENT,
     TRACE_ID_ENVIRONMENT,
     TLS_CLIENT_TRUST_ENVIRONMENT[0],
     TLS_CLIENT_TRUST_ENVIRONMENT[1],
@@ -492,6 +494,25 @@ impl HookConfig {
 }
 
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+pub(super) unsafe fn clear_startup_variable(key: &str) {
+    // Only used by the pre-main initializer. unsetenv compacts the original
+    // envp array, displacing the following Apple vector for runtimes such as Go
+    // that locate it through argv. Empty (non-null) slots hide the key without
+    // changing that layout or exposing it through a copied original envp.
+    let mut entry = unsafe { *libc::_NSGetEnviron() };
+    while !unsafe { *entry }.is_null() {
+        let bytes = unsafe { std::ffi::CStr::from_ptr(*entry) }.to_bytes();
+        if bytes
+            .strip_prefix(key.as_bytes())
+            .is_some_and(|suffix| suffix.starts_with(b"="))
+        {
+            unsafe { *entry = c"".as_ptr().cast_mut() };
+        }
+        entry = unsafe { entry.add(1) };
+    }
+}
+
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
 pub(super) fn initialize() -> Result<(), String> {
     if global_result()?.is_some() {
         for key in [
@@ -512,7 +533,7 @@ pub(super) fn initialize() -> Result<(), String> {
             LOCAL_CONTROL_DESCRIPTOR,
             REMOTE_CONTROL_DESCRIPTOR,
         ] {
-            unsafe { std::env::remove_var(key) };
+            unsafe { clear_startup_variable(key) };
         }
     }
     Ok(())

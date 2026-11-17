@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+mod images;
+use images::CodexImages;
+
 #[derive(Clone)]
 pub(super) struct CodexAgent {
     name: String,
@@ -146,14 +149,21 @@ impl Agent for CodexAgent {
     where
         O: AgentOutput + Send,
     {
+        let images = CodexImages::prepare(
+            request.workdir.clone(),
+            request.session_id.as_deref(),
+            &self.env,
+        )
+        .await;
         let PreparedCommand {
             command,
             resume_requested,
             _attachment_dir,
         } = self.command(request)?;
-        let mut command_output = CodexCommandOutput::new(&self.name, output, resume_requested);
+        let mut command_output =
+            CodexCommandOutput::new(&self.name, output, resume_requested, images);
         let outcome = command.run(&mut command_output).await?;
-        let session_update = if command_output.session_not_found() {
+        let session_update = if command_output.session_not_found(outcome.exit_code()) {
             AgentSessionUpdate::NotFound
         } else if let Some(next_session_id) = command_output.take_session_id() {
             logger::info!("agent session observed agent={}", self.name);
@@ -219,26 +229,35 @@ struct CodexCommandOutput<'a, O> {
     output: &'a mut O,
     stdout_buffer: Vec<u8>,
     stderr_buffer: Vec<u8>,
+    stderr_truncated: bool,
     session_id: Option<String>,
     pending_message: Option<PendingAgentMessage>,
     resume_requested: bool,
-    session_not_found: bool,
+    stdout_observed: bool,
+    images: CodexImages,
 }
 
 impl<'a, O> CodexCommandOutput<'a, O>
 where
     O: AgentOutput + Send,
 {
-    fn new(agent_name: &'a str, output: &'a mut O, resume_requested: bool) -> Self {
+    fn new(
+        agent_name: &'a str,
+        output: &'a mut O,
+        resume_requested: bool,
+        images: CodexImages,
+    ) -> Self {
         Self {
             agent_name,
             output,
             stdout_buffer: Vec::new(),
             stderr_buffer: Vec::new(),
+            stderr_truncated: false,
             session_id: None,
             pending_message: None,
             resume_requested,
-            session_not_found: false,
+            stdout_observed: false,
+            images,
         }
     }
 
@@ -246,11 +265,18 @@ where
         self.session_id.take()
     }
 
-    fn session_not_found(&self) -> bool {
-        self.session_not_found
+    fn session_not_found(&self, exit_code: i32) -> bool {
+        // A resume rejection happens before the JSONL execution stream starts.
+        // Once any stdout is observed, replaying may repeat user side effects.
+        self.resume_requested
+            && exit_code != 0
+            && !self.stdout_observed
+            && !self.stderr_truncated
+            && missing_resume_session_message(&String::from_utf8_lossy(&self.stderr_buffer))
     }
 
     async fn push_stdout(&mut self, chunk: &[u8]) -> Result<()> {
+        self.stdout_observed |= !chunk.is_empty();
         self.stdout_buffer.extend_from_slice(chunk);
         while let Some(newline) = self.stdout_buffer.iter().position(|byte| *byte == b'\n') {
             let mut line = self.stdout_buffer.drain(..=newline).collect::<Vec<_>>();
@@ -271,37 +297,26 @@ where
         self.handle_line(&String::from_utf8_lossy(&line)).await
     }
 
-    async fn flush_stderr(&mut self) -> Result<()> {
-        if self.stderr_buffer.is_empty() {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&self.stderr_buffer).into_owned();
-        if self.resume_requested && missing_session_message(&stderr) {
-            self.session_not_found = true;
-            return Ok(());
-        }
-        logger::error!(
-            "codex stderr agent={}: {}",
-            self.agent_name,
-            stderr.trim_end()
-        );
-        Ok(())
-    }
-
     async fn publish_pending_message(&mut self, final_answer: bool) -> Result<()> {
         let Some(message) = self.pending_message.take() else {
             return Ok(());
         };
-        let event = if final_answer {
-            OutputEvent::Answer { text: message.text }
-        } else {
-            OutputEvent::Progress {
-                id: message.id,
-                text: Self::concise(&message.text, 240),
-                status: ProgressStatus::Completed,
+        if final_answer {
+            let (text, images) = self.images.markdown(message.text).await;
+            self.output.write(OutputEvent::Answer { text }).await?;
+            for image in images {
+                self.output.write(image).await?;
             }
-        };
-        self.output.write(event).await
+            Ok(())
+        } else {
+            self.output
+                .write(OutputEvent::Progress {
+                    id: message.id,
+                    text: Self::concise(&message.text, 240),
+                    status: ProgressStatus::Completed,
+                })
+                .await
+        }
     }
 
     async fn handle_item(&mut self, event_type: &str, item: &Value) -> Result<()> {
@@ -390,6 +405,11 @@ where
                     Self::progress_status(event_type, item),
                 )
                 .await?;
+                if event_type == "item.completed" {
+                    for image in self.images.mcp_images(item) {
+                        self.output.write(image).await?;
+                    }
+                }
             }
             "web_search" => {
                 let query = item
@@ -490,6 +510,14 @@ where
         match event.get("type").and_then(Value::as_str) {
             Some("thread.started") => {
                 if let Some(thread_id) = event.get("thread_id").and_then(Value::as_str) {
+                    if thread_id.trim().is_empty() {
+                        bail!("codex reported an empty session id");
+                    }
+                    if self.session_id.as_deref().is_some_and(|id| id != thread_id) {
+                        bail!("codex changed session id during execution");
+                    }
+                    self.output.session_started(thread_id)?;
+                    self.images.session_started(thread_id);
                     self.session_id = Some(thread_id.to_string());
                 }
             }
@@ -500,6 +528,9 @@ where
             }
             Some("turn.completed") => {
                 self.publish_pending_message(true).await?;
+                for image in self.images.native_images().await {
+                    self.output.write(image).await?;
+                }
                 if let Some(usage) = Self::token_usage(&event) {
                     self.output.write(OutputEvent::Usage(usage)).await?;
                 }
@@ -523,6 +554,19 @@ where
     }
 }
 
+fn missing_resume_session_message(message: &str) -> bool {
+    message.lines().any(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        let Some(error) = line.strip_prefix("error: ") else {
+            return false;
+        };
+        error
+            .strip_prefix("thread/resume failed: ")
+            .unwrap_or(error)
+            .starts_with("no rollout found for thread id ")
+    })
+}
+
 fn missing_session_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("no rollout found for thread id")
@@ -544,13 +588,28 @@ where
     }
 
     async fn stderr(&mut self, chunk: &[u8]) -> Result<()> {
+        // Log while the process is alive: cancellation and timeouts skip finish().
+        logger::error!(
+            "codex stderr agent={}: {}",
+            self.agent_name,
+            String::from_utf8_lossy(chunk)
+        );
         self.stderr_buffer.extend_from_slice(chunk);
+        const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+        if self.stderr_buffer.len() > MAX_DIAGNOSTIC_BYTES {
+            self.stderr_truncated = true;
+            let excess = self.stderr_buffer.len() - MAX_DIAGNOSTIC_BYTES;
+            self.stderr_buffer.drain(..excess);
+        }
         Ok(())
     }
 
     async fn finish(&mut self) -> Result<()> {
         self.flush_stdout().await?;
         self.publish_pending_message(true).await?;
-        self.flush_stderr().await
+        for image in self.images.native_images().await {
+            self.output.write(image).await?;
+        }
+        Ok(())
     }
 }

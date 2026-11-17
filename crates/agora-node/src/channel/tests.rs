@@ -1,5 +1,25 @@
 use super::*;
-use crate::config::{LarkChannelConfig, NamedChannelConfig, TelegramChannelConfig};
+
+#[test]
+fn image_delivery_claims_are_deduplicated_and_bounded() {
+    let image = OutputImage::new(b"\x89PNG\r\n\x1a\nfixture".to_vec()).unwrap();
+    let mut deliveries = ImageDeliveries::default();
+    for index in 0..MAX_OUTPUT_IMAGES {
+        assert!(deliveries.admit(&index.to_string(), &image).unwrap());
+        assert!(!deliveries.admit(&index.to_string(), &image).unwrap());
+    }
+    assert!(deliveries.admit("excess", &image).is_err());
+    let mut bytes = vec![0; crate::task::MAX_OUTPUT_IMAGE_BYTES];
+    bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    let image = OutputImage::new(bytes).unwrap();
+    let mut deliveries = ImageDeliveries::default();
+    for index in 0..3 {
+        assert!(deliveries.admit(&index.to_string(), &image).unwrap());
+    }
+    assert!(deliveries.admit("too-large", &image).is_err());
+    assert_eq!(deliveries.ids.len(), 3);
+}
+use crate::config::{LarkChannelConfig, TelegramChannelConfig};
 
 #[tokio::test]
 async fn channel_delivery_accepts_the_source_exactly_once() {
@@ -37,7 +57,7 @@ async fn unresolved_channel_delivery_requests_retry_after_mapping() {
 
 #[test]
 fn channel_value_objects_expose_buttons_statuses_replies_and_callbacks() {
-    let command = CommandRequest::new(["ask", "enable"]).with_argument("agent_name", "reviewer");
+    let command = CommandRequest::new(["agent", "enable"]).with_argument("agent_name", "reviewer");
     for style in [
         ChannelButtonStyle::Default,
         ChannelButtonStyle::Primary,
@@ -73,29 +93,12 @@ fn channel_value_objects_expose_buttons_statuses_replies_and_callbacks() {
 
 #[test]
 fn configured_channels_reject_unimplemented_types_and_keep_configured_names() {
-    assert!(
-        ConfiguredChannel::from_config(ChannelConfig::Local(NamedChannelConfig {
-            name: "local".to_string(),
-            permission: Default::default(),
-            proxy: None,
-        }))
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("not implemented")
-    );
-    assert!(
-        ConfiguredChannel::from_config(ChannelConfig::Http(NamedChannelConfig {
-            name: "http".to_string(),
-            permission: Default::default(),
-            proxy: None,
-        }))
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("not implemented")
-    );
-
+    for kind in ["local", "http"] {
+        assert!(
+            serde_json::from_value::<ChannelConfig>(serde_json::json!({"type":kind,"name":"test"}))
+                .is_err()
+        );
+    }
     let lark = ConfiguredChannel::from_config(ChannelConfig::Lark(LarkChannelConfig {
         name: "lark".to_string(),
         app_id: "app-id".to_string(),
@@ -103,7 +106,6 @@ fn configured_channels_reject_unimplemented_types_and_keep_configured_names() {
         permission: Default::default(),
         proxy: None,
     }))
-    .unwrap()
     .unwrap();
     assert_eq!(lark.name(), "lark");
 
@@ -113,7 +115,6 @@ fn configured_channels_reject_unimplemented_types_and_keep_configured_names() {
         permission: Default::default(),
         proxy: None,
     }))
-    .unwrap()
     .unwrap();
     assert_eq!(telegram.name(), "telegram");
 }

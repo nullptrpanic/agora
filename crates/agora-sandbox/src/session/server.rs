@@ -118,6 +118,7 @@ where
         failure: failure_receiver,
     };
     let mut connections = JoinSet::new();
+    let mut preparations = JoinSet::new();
     let first_client = tokio::time::sleep(FIRST_CLIENT_TIMEOUT);
     tokio::pin!(first_client);
     let mut saw_client = false;
@@ -130,12 +131,14 @@ where
             Accepted(std::io::Result<(UnixStream, tokio::net::unix::SocketAddr)>),
             Connection(Option<std::result::Result<Result<()>, tokio::task::JoinError>>),
             Prepare(Option<PrepareRequest>),
+            Prepared(Option<std::result::Result<(), tokio::task::JoinError>>),
             Event(Option<SessionEvent>),
             Runtime(anyhow::Error),
             FirstClientTimeout,
         }
         let completion = tokio::select! {
-            request = prepare_receiver.recv() => Completion::Prepare(request),
+            request = prepare_receiver.recv(), if preparations.is_empty() => Completion::Prepare(request),
+            result = preparations.join_next(), if !preparations.is_empty() => Completion::Prepared(result),
             event = event_receiver.recv() => Completion::Event(event),
             result = connections.join_next(), if !connections.is_empty() => {
                 Completion::Connection(result)
@@ -160,13 +163,26 @@ where
                 break;
             }
             Completion::Prepare(Some(request)) => {
-                let result = runtime
-                    .prepare(request.executable)
-                    .await
-                    .map(|launch| WirePreparedLaunch::from(&launch))
-                    .map_err(|error| format!("{error:#}"));
-                let _ = request.response.send(result);
+                if !request.response.is_closed() {
+                    let preparing = runtime.prepare(request.executable);
+                    preparations.spawn(async move {
+                        let result = preparing
+                            .await
+                            .map(|launch| WirePreparedLaunch::from(&launch))
+                            .map_err(|error| format!("{error:#}"));
+                        let _ = request.response.send(result);
+                    });
+                }
             }
+            Completion::Prepared(Some(Ok(()))) => {}
+            Completion::Prepared(Some(Err(error))) => {
+                let error =
+                    anyhow::Error::from(error).context("sandbox session preparation task failed");
+                let _ = failure_sender.send(Some(format!("{error:#}")));
+                runtime_failure = Some(error);
+                break;
+            }
+            Completion::Prepared(None) => unreachable!("non-empty preparation task set was empty"),
             Completion::Prepare(None) => {
                 runtime_failure = Some(anyhow!("sandbox session prepare channel closed"));
                 break;
@@ -234,6 +250,7 @@ where
     drop(listener);
     drop(socket);
     drop(prepare_sender);
+    drop(prepare_receiver);
     drop(event_sender);
     if runtime_failure.is_some() {
         let deadline = tokio::time::sleep(Duration::from_secs(2));
@@ -251,6 +268,13 @@ where
                 }
                 else => break,
             }
+        }
+    }
+    // A started spawn_blocking preparation cannot be aborted. Drain it before
+    // releasing the workspace and controller-owned descriptors it depends on.
+    while let Some(result) = preparations.join_next().await {
+        if let Err(error) = result {
+            runtime_failure.get_or_insert_with(|| error.into());
         }
     }
     let shutdown = runtime.shutdown().await;
@@ -324,16 +348,18 @@ async fn handle_connection(mut stream: UnixStream, context: ConnectionContext) -
         .send(SessionEvent::Joined)
         .await
         .context("sandbox session owner stopped")?;
-    write_frame(
-        &mut stream,
-        &ServerMessage::Joined {
-            sandbox_id: sandbox_id.to_string(),
-            run_id: run_id.to_string(),
-        },
-    )
-    .await?;
-
-    let result = handle_joined_connection(&mut stream, &prepare, &events, &mut failure).await;
+    let result = async {
+        write_frame(
+            &mut stream,
+            &ServerMessage::Joined {
+                sandbox_id: sandbox_id.to_string(),
+                run_id: run_id.to_string(),
+            },
+        )
+        .await?;
+        handle_joined_connection(&mut stream, &prepare, &events, &mut failure).await
+    }
+    .await;
     match result {
         Ok(ConnectionCompletion::Released | ConnectionCompletion::RuntimeFailed) => Ok(()),
         Ok(ConnectionCompletion::Abandoned) => {
@@ -377,9 +403,20 @@ async fn handle_joined_connection(
         })
         .await
         .context("sandbox session owner stopped")?;
-    let prepared = receiver
-        .await
-        .context("sandbox session prepare response was dropped")?;
+    let prepared = tokio::select! {
+        result = receiver => result.context("sandbox session prepare response was dropped")?,
+        changed = failure.changed() => {
+            changed.context("sandbox session runtime monitor stopped")?;
+            let message = failure.borrow().clone().context("missing sandbox session runtime failure")?;
+            write_frame(stream, &ServerMessage::RuntimeFailed { message }).await?;
+            return Ok(ConnectionCompletion::RuntimeFailed);
+        }
+        _ = read_frame::<_, ClientMessage>(stream) => {
+            // No next protocol message is valid before Prepared. EOF (including
+            // a client's prepare timeout) must release its lease promptly.
+            return Ok(ConnectionCompletion::Abandoned);
+        }
+    };
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(message) => {
@@ -511,6 +548,152 @@ impl Drop for SocketGuard {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[tokio::test]
+    async fn pending_prepare_observes_runtime_failure_and_client_disconnect() {
+        for disconnect in [false, true] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let (prepare, mut requests) = mpsc::channel(MAX_CONNECTIONS);
+            let (events, _event_receiver) = mpsc::channel(MAX_CONNECTIONS);
+            let (failed, mut failure) = watch::channel(None);
+            let handler = tokio::spawn(async move {
+                handle_joined_connection(&mut server, &prepare, &events, &mut failure).await
+            });
+            write_frame(
+                &mut client,
+                &ClientMessage::Prepare {
+                    executable: super::super::protocol::WireOsString::from(
+                        std::ffi::OsString::from("/usr/bin/true"),
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+            let request = requests.recv().await.unwrap();
+            if disconnect {
+                drop(client);
+            } else {
+                failed.send(Some("controller stopped".to_owned())).unwrap();
+                assert!(matches!(
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        read_frame::<_, ServerMessage>(&mut client)
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                    ServerMessage::RuntimeFailed { .. }
+                ));
+            }
+            let completion = tokio::time::timeout(Duration::from_secs(2), handler)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                (disconnect, completion),
+                (true, ConnectionCompletion::Abandoned)
+                    | (false, ConnectionCompletion::RuntimeFailed)
+            ));
+            assert!(request.response.is_closed());
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_executable_prepare_does_not_block_a_second_join() {
+        use super::super::protocol::{DaemonReadiness, WireOsString};
+        use std::os::fd::IntoRawFd;
+        let root = tempfile::tempdir().unwrap();
+        let workdir = root.path().join("workspace");
+        let hook = crate::hook_library::materialize(&workdir).unwrap();
+        let config = SandboxConfig::new(hook).with_workdir(&workdir);
+        let paths = SessionPaths::resolve(&workdir).unwrap();
+        let build = build_identity().unwrap();
+        let (ready, server_ready) = std::os::unix::net::UnixStream::pair().unwrap();
+        ready.set_nonblocking(true).unwrap();
+        let mut ready = UnixStream::from_std(ready).unwrap();
+        let startup_lock = tempfile::tempfile().unwrap();
+        let startup = unsafe {
+            DaemonStartup::from_raw_descriptors(
+                server_ready.into_raw_fd(),
+                startup_lock.into_raw_fd(),
+            )
+            .unwrap()
+        };
+        let server = tokio::spawn(serve(
+            config,
+            |_| std::future::ready(crate::callback::Decision::Allow),
+            "test-config".to_owned(),
+            startup,
+        ));
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                read_frame::<_, DaemonReadiness>(&mut ready)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            DaemonReadiness::Ready
+        ));
+        let join = ClientMessage::Join {
+            protocol: PROTOCOL_VERSION,
+            build,
+            config: "test-config".to_owned(),
+        };
+        let mut first = UnixStream::connect(paths.socket()).await.unwrap();
+        write_frame(&mut first, &join).await.unwrap();
+        let _: ServerMessage = read_frame(&mut first).await.unwrap();
+
+        // Block the real execution store, without substituting its preparation.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(workdir.join("fs/.vfs.lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        write_frame(
+            &mut first,
+            &ClientMessage::Prepare {
+                executable: WireOsString::from(std::ffi::OsString::from("/usr/bin/true")),
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let mut second = UnixStream::connect(paths.socket()).await.unwrap();
+        write_frame(&mut second, &join).await.unwrap();
+        let joined = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_frame::<_, ServerMessage>(&mut second),
+        )
+        .await;
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(second);
+        let prepared: ServerMessage = read_frame(&mut first).await.unwrap();
+        let ServerMessage::Prepared { launch } = prepared else {
+            panic!("{prepared:?}")
+        };
+        write_frame(
+            &mut first,
+            &ClientMessage::Cancel {
+                launch_id: launch.launch_id().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let _: ServerMessage = read_frame(&mut first).await.unwrap();
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(joined, Ok(Ok(ServerMessage::Joined { .. }))),
+            "a blocked prepare stalled Join: {joined:?}"
+        );
+    }
 
     #[tokio::test]
     async fn incompatible_build_is_retryable_when_the_idle_owner_retires() {

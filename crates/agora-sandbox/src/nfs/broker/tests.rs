@@ -67,6 +67,31 @@ async fn materialize(broker: &Broker<MemoryStorage>, handle: &str) -> Response {
 }
 
 #[tokio::test]
+async fn broker_write_only_snapshot_detects_changed_baselines() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    let broker = Broker::new(Arc::clone(&storage), root.path()).unwrap();
+    for during_read in [false, true] {
+        storage.insert_file(0, "changing.bin", b"old");
+        let opened = broker
+            .handle(Request::Open {
+                path: path("changing.bin"),
+                flags: libc::O_WRONLY,
+                mode: 0,
+            })
+            .await;
+        let handle = open_handle(&opened.response);
+        if during_read {
+            storage.replace_during_snapshot_read(b"new");
+        } else {
+            storage.replace(0, "changing.bin", b"new");
+        }
+        assert_errno(materialize(&broker, &handle).await, libc::ESTALE);
+        assert_eq!(storage.data(0, "changing.bin").unwrap(), b"new");
+    }
+}
+
+#[tokio::test]
 async fn broker_materializes_only_missing_snapshot_ranges() {
     let root = tempfile::tempdir().unwrap();
     let storage = Arc::new(MemoryStorage::default());
@@ -1249,6 +1274,69 @@ async fn broker_stops_serializing_directory_lists_at_the_payload_limit() {
 
     assert_errno(response, libc::EOVERFLOW);
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn same_path_rename_preserves_an_open_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "file", b"before");
+    let broker = Broker::new(Arc::clone(&storage), root.path()).unwrap();
+    let opened = broker
+        .handle(Request::Open {
+            path: path("file"),
+            flags: libc::O_RDWR,
+            mode: 0,
+        })
+        .await;
+    let handle = open_handle(&opened.response);
+    let descriptor = File::from(opened.descriptor.unwrap());
+    assert!(matches!(
+        materialize(&broker, &handle).await,
+        Response::Materialized { .. }
+    ));
+    assert_eq!(
+        broker
+            .handle(Request::Rename {
+                from: path("file"),
+                to: path("file")
+            })
+            .await
+            .response,
+        Response::Success
+    );
+    descriptor.write_all_at(b"AFTER!", 0).unwrap();
+    assert!(matches!(
+        broker
+            .handle(Request::Sync {
+                handle: handle.clone(),
+                ranges: Vec::new()
+            })
+            .await
+            .response,
+        Response::Synced { .. }
+    ));
+    assert_eq!(
+        broker
+            .handle(Request::Close {
+                handle,
+                ranges: Vec::new()
+            })
+            .await
+            .response,
+        Response::Success
+    );
+    assert_eq!(storage.data(0, "file"), Some(b"AFTER!".to_vec()));
+    assert_errno(
+        broker
+            .handle(Request::Rename {
+                from: path("missing"),
+                to: path("missing"),
+            })
+            .await
+            .response,
+        libc::ENOENT,
+    );
 }
 
 #[tokio::test]

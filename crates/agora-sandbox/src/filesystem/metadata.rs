@@ -12,9 +12,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 const LEGACY_METADATA_VERSION: u32 = 1;
 const READABLE_METADATA_VERSION: u32 = 2;
@@ -199,6 +199,10 @@ struct StoredDirectoryMetadataV3 {
 
 #[derive(Default, Deserialize, Serialize)]
 struct StoredMetadataRecord {
+    /// Only long encrypted leaves need the full ciphertext outside the key.
+    /// The key remains the exact physical name, derived from this ciphertext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encrypted_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     entry: Option<EntryState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,6 +248,17 @@ struct MetadataCache {
     directories: HashMap<PathBuf, CachedDirectoryMetadata>,
 }
 
+impl MetadataCache {
+    fn insert(&mut self, path: PathBuf, metadata: CachedDirectoryMetadata) {
+        if self.directories.len() >= METADATA_CACHE_CAPACITY
+            && !self.directories.contains_key(&path)
+        {
+            self.directories.clear();
+        }
+        self.directories.insert(path, metadata);
+    }
+}
+
 #[derive(Default)]
 struct TransactionGeneration {
     owner: Option<usize>,
@@ -263,7 +278,7 @@ struct AppendFile {
 #[derive(Clone)]
 struct CachedDirectoryMetadata {
     identity: Option<SourceIdentity>,
-    metadata: Option<DirectoryMetadata>,
+    metadata: Arc<DirectoryMetadata>,
 }
 
 impl MetadataStore {
@@ -354,14 +369,15 @@ impl MetadataStore {
                 let logical = Self::decode(&logical_name)?;
                 let new_name = loop {
                     let candidate = new_cipher.encrypt_name(logical.as_bytes())?;
-                    if assigned.insert(candidate.clone())
-                        && !backing_directory.join(&candidate).try_exists()?
+                    let physical = namespace::encrypted_backing_name(&candidate);
+                    if assigned.insert(physical.clone())
+                        && !backing_directory.join(physical).try_exists()?
                     {
                         break candidate;
                     }
                 };
-                let old_path = backing_directory.join(&old_name);
-                let new_path = backing_directory.join(&new_name);
+                let old_path = backing_directory.join(namespace::encrypted_backing_name(&old_name));
+                let new_path = backing_directory.join(namespace::encrypted_backing_name(&new_name));
                 if plan
                     .renames
                     .insert(old_path.clone(), new_path.clone())
@@ -369,9 +385,9 @@ impl MetadataStore {
                 {
                     bail!("duplicate encrypted filesystem filename migration source");
                 }
-                let old_lease = Self::lease_path(&old_path)?;
+                let old_lease = namespace::write_lease_path(&old_path)?;
                 if old_lease.try_exists()? {
-                    let new_lease = Self::lease_path(&new_path)?;
+                    let new_lease = namespace::write_lease_path(&new_path)?;
                     plan.leases.push((
                         old_lease,
                         new_lease,
@@ -388,21 +404,16 @@ impl MetadataStore {
         Ok(plan)
     }
 
-    pub(super) fn lease_path(destination: &Path) -> Result<PathBuf> {
-        let name = destination
-            .file_name()
-            .context("encrypted filesystem destination has no filename")?;
-        let mut lease = namespace::WRITE_LEASE_PREFIX.to_vec();
-        lease.extend_from_slice(name.as_bytes());
-        Ok(destination.with_file_name(OsString::from_vec(lease)))
-    }
-
     pub(super) fn state(&self, path: &Path) -> Result<Option<EntryState>> {
         if path == Path::new("/") {
             return Ok(None);
         }
         let (parent, name) = Self::split(path)?;
-        Ok(self.load(parent)?.entries.get(&Self::encode(name)).cloned())
+        Ok(self
+            .load_shared(parent)?
+            .entries
+            .get(&Self::encode(name))
+            .cloned())
     }
 
     pub(super) fn records(
@@ -427,7 +438,7 @@ impl MetadataStore {
     pub(super) fn ensure_marker(&self, directory: &Path) -> Result<()> {
         let path = self.path(directory)?;
         match path.symlink_metadata() {
-            Ok(metadata) if metadata.is_file() => self.load(directory).map(|_| ()),
+            Ok(metadata) if metadata.is_file() => self.load_shared(directory).map(|_| ()),
             Ok(_) => bail!(
                 "failed to read filesystem metadata {}: marker is not a file",
                 path.display()
@@ -457,7 +468,7 @@ impl MetadataStore {
             self.advance_generation()?;
         }
         if identity.is_some() {
-            self.load(directory)?;
+            self.load_shared(directory)?;
         }
         Ok(identity.is_some())
     }
@@ -553,7 +564,7 @@ impl MetadataStore {
         }
         let (parent, name) = Self::split(path)?;
         Ok(self
-            .load(parent)?
+            .load_shared(parent)?
             .attributes
             .get(&Self::encode(name))
             .cloned())
@@ -587,15 +598,15 @@ impl MetadataStore {
     }
 
     pub(super) fn entries(&self, directory: &Path) -> Result<Vec<(OsString, EntryState)>> {
-        self.load(directory)?
+        self.load_shared(directory)?
             .entries
-            .into_iter()
-            .map(|(name, state)| Ok((Self::decode(&name)?, state)))
+            .iter()
+            .map(|(name, state)| Ok((Self::decode(name)?, state.clone())))
             .collect()
     }
 
     pub(super) fn contains_only_loader_cache_records(&self, directory: &Path) -> Result<bool> {
-        let metadata = self.load(directory)?;
+        let metadata = self.load_shared(directory)?;
         Ok(metadata.attributes.is_empty()
             && metadata.encrypted_names.is_empty()
             && metadata.entries.values().all(|state| {
@@ -612,10 +623,10 @@ impl MetadataStore {
     pub(super) fn encrypted_name(&self, path: &Path) -> Result<Option<OsString>> {
         let (parent, name) = Self::split(path)?;
         Ok(self
-            .load(parent)?
+            .load_shared(parent)?
             .encrypted_names
             .get(&Self::encode(name))
-            .map(OsString::from))
+            .map(|name| OsString::from(namespace::encrypted_backing_name(name))))
     }
 
     pub(super) fn ensure_encrypted_name(&self, path: &Path) -> Result<OsString> {
@@ -623,7 +634,7 @@ impl MetadataStore {
         let mut metadata = self.load(parent)?;
         let canonical_name = Self::encode(name);
         if let Some(encrypted) = metadata.encrypted_names.get(&canonical_name) {
-            return Ok(OsString::from(encrypted));
+            return Ok(OsString::from(namespace::encrypted_backing_name(encrypted)));
         }
         let cipher = self
             .cipher
@@ -634,14 +645,21 @@ impl MetadataStore {
             .encrypted_names
             .insert(canonical_name, encrypted.clone());
         self.write(parent, &metadata)?;
-        Ok(OsString::from(encrypted))
+        Ok(OsString::from(namespace::encrypted_backing_name(
+            &encrypted,
+        )))
     }
 
     pub(super) fn encrypted_names(&self, directory: &Path) -> Result<Vec<(OsString, OsString)>> {
-        self.load(directory)?
+        self.load_shared(directory)?
             .encrypted_names
-            .into_iter()
-            .map(|(logical, backing)| Ok((Self::decode(&logical)?, OsString::from(backing))))
+            .iter()
+            .map(|(logical, backing)| {
+                Ok((
+                    Self::decode(logical)?,
+                    OsString::from(namespace::encrypted_backing_name(backing)),
+                ))
+            })
             .collect()
     }
 
@@ -662,11 +680,19 @@ impl MetadataStore {
     }
 
     fn load(&self, directory: &Path) -> Result<DirectoryMetadata> {
+        self.load_shared(directory).map(Arc::unwrap_or_clone)
+    }
+
+    fn load_shared(&self, directory: &Path) -> Result<Arc<DirectoryMetadata>> {
         let generation = self.current_generation()?;
         self.load_at_generation(directory, generation)
     }
 
-    fn load_at_generation(&self, directory: &Path, generation: u64) -> Result<DirectoryMetadata> {
+    fn load_at_generation(
+        &self,
+        directory: &Path,
+        generation: u64,
+    ) -> Result<Arc<DirectoryMetadata>> {
         let path = self.path(directory)?;
         {
             let mut cache = self.cache();
@@ -675,7 +701,7 @@ impl MetadataStore {
                 cache.directories.clear();
             }
             if let Some(cached) = cache.directories.get(&path) {
-                return Ok(cached.metadata.clone().unwrap_or_default());
+                return Ok(Arc::clone(&cached.metadata));
             }
         }
         #[cfg(test)]
@@ -686,17 +712,18 @@ impl MetadataStore {
         {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let metadata = Arc::default();
                 let mut cache = self.cache();
                 if cache.generation == Some(generation) {
-                    cache.directories.insert(
+                    cache.insert(
                         path,
                         CachedDirectoryMetadata {
                             identity: None,
-                            metadata: None,
+                            metadata: Arc::clone(&metadata),
                         },
                     );
                 }
-                return Ok(DirectoryMetadata::default());
+                return Ok(metadata);
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -717,23 +744,18 @@ impl MetadataStore {
             MAX_DIRECTORY_METADATA_BYTES,
             &format!("filesystem metadata {}", path.display()),
         )?;
-        let metadata = self.decode_metadata(&contents, &path)?;
+        let metadata = Arc::new(self.decode_metadata(&contents, &path)?);
         #[cfg(test)]
         self.parse_count.fetch_add(1, Ordering::Relaxed);
         let mut cache = self.cache();
         if cache.generation != Some(generation) {
             return Ok(metadata);
         }
-        if cache.directories.len() >= METADATA_CACHE_CAPACITY
-            && !cache.directories.contains_key(&path)
-        {
-            cache.directories.clear();
-        }
-        cache.directories.insert(
+        cache.insert(
             path,
             CachedDirectoryMetadata {
                 identity,
-                metadata: Some(metadata.clone()),
+                metadata: Arc::clone(&metadata),
             },
         );
         Ok(metadata)
@@ -762,7 +784,7 @@ impl MetadataStore {
             let marker = self.path(ancestor)?;
             match Self::marker_identity(&marker)? {
                 Some(_) => {
-                    self.load(ancestor)?;
+                    self.load_shared(ancestor)?;
                 }
                 None => self.write_one(ancestor, &DirectoryMetadata::default())?,
             }
@@ -822,11 +844,10 @@ impl MetadataStore {
             let Some(cached) = cache.directories.get(&path) else {
                 return Ok(false);
             };
-            let (Some(expected_identity), Some(metadata)) =
-                (cached.identity, cached.metadata.as_ref())
-            else {
+            let Some(expected_identity) = cached.identity else {
                 return Ok(false);
             };
+            let metadata = &cached.metadata;
             if metadata.entries.contains_key(&logical_name)
                 || metadata.attributes.contains_key(&logical_name)
                 || metadata.encrypted_names.contains_key(&logical_name)
@@ -842,7 +863,7 @@ impl MetadataStore {
                 None
             };
             let stored_name = match encrypted_name.as_ref() {
-                Some(encrypted_name) => encrypted_name.clone(),
+                Some(encrypted_name) => namespace::encrypted_backing_name(encrypted_name),
                 None => Self::storage_name(&logical_name)?,
             };
             if stored_name.len() > MAX_METADATA_NAME_BYTES {
@@ -877,6 +898,10 @@ impl MetadataStore {
         };
         let (expected_identity, stored_name, encrypted_name) = candidate;
         let record = StoredMetadataRecord {
+            encrypted_name: encrypted_name
+                .as_ref()
+                .filter(|name| name.len() > namespace::NAME_MAX)
+                .cloned(),
             entry: Some(EntryState::Whiteout),
             attributes: None,
         };
@@ -894,8 +919,8 @@ impl MetadataStore {
             cache.directories.clear();
         } else if let Some(cached) = cache.directories.get_mut(&path)
             && cached.identity == Some(expected_identity)
-            && let Some(metadata) = cached.metadata.as_mut()
         {
+            let metadata = Arc::make_mut(&mut cached.metadata);
             metadata
                 .entries
                 .insert(logical_name.clone(), EntryState::Whiteout);
@@ -1012,16 +1037,11 @@ impl MetadataStore {
             cache.directories.clear();
         }
         cache.generation = Some(generation);
-        if cache.directories.len() >= METADATA_CACHE_CAPACITY
-            && !cache.directories.contains_key(&path)
-        {
-            cache.directories.clear();
-        }
-        cache.directories.insert(
+        cache.insert(
             path,
             CachedDirectoryMetadata {
                 identity: Some(identity),
-                metadata: Some(metadata),
+                metadata: Arc::new(metadata),
             },
         );
         Ok(())
@@ -1090,6 +1110,19 @@ impl MetadataStore {
                 );
             }
             let encrypted = stored_name.starts_with(super::crypto::ENCRYPTED_NAME_PREFIX);
+            if (encrypted && stored_name.len() > namespace::NAME_MAX)
+                || record.encrypted_name.as_ref().is_some_and(|name| {
+                    !encrypted
+                        || name.len() <= namespace::NAME_MAX
+                        || name.len() > MAX_METADATA_NAME_BYTES
+                        || namespace::encrypted_backing_name(name) != stored_name
+                })
+            {
+                bail!(
+                    "invalid long encrypted filesystem name in {}",
+                    path.display()
+                );
+            }
             if !encrypted && record.entry.is_none() && record.attributes.is_none() {
                 bail!(
                     "empty filesystem metadata record {stored_name:?} in {}",
@@ -1103,7 +1136,8 @@ impl MetadataStore {
                         path.display()
                     )
                 })?;
-                let bytes = cipher.decrypt_name(&stored_name).with_context(|| {
+                let ciphertext = record.encrypted_name.as_deref().unwrap_or(&stored_name);
+                let bytes = cipher.decrypt_name(ciphertext).with_context(|| {
                     format!(
                         "failed to decrypt filesystem metadata name in {}",
                         path.display()
@@ -1113,7 +1147,7 @@ impl MetadataStore {
                 let logical = Self::encode(OsStr::from_bytes(&bytes));
                 metadata
                     .encrypted_names
-                    .insert(logical.clone(), stored_name.clone());
+                    .insert(logical.clone(), ciphertext.to_owned());
                 logical
             } else {
                 Self::canonical_name(&stored_name, READABLE_METADATA_VERSION)?
@@ -1149,7 +1183,7 @@ impl MetadataStore {
                     if !encrypted_name.starts_with(super::crypto::ENCRYPTED_NAME_PREFIX) {
                         bail!("invalid encrypted filesystem filename {encrypted_name:?}");
                     }
-                    encrypted_name.clone()
+                    namespace::encrypted_backing_name(encrypted_name)
                 } else {
                     Self::storage_name(&logical_name)?
                 };
@@ -1157,6 +1191,11 @@ impl MetadataStore {
                 bail!("filesystem metadata name exceeds {MAX_METADATA_NAME_BYTES} bytes");
             }
             let record = StoredMetadataRecord {
+                encrypted_name: metadata
+                    .encrypted_names
+                    .get(&logical_name)
+                    .filter(|name| name.len() > namespace::NAME_MAX)
+                    .cloned(),
                 entry: metadata.entries.get(&logical_name).cloned(),
                 attributes: metadata.attributes.get(&logical_name).cloned(),
             };
@@ -1218,6 +1257,7 @@ impl MetadataStore {
 
     fn validate_logical_name(name: &[u8], path: &Path) -> Result<()> {
         if name.is_empty()
+            || name.len() > namespace::NAME_MAX
             || name == b"."
             || name == b".."
             || name.contains(&b'/')

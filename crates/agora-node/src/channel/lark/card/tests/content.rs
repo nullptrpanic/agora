@@ -1,6 +1,115 @@
 use super::super::MAX_ANSWER_BYTES;
 use super::*;
+
+#[test]
+fn oversized_management_reply_has_a_bounded_explicit_command_fallback() {
+    let reply = ChannelReply::agent_list(
+        (0..100)
+            .map(|index| {
+                agent_status_with_button(&format!("{index}-{}", "agent".repeat(100)), true)
+            })
+            .collect(),
+    );
+    let card = LarkReplyCard::build(&reply, LarkConversation::Private);
+    assert!(card.to_string().len() <= super::super::super::lark_api::LARK_CARD_MAX_BYTES);
+    assert!(card.to_string().contains("/agent status"));
+    assert!(card.to_string().contains("/agent enable"));
+}
 use crate::i18n;
+
+#[test]
+fn lark_card_serialized_budget_keeps_the_latest_grouped_progress() {
+    let mut content = LarkCardContent::new("agent".into());
+    content.apply_output(OutputEvent::Thinking {
+        text: "latest thinking".into(),
+    });
+    for index in 0..20 {
+        content.apply_output(OutputEvent::Progress {
+            id: index.to_string(),
+            text: format!("{} latest-progress-{index}", "x".repeat(7000)),
+            status: ProgressStatus::Completed,
+        });
+    }
+    content.apply_output(OutputEvent::Answer {
+        text: "answer".into(),
+    });
+    content.complete();
+    let rendered = content.build_card().to_string();
+    assert!(rendered.len() <= 30_000);
+    assert!(rendered.contains("latest-progress-19"));
+    assert!(rendered.contains("latest thinking"));
+    assert!(rendered.contains("输出已截断"));
+}
+
+#[test]
+fn lark_card_serialized_budget_keeps_result_and_latest_process() {
+    for text in ["x".repeat(8000), "中文".repeat(1300), "\"\\\n".repeat(2600)] {
+        let mut content = LarkCardContent::new("agent".into());
+        for index in 0..20 {
+            content.apply_output(OutputEvent::Thinking {
+                text: format!("phase-{index}"),
+            });
+            content.apply_output(OutputEvent::CommandExecution {
+                id: format!("command-{index}"),
+                command: format!("{text}\nlatest-{index}"),
+                status: ProgressStatus::Completed,
+                exit_code: Some(0),
+            });
+        }
+        content.apply_output(OutputEvent::Answer {
+            text: format!("{}\nanswer-tail", "回答".repeat(3000)),
+        });
+        content.apply_output(OutputEvent::Usage(TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 20,
+            output_tokens: 10,
+            reasoning_output_tokens: 5,
+        }));
+        content.complete();
+        let card = content.build_card();
+        let serialized = serde_json::to_string(&card).unwrap();
+        assert!(
+            serialized.len() <= 30_000,
+            "card bytes: {}",
+            serialized.len()
+        );
+        assert_eq!(
+            card["header"]["text_tag_list"][0]["text"]["content"],
+            "已完成"
+        );
+        assert!(serialized.contains("answer-tail"));
+        assert!(
+            serialized.contains(&"回答".repeat(3000)),
+            "old process must be reduced before a fitting answer"
+        );
+        assert!(serialized.contains("latest-19"));
+        assert!(serialized.contains("Total") && serialized.contains("Reasoning"));
+        assert!(serialized.contains("输出已截断"));
+        assert!(!serialized.contains("latest-0"));
+    }
+}
+
+#[test]
+fn lark_card_serialized_budget_handles_escaped_answers_and_large_headers() {
+    let mut content = LarkCardContent::new("name".repeat(10000));
+    content.apply_output(OutputEvent::Answer {
+        text: format!("{}\nanswer-tail", "\u{1}".repeat(20_000)),
+    });
+    content.fail("test failure".into());
+    let card = content.build_card();
+    let serialized = serde_json::to_string(&card).unwrap();
+    assert!(
+        serialized.len() <= 30_000,
+        "card bytes: {}",
+        serialized.len()
+    );
+    assert!(serialized.contains("部分回答") && serialized.contains("answer-tail"));
+    assert!(serialized.contains("任务失败"));
+    assert_eq!(
+        card["header"]["text_tag_list"][0]["text"]["content"],
+        "失败"
+    );
+}
 
 #[test]
 fn lark_permission_denial_card_owns_its_markdown_layout() {
@@ -85,7 +194,7 @@ fn lark_agent_list_card_renders_one_right_aligned_toggle_button_per_agent() {
         first_button.pointer("/behaviors/0/value").unwrap(),
         &serde_json::json!({
             "agora_command": {
-                "path": ["ask", "disable"],
+                "path": ["agent", "disable"],
                 "arguments": { "agent_name": "codex-dev" }
             },
             "agora_conversation": "private"
@@ -97,7 +206,7 @@ fn lark_agent_list_card_renders_one_right_aligned_toggle_button_per_agent() {
         second_button.pointer("/behaviors/0/value").unwrap(),
         &serde_json::json!({
             "agora_command": {
-                "path": ["ask", "enable"],
+                "path": ["agent", "enable"],
                 "arguments": { "agent_name": "reviewer" }
             },
             "agora_conversation": "private"
@@ -945,8 +1054,8 @@ fn lark_card_bounds_one_large_phase_and_preserves_terminal_markers() {
 
 #[test]
 fn lark_card_formats_token_extremes_and_truncates_unicode_on_a_boundary() {
-    assert_eq!(LarkCardContent::format_tokens(999), "999");
-    assert_eq!(LarkCardContent::format_tokens(1_000_000), "1.0M");
+    assert_eq!(crate::i18n::format_tokens(999), "999");
+    assert_eq!(crate::i18n::format_tokens(1_000_000), "1.0M");
 
     let answer = format!("prefix{}tail", "界".repeat(MAX_ANSWER_BYTES));
     let truncated = LarkCardContent::truncate_answer(&answer);

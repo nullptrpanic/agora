@@ -1,9 +1,11 @@
+use super::super::data::copy_process_value;
 use super::super::metadata::{original_lstat, patch_stat};
 use super::super::*;
-use super::DirectoryCursor;
+use super::{DirectoryCursor, attributes};
 use crate::platform::hook::abi::{
     DarwinFtsEntry, FtsCompareFn, darwin_fts_children, darwin_fts_close, darwin_fts_open,
-    darwin_fts_read, darwin_fts_set, darwin_getattrlistbulk,
+    darwin_fts_read, darwin_fts_set, darwin_getattrlistbulk, darwin_mach_task_self,
+    darwin_mach_vm_read_overwrite,
 };
 use std::cell::{Cell, RefCell};
 use std::os::unix::fs::FileTypeExt;
@@ -39,7 +41,6 @@ const DARWIN_VNODE_TYPE_DIRECTORY: u32 = 2;
 
 thread_local! {
     static ACTIVE_FTS_STREAM: Cell<usize> = const { Cell::new(0) };
-    static FTS_BULK_CURSORS: RefCell<HashMap<libc::c_int, FtsBulkCursor>> = RefCell::new(HashMap::new());
     static FTS_COMPARE_CONTEXTS: RefCell<Vec<FtsCompareContext>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -58,6 +59,7 @@ impl FtsVirtualBulk {
         Self { previous }
     }
 
+    #[cfg(test)]
     fn is_active() -> bool {
         Self::active_stream().is_some()
     }
@@ -87,8 +89,32 @@ struct FtsBulkEntry {
 
 struct FtsBulkCursor {
     identity: FtsDescriptorIdentity,
+    logical: PathBuf,
     entries: Vec<FtsBulkEntry>,
     next: usize,
+}
+
+type SharedBulkCursor = Arc<Mutex<Option<FtsBulkCursor>>>;
+
+fn bulk_cursors() -> &'static Mutex<HashMap<libc::c_int, SharedBulkCursor>> {
+    static CURSORS: OnceLock<Mutex<HashMap<libc::c_int, SharedBulkCursor>>> = OnceLock::new();
+    CURSORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(in crate::platform::hook::filesystem) fn forget_bulk_descriptor(descriptor: libc::c_int) {
+    lock(bulk_cursors()).remove(&descriptor);
+}
+
+pub(in crate::platform::hook::filesystem) fn duplicate_bulk_descriptor(
+    source: libc::c_int,
+    destination: libc::c_int,
+) {
+    let mut cursors = lock(bulk_cursors());
+    if let Some(cursor) = cursors.get(&source).cloned() {
+        cursors.insert(destination, cursor);
+    } else {
+        cursors.remove(&destination);
+    }
 }
 
 #[derive(Clone)]
@@ -555,6 +581,7 @@ impl FtsBulkCursor {
         }
         Ok(Some(Self {
             identity,
+            logical: view.logical().to_path_buf(),
             entries,
             next: 0,
         }))
@@ -592,6 +619,7 @@ impl FtsBulkCursor {
         }
         Ok(Self {
             identity,
+            logical,
             entries,
             next: 0,
         })
@@ -724,51 +752,70 @@ fn fts_descriptor_identity(descriptor: libc::c_int) -> Result<FtsDescriptorIdent
     })
 }
 
-fn fts_attr_record(entry: &FtsBulkEntry, attributes: &libc::attrlist) -> Result<Vec<u8>> {
-    const ATTRIBUTE_SET_SIZE: usize = 20;
-    const ATTRIBUTE_REFERENCE_OFFSET: usize = 4 + ATTRIBUTE_SET_SIZE;
-    const FULL_FIXED_SIZE: usize = 156;
-    const NOSTAT_FIXED_SIZE: usize = 56;
-
-    let nostat = attributes.commonattr & libc::ATTR_CMN_CRTIME == 0;
-    let fixed_size = if nostat {
-        NOSTAT_FIXED_SIZE
+fn bulk_entry_record(
+    runtime: &FilesystemHookRuntime,
+    logical_directory: &Path,
+    entry: &FtsBulkEntry,
+    requested: &libc::attrlist,
+    options: u64,
+) -> Result<Vec<u8>> {
+    let logical = logical_directory.join(OsStr::from_bytes(&entry.name));
+    let status = if attributes::needs_stat(requested) {
+        Some((|| -> Result<attributes::Metadata> {
+            let path = CString::new(logical.as_os_str().as_bytes())?;
+            let (mapped, size, attributes, _anchor) = runtime.map_metadata(
+                path.as_ptr(),
+                libc::AT_FDCWD,
+                false,
+                &Credentials::effective(),
+            )?;
+            let original = original_lstat().context("lstat is unavailable")?;
+            let mut status = unsafe { std::mem::zeroed() };
+            if unsafe { original(mapped.as_ptr(), &mut status) } != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            unsafe { patch_stat(&mut status, size, attributes.as_ref()) };
+            let mut native = unsafe { std::mem::zeroed::<libc::attrlist>() };
+            native.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
+            native.commonattr = libc::ATTR_CMN_FSID;
+            let mut filesystem_id = [0_u8; 12];
+            let needs_fsid = requested.commonattr & libc::ATTR_CMN_FSID != 0
+                || requested.forkattr & libc::ATTR_CMNEXT_REALFSID != 0;
+            if needs_fsid
+                && unsafe {
+                    libc::getattrlist(
+                        mapped.as_ptr(),
+                        (&raw mut native).cast(),
+                        filesystem_id.as_mut_ptr().cast(),
+                        filesystem_id.len(),
+                        libc::FSOPT_NOFOLLOW,
+                    )
+                } != 0
+            {
+                return Err(io::Error::last_os_error().into());
+            }
+            Ok(attributes::Metadata {
+                status,
+                filesystem_id: filesystem_id[4..12].try_into().unwrap(),
+            })
+        })())
     } else {
-        FULL_FIXED_SIZE
+        None
     };
-    let unaligned_size = fixed_size
-        .checked_add(entry.name.len())
-        .and_then(|size| size.checked_add(1))
-        .context("FTS attribute record size overflow")?;
-    let record_size = unaligned_size
-        .checked_add(3)
-        .map(|size| size & !3)
-        .context("FTS attribute record size overflow")?;
-    let record_length = u32::try_from(record_size).context("FTS attribute record is too large")?;
-    let name_length = u32::try_from(entry.name.len() + 1).context("FTS name is too large")?;
-    let name_offset = i32::try_from(fixed_size - ATTRIBUTE_REFERENCE_OFFSET)
-        .context("FTS name offset is too large")?;
-
-    let mut record = vec![0_u8; record_size];
-    record[0..4].copy_from_slice(&record_length.to_ne_bytes());
-    let returned_common =
-        libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_OBJTYPE;
-    record[4..8].copy_from_slice(&returned_common.to_ne_bytes());
-    record[24..28].copy_from_slice(&name_offset.to_ne_bytes());
-    record[28..32].copy_from_slice(&name_length.to_ne_bytes());
-    record[36..40].copy_from_slice(&entry.object_type.to_ne_bytes());
-    record[fixed_size..fixed_size + entry.name.len()].copy_from_slice(&entry.name);
-    Ok(record)
-}
-
-fn fts_attributes_supported(attributes: &libc::attrlist) -> bool {
-    attributes.bitmapcount == libc::ATTR_BIT_MAP_COUNT
-        && attributes.commonattr
-            & (libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_OBJTYPE)
-            == (libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_OBJTYPE)
-        && attributes.volattr == 0
-        && attributes.dirattr == 0
-        && attributes.forkattr == 0
+    let errno = status
+        .as_ref()
+        .and_then(|result| result.as_ref().err())
+        .map(error_errno)
+        .unwrap_or(0);
+    attributes::record(
+        &entry.name,
+        &logical,
+        entry.object_type,
+        status.as_ref().and_then(|result| result.as_ref().ok()),
+        errno,
+        requested,
+        options,
+    )
 }
 
 unsafe fn sandbox_getattrlistbulk(
@@ -783,26 +830,21 @@ unsafe fn sandbox_getattrlistbulk(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(guard) = active_fts_bulk_guard(FilesystemHookGuard::enter()) else {
+        // Enter before touching TLS/cursor state, including during dyld startup.
+        let Some(guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(directory, attributes, buffer, size, options) };
         };
         if attributes.is_null() || buffer.is_null() {
             unsafe { set_errno(libc::EFAULT) };
             return -1;
         }
-        let attributes = unsafe { std::ptr::read(attributes.cast::<libc::attrlist>()) };
-        if !fts_attributes_supported(&attributes) {
-            drop(guard);
-            return unsafe {
-                original(
-                    directory,
-                    (&raw const attributes).cast_mut().cast(),
-                    buffer,
-                    size,
-                    options,
-                )
-            };
-        }
+        let attributes = match unsafe { copy_process_value(attributes.cast::<libc::attrlist>()) } {
+            Ok(attributes) => attributes,
+            Err(errno) => {
+                unsafe { set_errno(errno) };
+                return -1;
+            }
+        };
         let Some(runtime) = FilesystemHookRuntime::global() else {
             drop(guard);
             return unsafe {
@@ -819,21 +861,26 @@ unsafe fn sandbox_getattrlistbulk(
             Ok(identity) => identity,
             Err(error) => return unsafe { fail(&error, -1) },
         };
-        let needs_cursor = FTS_BULK_CURSORS.with(|cursors| {
-            cursors
-                .borrow()
-                .get(&directory)
-                .is_none_or(|cursor| cursor.identity != identity)
+        // Use the native open-file offset, so dup, thread handoff, rewind and
+        // descriptor reuse do not accidentally continue a stale TLS cursor.
+        // Registry locking never spans filesystem/Broker work. Only callers
+        // sharing this directory cursor wait behind its enumeration.
+        let shared = lock(bulk_cursors()).entry(directory).or_default().clone();
+        let mut current = lock(&shared);
+        let offset = unsafe { libc::lseek(directory, 0, libc::SEEK_CUR) };
+        if offset < 0 {
+            return -1;
+        }
+        let needs_cursor = current.as_ref().is_none_or(|cursor| {
+            cursor.identity != identity || cursor.next as i64 != offset || offset == 0
         });
         if needs_cursor {
-            if FtsVirtualBulk::active_stream().is_none()
-                && let Err(error) = runtime.synchronize_current_directory()
-            {
-                return unsafe { fail(&error, -1) };
-            }
             let cursor = match FtsBulkCursor::new(runtime, directory, identity) {
                 Ok(Some(cursor)) => cursor,
                 Ok(None) => {
+                    forget_bulk_descriptor(directory);
+                    drop(current);
+                    drop(guard);
                     return unsafe {
                         original(
                             directory,
@@ -846,67 +893,63 @@ unsafe fn sandbox_getattrlistbulk(
                 }
                 Err(error) => return unsafe { fail(&error, -1) },
             };
-            FTS_BULK_CURSORS.with(|cursors| {
-                cursors.borrow_mut().insert(directory, cursor);
-            });
+            let mut cursor = cursor;
+            cursor.next = usize::try_from(offset).unwrap_or(usize::MAX);
+            *current = Some(cursor);
+        }
+
+        if !attributes::supported(&attributes, options) {
+            unsafe { set_errno(libc::ENOTSUP) };
+            return -1;
         }
 
         let mut written = 0_usize;
         let mut count = 0_i32;
-        let mut finished = false;
-        let result = FTS_BULK_CURSORS.with(|cursors| -> Result<()> {
-            let mut cursors = cursors.borrow_mut();
-            let cursor = cursors
-                .get_mut(&directory)
-                .context("missing FTS bulk cursor")?;
+        let result = (|| -> Result<()> {
+            let cursor = current.as_mut().context("missing directory bulk cursor")?;
             while let Some(entry) = cursor.entries.get(cursor.next) {
-                let record = fts_attr_record(entry, &attributes)?;
+                let record =
+                    bulk_entry_record(runtime, &cursor.logical, entry, &attributes, options)?;
                 if record.len() > size.saturating_sub(written) {
                     if count == 0 {
                         return Err(io::Error::from_raw_os_error(libc::ERANGE).into());
                     }
                     break;
                 }
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        record.as_ptr(),
-                        buffer.cast::<u8>().add(written),
-                        record.len(),
-                    );
+                let mut copied = 0;
+                let result = unsafe {
+                    darwin_mach_vm_read_overwrite(
+                        darwin_mach_task_self,
+                        record.as_ptr() as u64,
+                        record.len() as u64,
+                        (buffer as u64)
+                            .checked_add(written as u64)
+                            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?,
+                        &mut copied,
+                    )
+                };
+                if result != 0 || copied != record.len() as u64 {
+                    return Err(io::Error::from_raw_os_error(libc::EFAULT).into());
                 }
                 written += record.len();
                 count += 1;
                 cursor.next += 1;
             }
-            finished = cursor.next == cursor.entries.len() && count == 0;
+            if unsafe { libc::lseek(directory, cursor.next as i64, libc::SEEK_SET) } < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            if cursor.next >= cursor.entries.len() {
+                // Keep only the EOF marker until close/rewind, not the listing.
+                cursor.entries = Vec::new();
+            }
             Ok(())
-        });
+        })();
         if let Err(error) = result {
-            FTS_BULK_CURSORS.with(|cursors| {
-                cursors.borrow_mut().remove(&directory);
-            });
             return unsafe { fail(&error, -1) };
-        }
-        if finished {
-            FTS_BULK_CURSORS.with(|cursors| {
-                cursors.borrow_mut().remove(&directory);
-            });
         }
         unsafe { set_errno(0) };
         count
     })
-}
-
-fn active_fts_bulk_guard(guard: Option<FilesystemHookGuard>) -> Option<FilesystemHookGuard> {
-    active_fts_bulk_guard_with(guard, FtsVirtualBulk::is_active)
-}
-
-fn active_fts_bulk_guard_with(
-    guard: Option<FilesystemHookGuard>,
-    is_active: impl FnOnce() -> bool,
-) -> Option<FilesystemHookGuard> {
-    let guard = guard?;
-    is_active().then_some(guard)
 }
 
 #[unsafe(no_mangle)]

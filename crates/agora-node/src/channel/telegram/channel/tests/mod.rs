@@ -4,7 +4,7 @@ use crate::channel::permission::PermissionDenial;
 use crate::channel::test_http::{HttpMockServer, MockResponse};
 use crate::channel::{
     Channel, ChannelAgent, ChannelAgentStatus, ChannelReply, ChannelRun, ChannelRunContext,
-    ChannelTask, ConfiguredChannel, ConfiguredTask, InterruptCallback, RunEvent,
+    ChannelSender, ChannelTask, ConfiguredChannel, ConfiguredTask, InterruptCallback, RunEvent,
 };
 use crate::config::{
     ChannelConfig, ChannelGroupPermissionConfig, ChannelPermissionConfig,

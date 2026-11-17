@@ -237,14 +237,8 @@ unsafe fn duplicate_inherited_local_descriptors(encoded: &str) -> InheritedLocal
     inherited
 }
 
-fn descriptor_is_open(descriptor: libc::c_int) -> bool {
-    unsafe { libc::fcntl(descriptor, libc::F_GETFD) >= 0 }
-}
-
-fn close_if_open(descriptor: libc::c_int) {
-    if descriptor_is_open(descriptor) {
-        unsafe { libc::close(descriptor) };
-    }
+fn descriptor_matches(descriptor: libc::c_int, device: u64, inode: u64) -> bool {
+    FilesystemHookRuntime::inherited_descriptor_identity(descriptor) == Some((device, inode))
 }
 
 #[test]
@@ -1105,6 +1099,109 @@ async fn lazy_broker_reads_materialize_ranges_before_native_io() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_io_adapters_enforce_encrypted_descriptor_access_modes() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    let results = with_test_runtime(&runtime, || unsafe {
+        let path = c_path(&directory.path().join("write-only"));
+        write_managed_file(&path, b"secret");
+        let descriptor =
+            super::super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_WRONLY, 0);
+        assert!(descriptor >= 0);
+        let mut results = Vec::new();
+        for list_io in [false, true] {
+            let mut buffer = [0_u8; 6];
+            let mut control = std::mem::zeroed::<libc::aiocb>();
+            control.aio_fildes = descriptor;
+            control.aio_buf = buffer.as_mut_ptr().cast();
+            control.aio_nbytes = buffer.len();
+            control.aio_lio_opcode = libc::LIO_READ;
+            let controls = [&mut control as *mut libc::aiocb];
+            let result = if list_io {
+                agora_sandbox_lio_listio(libc::LIO_WAIT, controls.as_ptr(), 1, std::ptr::null_mut())
+            } else {
+                agora_sandbox_aio_read(&mut control)
+            };
+            results.push((
+                if list_io { "lio_read" } else { "aio_read" },
+                result,
+                *libc::__error(),
+            ));
+            // Drain unexpected successful submissions before dropping their buffers.
+            if result == 0 {
+                await_submitted_aio(&mut control);
+            }
+        }
+        let mut sockets = [-1; 2];
+        assert_eq!(
+            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sockets.as_mut_ptr()),
+            0
+        );
+        let mut length = 6;
+        let result = agora_sandbox_sendfile(
+            descriptor,
+            sockets[0],
+            0,
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        );
+        results.push(("sendfile", result, *libc::__error()));
+        assert_eq!(libc::close(sockets[0]), 0);
+        assert_eq!(libc::close(sockets[1]), 0);
+        let destination = tempfile::tempfile().unwrap();
+        let result = agora_sandbox_fcopyfile(
+            descriptor,
+            destination.as_raw_fd(),
+            std::ptr::null_mut(),
+            libc::COPYFILE_DATA,
+        );
+        results.push(("fcopyfile", result, *libc::__error()));
+        assert_eq!(super::super::agora_sandbox_close(descriptor), 0);
+        let readonly = super::super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(readonly >= 0);
+        let result = agora_sandbox_fcopyfile(
+            destination.as_raw_fd(),
+            readonly,
+            std::ptr::null_mut(),
+            libc::COPYFILE_DATA,
+        );
+        results.push(("fcopyfile_readonly_destination", result, *libc::__error()));
+        for list_io in [false, true] {
+            let mut control = std::mem::zeroed::<libc::aiocb>();
+            control.aio_fildes = readonly;
+            control.aio_buf = b"replacement".as_ptr().cast_mut().cast();
+            control.aio_nbytes = 11;
+            control.aio_lio_opcode = libc::LIO_WRITE;
+            let controls = [&mut control as *mut libc::aiocb];
+            let result = if list_io {
+                agora_sandbox_lio_listio(libc::LIO_WAIT, controls.as_ptr(), 1, std::ptr::null_mut())
+            } else {
+                agora_sandbox_aio_write(&mut control)
+            };
+            results.push((
+                if list_io {
+                    "lio_write_readonly"
+                } else {
+                    "aio_write_readonly"
+                },
+                result,
+                *libc::__error(),
+            ));
+            if result == 0 {
+                await_submitted_aio(&mut control);
+            }
+        }
+        assert_eq!(super::super::agora_sandbox_close(readonly), 0);
+        results
+    });
+    controller.shutdown().await.unwrap();
+    for (operation, result, errno) in results {
+        assert_eq!((result, errno), (-1, libc::EBADF), "{operation}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_managed_aio_write_is_rejected_before_native_io() {
     let directory = tempfile::tempdir().unwrap();
     let logical = directory.path().join("lazy-aio-write.bin");
@@ -1540,8 +1637,23 @@ async fn broker_managed_io_failures_preserve_errno_and_recoverable_state() {
         );
         set_descriptor_close_on_exec(descriptor, false).unwrap();
         super::super::agora_sandbox_fcntl_commit_setfd(descriptor);
-        let inherited = runtime.inheritable_local_descriptors();
-        assert_eq!(inherited.len(), 3);
+        let inherited: InheritedLocalDescriptors = serde_json::from_str(
+            &runtime
+                .encode_inherited_local_descriptors()
+                .unwrap()
+                .encoded,
+        )
+        .unwrap();
+        assert_eq!(inherited.descriptors.len(), 1);
+        assert_eq!(inherited.descriptors[0].descriptor, descriptor);
+        assert_eq!(
+            inherited.descriptors[0].state_descriptor,
+            registration.state.as_raw_fd()
+        );
+        assert_eq!(
+            inherited.descriptors[0].lock_descriptor,
+            registration.lock.as_raw_fd()
+        );
 
         assert_eq!(libc::ftruncate(registration.state.as_raw_fd(), 0), 0);
         assert_eq!(
@@ -1644,6 +1756,18 @@ async fn inherited_local_descriptors_restore_aliases_and_shared_offsets() {
         &restored.tracked_open(restored_descriptors[0]).unwrap(),
         &restored.tracked_open(restored_descriptors[1]).unwrap(),
     ));
+    let restored_open = restored.tracked_open(restored_descriptors[0]).unwrap();
+    let restored_local = restored_open.local_inheritance().unwrap();
+    for fd in [
+        restored_local.state.as_raw_fd(),
+        restored_local.lock.as_raw_fd(),
+    ] {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "restored auxiliary FD would disappear on the next exec"
+        );
+    }
 
     with_test_runtime(&restored, || unsafe {
         assert_eq!(
@@ -1684,6 +1808,73 @@ async fn inherited_local_descriptors_restore_aliases_and_shared_offsets() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_environment_tracks_cloexec_and_mapped_only_handles_for_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    let path = c_path(&directory.path().join("cloexec.txt"));
+    with_test_runtime(&runtime, || unsafe {
+        let fd = super::super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600,
+        );
+        assert!(fd >= 0);
+        let environment = runtime.encode_inherited_local_descriptors();
+        let environment =
+            environment.expect("exec would lose ownership of the close-on-exec handle");
+        assert_eq!(environment.handles.len(), 1);
+        let encoded: InheritedLocalDescriptors =
+            serde_json::from_str(&environment.encoded).unwrap();
+        assert!(encoded.descriptors.is_empty());
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        assert_eq!(agora_sandbox_ftruncate(fd, page as libc::off_t), 0);
+        let mapped = super::super::mapping::agora_sandbox_mmap(
+            std::ptr::null_mut(),
+            page,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        assert_ne!(mapped, libc::MAP_FAILED);
+        assert_eq!(super::super::agora_sandbox_close(fd), 0);
+        let mapped_only = runtime.encode_inherited_local_descriptors().unwrap();
+        assert_eq!(mapped_only.handles, environment.handles);
+        assert_eq!(super::super::mapping::agora_sandbox_munmap(mapped, page), 0);
+        assert!(runtime.encode_inherited_local_descriptors().is_none());
+    });
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_native_close_keeps_the_broker_handle_usable() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    let path = c_path(&directory.path().join("close-retry.txt"));
+    with_test_runtime(&runtime, || unsafe {
+        let fd = super::super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR,
+            0o600,
+        );
+        assert!(fd >= 0);
+        assert_eq!(agora_sandbox_write(fd, b"a".as_ptr().cast(), 1), 1);
+        assert_eq!(
+            super::super::descriptor::sandbox_close(fd, |_| {
+                set_errno(libc::EPERM);
+                -1
+            }),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::EPERM);
+        assert!(runtime.tracked_open(fd).is_some());
+        assert_eq!(agora_sandbox_write(fd, b"b".as_ptr().cast(), 1), 1);
+        assert_eq!(super::super::agora_sandbox_close(fd), 0);
+    });
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inherited_local_descriptors_release_handles_when_file_actions_close_all_aliases() {
     let directory = tempfile::tempdir().unwrap();
     let (runtime, controller) = broker_runtime(directory.path()).await;
@@ -1710,7 +1901,7 @@ async fn inherited_local_descriptors_release_handles_when_file_actions_close_all
     let state_descriptor = child.descriptors[0].state_descriptor;
     let lock_descriptor = child.descriptors[0].lock_descriptor;
     for inherited in &child.descriptors {
-        close_if_open(inherited.descriptor);
+        assert_eq!(unsafe { libc::close(inherited.descriptor) }, 0);
     }
 
     let mut restored = FilesystemHookRuntime::new_encrypted(
@@ -1724,10 +1915,16 @@ async fn inherited_local_descriptors_release_handles_when_file_actions_close_all
         .restore_inherited_local_descriptors(Some(&serde_json::to_string(&child).unwrap()))
         .unwrap();
 
-    let state_closed = !descriptor_is_open(state_descriptor);
-    let lock_closed = !descriptor_is_open(lock_descriptor);
-    close_if_open(state_descriptor);
-    close_if_open(lock_descriptor);
+    // A closed numeric FD may already belong to another parallel test. Check
+    // its original identity, and never close descriptors consumed by restore.
+    let original = &child.descriptors[0];
+    let state_closed = !descriptor_matches(
+        state_descriptor,
+        original.state_device,
+        original.state_inode,
+    );
+    let lock_closed =
+        !descriptor_matches(lock_descriptor, original.lock_device, original.lock_inode);
     with_test_runtime(&runtime, || unsafe {
         assert_eq!(super::super::agora_sandbox_close(descriptor), 0);
     });
@@ -1788,12 +1985,16 @@ async fn inherited_local_descriptors_close_valid_content_when_auxiliary_fd_was_r
         .restore_inherited_local_descriptors(Some(&serde_json::to_string(&child).unwrap()))
         .unwrap();
 
-    let content_closed = !descriptor_is_open(content_descriptor);
-    let replacement_preserved = descriptor_is_open(state_descriptor);
-    let lock_closed = !descriptor_is_open(lock_descriptor);
-    close_if_open(content_descriptor);
-    close_if_open(state_descriptor);
-    close_if_open(lock_descriptor);
+    let original = &child.descriptors[0];
+    let content_closed = !descriptor_matches(content_descriptor, original.device, original.inode);
+    let replacement_preserved =
+        FilesystemHookRuntime::inherited_descriptor_identity(state_descriptor)
+            == FilesystemHookRuntime::inherited_descriptor_identity(replacement.as_raw_fd());
+    let lock_closed =
+        !descriptor_matches(lock_descriptor, original.lock_device, original.lock_inode);
+    if replacement_preserved {
+        assert_eq!(unsafe { libc::close(state_descriptor) }, 0);
+    }
     with_test_runtime(&runtime, || unsafe {
         assert_eq!(super::super::agora_sandbox_close(descriptor), 0);
     });
@@ -1863,12 +2064,12 @@ async fn inherited_local_descriptors_close_plaintext_moved_into_an_auxiliary_fd(
         .restore_inherited_local_descriptors(Some(&serde_json::to_string(&child).unwrap()))
         .unwrap();
 
-    let content_closed = !descriptor_is_open(content_descriptor);
-    let moved_plaintext_closed = !descriptor_is_open(state_descriptor);
-    let lock_closed = !descriptor_is_open(lock_descriptor);
-    close_if_open(content_descriptor);
-    close_if_open(state_descriptor);
-    close_if_open(lock_descriptor);
+    let original = &child.descriptors[0];
+    let content_closed = !descriptor_matches(content_descriptor, original.device, original.inode);
+    let moved_plaintext_closed =
+        !descriptor_matches(state_descriptor, original.device, original.inode);
+    let lock_closed =
+        !descriptor_matches(lock_descriptor, original.lock_device, original.lock_inode);
     with_test_runtime(&runtime, || unsafe {
         assert_eq!(super::super::agora_sandbox_close(descriptor), 0);
     });

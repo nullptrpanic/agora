@@ -1,5 +1,105 @@
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn executable_search_skips_non_executable_shadow_entries() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(first.join("agent"), "not executable").unwrap();
+    std::fs::set_permissions(first.join("agent"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(second.join("agent"), "executable").unwrap();
+    std::fs::set_permissions(second.join("agent"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let search = std::env::join_paths([&first, &second]).unwrap();
+    assert_eq!(
+        find_in_search_path(Path::new("agent"), &search),
+        Some(second.join("agent"))
+    );
+    assert_eq!(find_in_search_path(Path::new("missing"), &search), None);
+}
+
+#[test]
+fn hardening_rejects_unknown_fields_at_each_configuration_level() {
+    let base = serde_json::json!({"channels":[{"type":"lark","name":"lark","app_id":"id","secret":"secret","permission":{"users":[{"id":"u"}],"groups":[{"id":"g"}]}}],"agents":[{"name":"agent","isolate":"none","type":"custom","path":"agent","subscribe":[{"channel":"lark"}]}],"runtime":{}});
+    for pointer in [
+        "",
+        "/runtime",
+        "/channels/0",
+        "/channels/0/permission",
+        "/channels/0/permission/users/0",
+        "/channels/0/permission/groups/0",
+        "/agents/0",
+        "/agents/0/subscribe/0",
+    ] {
+        let mut document = base.clone();
+        document
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("typo".into(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<NodeConfig>(document).is_err(),
+            "silently accepted {pointer}/typo"
+        );
+    }
+}
+
+#[test]
+fn hardening_rejects_duplicate_provider_accounts_and_extreme_capacity() {
+    for channels in [
+        serde_json::json!([{"type":"lark","name":"one","app_id":"id","secret":"old"},{"type":"lark","name":"two","app_id":"id","secret":"new"}]),
+        serde_json::json!([{"type":"telegram","name":"one","token":"00123:old"},{"type":"telegram","name":"two","token":"123:new"}]),
+    ] {
+        let config: NodeConfig =
+            serde_json::from_value(serde_json::json!({"channels":channels,"agents":[]})).unwrap();
+        assert!(config.validate().is_err(), "duplicate provider receiver");
+    }
+}
+
+#[test]
+fn hardening_rejects_extreme_capacity() {
+    for key in [
+        "max_in_flight_tasks",
+        "max_in_flight_runs",
+        "max_concurrent_runs",
+    ] {
+        let mut document = serde_json::json!({"channels":[],"agents":[],"runtime":{"max_in_flight_runs":tokio::sync::Semaphore::MAX_PERMITS}});
+        document["runtime"][key] = serde_json::json!(tokio::sync::Semaphore::MAX_PERMITS + 1);
+        assert!(
+            serde_json::from_value::<NodeConfig>(document)
+                .unwrap()
+                .validate()
+                .is_err(),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn hardening_proxy_credentials_survive_environment_roundtrip() {
+    for raw in [
+        "us/er:p@ss#?%word@proxy.local:8080",
+        "用 户:密:码+@proxy.local:8080",
+        "a:b%40c@proxy.local:8080",
+    ] {
+        let proxy: HttpProxy = raw.parse().unwrap();
+        let value = proxy.environment_value();
+        let url = reqwest::Url::parse(&value).unwrap();
+        assert_eq!(url.host_str(), Some("proxy.local"), "{value}");
+        assert_eq!(url.path(), "/");
+        assert!(url.query().is_none());
+        assert!(url.fragment().is_none());
+        assert_eq!(
+            value.parse::<HttpProxy>().unwrap().credentials(),
+            proxy.credentials()
+        );
+    }
+}
+
 #[test]
 fn node_runtime_limits_use_safe_defaults() {
     let config: NodeConfig = serde_json::from_str(r#"{"channels":[],"agents":[]}"#).unwrap();
@@ -130,9 +230,7 @@ fn component_proxies_override_the_global_default() {
             "proxy":"global:8000",
             "channels":[
                 {"type":"lark","name":"lark","app_id":"id","secret":"secret"},
-                {"type":"telegram","name":"telegram","token":"123456:token","proxy":"tg:8001"},
-                {"type":"local","name":"local"},
-                {"type":"http","name":"http","proxy":"http:8002"}
+                {"type":"telegram","name":"telegram","token":"123456:token","proxy":"tg:8001"}
             ],
             "agents":[
                 {"name":"global","isolate":"none","type":"custom","path":"agent","subscribe":[]},
@@ -157,15 +255,7 @@ fn component_proxies_override_the_global_default() {
         .iter_mut()
         .map(|channel| channel.proxy_mut().as_ref().unwrap().environment_value())
         .collect::<Vec<_>>();
-    assert_eq!(
-        channel_proxies,
-        [
-            "http://global:8000",
-            "http://tg:8001",
-            "http://global:8000",
-            "http://http:8002",
-        ]
-    );
+    assert_eq!(channel_proxies, ["http://global:8000", "http://tg:8001",]);
 }
 
 #[test]
@@ -202,9 +292,7 @@ fn config_accessors_preserve_names_paths_and_proxy_credentials() {
         r#"{
             "channels":[
                 {"type":"lark","name":"lark","app_id":"id","secret":"secret"},
-                {"type":"telegram","name":"telegram","token":"123456:token"},
-                {"type":"local","name":"local"},
-                {"type":"http","name":"http"}
+                {"type":"telegram","name":"telegram","token":"123456:token"}
             ],
             "agents":[{
                 "name":"agent",
@@ -224,7 +312,7 @@ fn config_accessors_preserve_names_paths_and_proxy_credentials() {
             .iter()
             .map(ChannelConfig::name)
             .collect::<Vec<_>>(),
-        ["lark", "telegram", "local", "http"]
+        ["lark", "telegram"]
     );
     assert_eq!(
         config.agents[0].workdir(),
@@ -330,7 +418,7 @@ fn node_config_rejects_zero_agent_execution_limits() {
 fn node_config_rejects_ambiguous_or_invalid_runtime_entries() {
     let cases = [
         (
-            r#"{"channels":[{"type":"local","name":""}],"agents":[]}"#,
+            r#"{"channels":[{"type":"lark","name":"","app_id":"id","secret":"secret"}],"agents":[]}"#,
             "channel name must not be empty",
         ),
         (
@@ -356,14 +444,6 @@ fn node_config_rejects_ambiguous_or_invalid_runtime_entries() {
         (
             r#"{"channels":[{"type":"lark","name":"lark","app_id":"id","secret":"secret","permission":{"groups":[{"id":""}]}}],"agents":[]}"#,
             "channel group permission id must not be empty: lark",
-        ),
-        (
-            r#"{"channels":[{"type":"local","name":"local"}],"agents":[]}"#,
-            "local channel is not implemented: local",
-        ),
-        (
-            r#"{"channels":[{"type":"http","name":"http"}],"agents":[]}"#,
-            "http channel is not implemented: http",
         ),
         (
             r#"{"channels":[],"agents":[{"name":"","isolate":"none","workspace":"/tmp/work","type":"custom","path":"agent","subscribe":[]}]}"#,

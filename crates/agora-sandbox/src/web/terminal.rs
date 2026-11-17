@@ -1,14 +1,18 @@
 use anyhow::{Context, Result, anyhow};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 const EVENT_CAPACITY: usize = 128;
+const INPUT_CAPACITY: usize = 16;
+pub(super) const MAX_INPUT_BYTES: usize = 64 * 1024;
 const STOP_GRACE: Duration = Duration::from_secs(2);
 const FORCE_KILL_WAIT: Duration = Duration::from_secs(1);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -55,7 +59,7 @@ pub(super) struct TerminalSpec {
 
 pub(super) struct TerminalSession {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    input: std_mpsc::SyncSender<Vec<u8>>,
     process_id: libc::pid_t,
     exited: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
@@ -69,6 +73,19 @@ impl TerminalSession {
         let pair = native_pty_system()
             .openpty(size.into())
             .context("failed to open viewer pseudoterminal")?;
+        let descriptor = pair
+            .master
+            .as_raw_fd()
+            .context("terminal has no native descriptor")?;
+        let mut reader =
+            File::from(unsafe { BorrowedFd::borrow_raw(descriptor) }.try_clone_to_owned()?);
+        let writer = reader.try_clone()?;
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
         let mut command = CommandBuilder::new(&spec.sandbox_binary);
         command.args([
             "run".as_ref(),
@@ -87,21 +104,29 @@ impl TerminalSession {
             .process_id()
             .and_then(|pid| libc::pid_t::try_from(pid).ok())
             .context("viewer terminal child did not expose a process id")?;
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .context("failed to clone viewer terminal reader")?;
-        let writer = Arc::new(Mutex::new(
-            pair.master
-                .take_writer()
-                .context("failed to open viewer terminal writer")?,
-        ));
         let master = Arc::new(Mutex::new(pair.master));
         let exited = Arc::new(AtomicBool::new(false));
         let stop_requested = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel(EVENT_CAPACITY);
+        let (input, input_receiver) = std_mpsc::sync_channel(INPUT_CAPACITY);
+        let input_sender = sender.clone();
+        let input_exited = exited.clone();
+        let input_stopped = stop_requested.clone();
+        thread::Builder::new()
+            .name("agora-trace-terminal-input".to_string())
+            .spawn(move || {
+                if let Err(error) =
+                    write_input(writer, input_receiver, &input_exited, &input_stopped)
+                {
+                    let _ = input_sender.blocking_send(TerminalEvent::Error(format!(
+                        "terminal input failed: {error}"
+                    )));
+                }
+            })
+            .context("failed to start viewer terminal input worker")?;
 
         let output_sender = sender.clone();
+        let output_exited = exited.clone();
         thread::Builder::new()
             .name("agora-trace-terminal-output".to_string())
             .spawn(move || {
@@ -118,6 +143,16 @@ impl TerminalSession {
                             }
                         }
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if output_exited.load(Ordering::Acquire) {
+                                break;
+                            }
+                            if let Err(error) = wait_ready(&reader, libc::POLLIN) {
+                                let _ = output_sender
+                                    .blocking_send(TerminalEvent::Error(error.to_string()));
+                                break;
+                            }
+                        }
                         Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
                         Err(error) => {
                             let _ = output_sender.blocking_send(TerminalEvent::Error(format!(
@@ -160,7 +195,7 @@ impl TerminalSession {
         Ok((
             Self {
                 master,
-                writer,
+                input,
                 process_id,
                 exited,
                 stop_requested,
@@ -170,12 +205,31 @@ impl TerminalSession {
     }
 
     pub(super) fn input(&self, bytes: &[u8]) -> io::Result<()> {
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| io::Error::other("viewer terminal writer lock is poisoned"))?;
-        writer.write_all(bytes)?;
-        writer.flush()
+        if self.is_exited() || self.stop_requested.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "terminal is stopping",
+            ));
+        }
+        if bytes.len() > MAX_INPUT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "terminal input exceeds frame limit",
+            ));
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.input
+            .try_send(bytes.to_vec())
+            .map_err(|error| match error {
+                std_mpsc::TrySendError::Full(_) => {
+                    io::Error::new(io::ErrorKind::WouldBlock, "terminal input queue is full")
+                }
+                std_mpsc::TrySendError::Disconnected(_) => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "terminal input worker stopped")
+                }
+            })
     }
 
     pub(super) fn resize(&self, size: TerminalSize) -> io::Result<()> {
@@ -233,6 +287,52 @@ impl TerminalSession {
     pub(super) fn is_exited(&self) -> bool {
         self.exited.load(Ordering::Acquire)
     }
+}
+
+fn wait_ready(file: &File, events: libc::c_short) -> io::Result<()> {
+    let mut descriptor = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut descriptor, 1, EXIT_POLL_INTERVAL.as_millis() as i32) } < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn write_input(
+    mut writer: File,
+    receiver: std_mpsc::Receiver<Vec<u8>>,
+    exited: &AtomicBool,
+    stopped: &AtomicBool,
+) -> io::Result<()> {
+    while !exited.load(Ordering::Acquire) && !stopped.load(Ordering::Acquire) {
+        let bytes = match receiver.recv_timeout(EXIT_POLL_INTERVAL) {
+            Ok(bytes) => bytes,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let mut remaining = bytes.as_slice();
+        while !remaining.is_empty() {
+            if exited.load(Ordering::Acquire) || stopped.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match writer.write(remaining) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(written) => remaining = &remaining[written..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    wait_ready(&writer, libc::POLLOUT)?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn signal_process(process_id: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
@@ -298,6 +398,38 @@ exec /bin/bash --noprofile --norc
             sandbox_binary: root.join("fake-sandbox"),
             config_path: root.join("sandbox.json"),
         }
+    }
+
+    #[tokio::test]
+    async fn input_backpressure_does_not_block_terminal_control() {
+        let root = tempfile::tempdir().unwrap();
+        let sandbox = root.path().join("fake-sandbox");
+        fs::write(
+            &sandbox,
+            "#!/bin/sh\nstty raw -echo\nprintf READY\nexec sleep 10\n",
+        )
+        .unwrap();
+        fs::set_permissions(&sandbox, fs::Permissions::from_mode(0o700)).unwrap();
+        let (session, mut events) =
+            TerminalSession::spawn(spec(root.path()), TerminalSize::default()).unwrap();
+        output_until(&mut events, "READY").await;
+        let session = std::sync::Arc::new(session);
+        let writer = session.clone();
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let bytes = vec![b'x'; 64 * 1024];
+            for _ in 0..64 {
+                if let Err(error) = writer.input(&bytes) {
+                    done.send(error.kind()).unwrap();
+                    return;
+                }
+            }
+            panic!("terminal input must have a bounded queue");
+        });
+        let backpressure = result.recv_timeout(Duration::from_secs(1));
+        session.stop_and_wait().unwrap();
+        worker.join().unwrap();
+        assert_eq!(backpressure.unwrap(), std::io::ErrorKind::WouldBlock);
     }
 
     #[tokio::test]

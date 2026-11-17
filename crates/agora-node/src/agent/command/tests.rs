@@ -100,3 +100,88 @@ async fn command_combines_stdout_and_stderr_for_the_output_limit() {
     assert_eq!(output.stderr, b"1234");
     assert!(!output.finished);
 }
+
+// Run in a separate test process so setsid never touches the test runner itself.
+#[cfg(unix)]
+#[test]
+fn detached_pipe_holder_fixture() {
+    use std::os::unix::process::CommandExt;
+
+    let Some(pid_file) = std::env::var_os("AGORA_TEST_DETACHED_PID_FILE") else {
+        return;
+    };
+    let mut command = std::process::Command::new("/bin/sleep");
+    command.arg("30");
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    std::fs::write(pid_file, child.id().to_string()).unwrap();
+    println!("parent finished");
+    eprintln!("diagnostic retained");
+    // Reap if this fixture is ever changed to leave the child already exited.
+    let _ = child.try_wait();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_finishes_when_detached_descendant_keeps_output_pipes_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("child.pid");
+    let command = Command::new(std::env::current_exe().unwrap().to_str().unwrap())
+        .args([
+            "--exact",
+            "agent::command::tests::detached_pipe_holder_fixture",
+            "--nocapture",
+        ])
+        .envs([("AGORA_TEST_DETACHED_PID_FILE", pid_file.to_str().unwrap())]);
+    let mut output = CollectedOutput::default();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), command.run(&mut output)).await;
+    if let Ok(pid) = std::fs::read_to_string(pid_file) {
+        unsafe { libc::kill(pid.parse().unwrap(), libc::SIGKILL) };
+    }
+    let outcome = outcome
+        .expect("exited parent still waited for an escaped child's pipes")
+        .unwrap();
+    assert_eq!(outcome.exit_code(), 0);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("parent finished"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("diagnostic retained"));
+    assert!(output.finished);
+}
+
+#[tokio::test]
+async fn command_drain_budget_excludes_slow_output_delivery() {
+    #[derive(Default)]
+    struct SlowOutput(Vec<u8>);
+    impl CommandOutput for SlowOutput {
+        async fn stdout(&mut self, chunk: &[u8]) -> Result<()> {
+            self.0.extend_from_slice(chunk);
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            Ok(())
+        }
+        async fn stderr(&mut self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+    let mut output = SlowOutput::default();
+    let command = Command::new("/bin/sh").args([
+        "-c",
+        "/bin/dd if=/dev/zero bs=4096 count=2 2>/dev/null; printf tail",
+    ]);
+    let outcome = tokio::time::timeout(Duration::from_secs(8), command.run(&mut output))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.exit_code(), 0);
+    assert_eq!(
+        output.0.len(),
+        8196,
+        "slow image delivery discarded buffered stdout"
+    );
+    assert!(output.0.ends_with(b"tail"));
+}

@@ -1,6 +1,39 @@
 use super::*;
 
 #[tokio::test]
+async fn hardening_ask_preserves_prompt_and_all_agent_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = isolated_command_runtime();
+    let prompt = "  \nfirst  line\n    indented\tvalue\nlast  ";
+    for name in ["normal", "list", "status", "enable", "disable", "help"] {
+        let agents = vec![command_test_agent(name, temp.path())];
+        let input = ChannelTaskInput::Message(TaskContent::new(format!("/ask {name} {prompt}")));
+        let outcome = runtime
+            .handle(&command_channel_identity(), "chat", &agents, &input)
+            .await
+            .unwrap();
+        let CommandOutcome::Dispatch(dispatch) = outcome else {
+            panic!("agent {name} was not addressable");
+        };
+        let (selected, content) = dispatch.into_parts();
+        assert_eq!(selected[0].name(), name);
+        assert_eq!(content.text(), prompt);
+        let status = runtime
+            .handle(
+                &command_channel_identity(),
+                "chat",
+                &agents,
+                &ChannelTaskInput::Message(TaskContent::new(format!("/agent status {name}"))),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(status, CommandOutcome::Reply(Some(ChannelReply::AgentStatus(agent))) if agent.name() == name)
+        );
+    }
+}
+
+#[tokio::test]
 async fn ask_commands_persist_and_report_agent_status_for_the_current_session() {
     let temp = tempfile::tempdir().unwrap();
     let agents = vec![
@@ -18,7 +51,7 @@ async fn ask_commands_persist_and_report_agent_status_for_the_current_session() 
         &agents,
         &dispatcher,
         &command_runtime(&dispatcher),
-        CommandTestTask::new("disable", "chat-1", "/ask disable codex-dev"),
+        CommandTestTask::new("disable", "chat-1", "/agent disable codex-dev"),
         &mut runs,
     )
     .await
@@ -37,7 +70,7 @@ async fn ask_commands_persist_and_report_agent_status_for_the_current_session() 
         &agents,
         &dispatcher,
         &command_runtime(&dispatcher),
-        CommandTestTask::new("list", "chat-1", "/ask list"),
+        CommandTestTask::new("list", "chat-1", "/agent list"),
         &mut runs,
     )
     .await
@@ -56,7 +89,7 @@ async fn ask_commands_persist_and_report_agent_status_for_the_current_session() 
         &agents,
         &dispatcher,
         &command_runtime(&dispatcher),
-        CommandTestTask::new("status", "chat-1", "/ask status reviewer"),
+        CommandTestTask::new("status", "chat-1", "/agent status reviewer"),
         &mut runs,
     )
     .await
@@ -321,7 +354,7 @@ async fn ask_status_updates_cover_unknown_and_enable_paths() {
         AgentDispatcher::new(SessionStore::open(temp.path().join("store.db")).unwrap());
     let runtime = command_runtime(&dispatcher);
 
-    for input in ["/ask status missing", "/ask disable missing"] {
+    for input in ["/agent status missing", "/agent disable missing"] {
         let outcome = runtime
             .handle(
                 &command_channel_identity(),
@@ -345,7 +378,7 @@ async fn ask_status_updates_cover_unknown_and_enable_paths() {
             &command_channel_identity(),
             "chat-1",
             &agents,
-            &ChannelTaskInput::Message(TaskContent::new("/ask enable codex-dev")),
+            &ChannelTaskInput::Message(TaskContent::new("/agent enable codex-dev")),
         )
         .await
         .unwrap();

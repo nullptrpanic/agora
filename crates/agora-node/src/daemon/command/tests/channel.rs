@@ -109,7 +109,18 @@ async fn channel_loop_keeps_receiving_while_reset_waits_for_its_barrier() {
     })
     .await
     .unwrap();
-    assert!(replies.lock().unwrap().is_empty());
+    timeout(Duration::from_secs(1), async {
+        while replies.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        replies.lock().unwrap().len(),
+        1,
+        "only help completes before reset's barrier"
+    );
 
     drop(blocker);
     daemon.abort();

@@ -81,7 +81,7 @@ fn generated_configs_cover_both_channels_and_secure_file_output() {
     assert_eq!(lark_json["agents"][0]["effort"], "high");
 
     let mut telegram_input =
-        Cursor::new(b"2\ntoken\n42\n\n/path/to/codex\nmodel\nlow\n".as_slice());
+        Cursor::new(b"2\n123:token\n42\n\n/path/to/codex\nmodel\nlow\n".as_slice());
     let telegram = collect_config(
         &mut telegram_input,
         &mut output,
@@ -93,7 +93,7 @@ fn generated_configs_cover_both_channels_and_secure_file_output() {
     .unwrap();
     let telegram_json = serde_json::to_value(&telegram).unwrap();
     assert_eq!(telegram_json["channels"][0]["type"], "telegram");
-    assert_eq!(telegram_json["channels"][0]["token"], "token");
+    assert_eq!(telegram_json["channels"][0]["token"], "123:token");
     assert_eq!(
         telegram_json["channels"][0]["permission"]["users"][0]["id"],
         "42"
@@ -119,7 +119,7 @@ fn generated_configs_cover_both_channels_and_secure_file_output() {
 fn generated_config_reprompts_for_empty_credentials_and_allowed_user() {
     let workspace = tempfile::tempdir().unwrap();
     let mut input =
-        Cursor::new(b"2\n\nbot-token\n\nallowed-user\n\n/path/to/codex\nmodel\n\n".as_slice());
+        Cursor::new(b"2\n\n123:bot-token\n\nallowed-user\n\n/path/to/codex\nmodel\n\n".as_slice());
     let mut output = Vec::new();
 
     let config = collect_config(
@@ -133,7 +133,7 @@ fn generated_config_reprompts_for_empty_credentials_and_allowed_user() {
     .unwrap();
 
     let document = serde_json::to_value(config).unwrap();
-    assert_eq!(document["channels"][0]["token"], "bot-token");
+    assert_eq!(document["channels"][0]["token"], "123:bot-token");
     assert_eq!(
         document["channels"][0]["permission"]["users"][0]["id"],
         "allowed-user"
@@ -172,11 +172,15 @@ fn executable_detection_rejects_directories_and_non_executable_files() {
     #[cfg(unix)]
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    assert!(!is_executable(directory.path()));
-    assert!(!is_executable(&regular));
-    assert!(is_executable(&executable));
+    assert!(!directory.path().is_file());
+    assert!(!super::super::is_executable(
+        &std::fs::metadata(&regular).unwrap()
+    ));
+    assert!(super::super::is_executable(
+        &std::fs::metadata(&executable).unwrap()
+    ));
     assert_eq!(
-        executable_names("codex").collect::<Vec<_>>(),
-        [OsString::from("codex")]
+        super::super::executable_names(std::ffi::OsStr::new("codex")).collect::<Vec<_>>(),
+        [std::ffi::OsString::from("codex")]
     );
 }

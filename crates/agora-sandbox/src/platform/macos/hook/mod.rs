@@ -93,6 +93,7 @@ extern "C" fn initialize_hook() {
     let initialized = config::initialize()
         .map_err(anyhow::Error::msg)
         .and_then(|()| control::initialize())
+        .and_then(|()| process::publish_pending_event().map_err(anyhow::Error::msg))
         .and_then(|()| filesystem::initialize_process());
     if let Err(error) = initialized {
         let message = format!("agora-sandbox: {error:#}\n");

@@ -16,7 +16,6 @@ const TAG_SIZE: usize = 16;
 const NAME_NONCE_SIZE: usize = 12;
 const NAME_AAD: &[u8] = b"AGORA-FILENAME\0\x01";
 pub(super) const ENCRYPTED_NAME_PREFIX: &str = "enc_";
-const FILESYSTEM_NAME_MAX: usize = 255;
 const PBKDF2_ITERATIONS: u32 = 100_000;
 
 mod content;
@@ -81,6 +80,9 @@ impl FileCipher {
     }
 
     pub(crate) fn encrypt_name(&self, plaintext: &[u8]) -> Result<String> {
+        if plaintext.len() > super::namespace::NAME_MAX {
+            return Err(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG).into());
+        }
         let mut nonce = [0_u8; NAME_NONCE_SIZE];
         SystemRandom::new()
             .fill(&mut nonce)
@@ -100,9 +102,6 @@ impl FileCipher {
             "{ENCRYPTED_NAME_PREFIX}{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
         );
-        if encoded.len() > FILESYSTEM_NAME_MAX {
-            return Err(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG).into());
-        }
         Ok(encoded)
     }
 

@@ -9,6 +9,38 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
 
 #[test]
+fn missing_directory_cache_is_bounded() {
+    let root = tempfile::tempdir().unwrap();
+    let store = MetadataStore::new(root.path()).unwrap();
+    for index in 0..(super::METADATA_CACHE_CAPACITY * 2) {
+        assert!(
+            store
+                .load(Path::new(&format!("/missing-{index}")))
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert!(store.cache().directories.len() <= super::METADATA_CACHE_CAPACITY);
+    }
+}
+
+#[test]
+fn read_hits_share_metadata_without_mutating_existing_snapshots() {
+    let root = tempfile::tempdir().unwrap();
+    let store = MetadataStore::new(root.path()).unwrap();
+    store.set(Path::new("/entry"), EntryState::Cow).unwrap();
+    let first = store.load_shared(Path::new("/")).unwrap();
+    let second = store.load_shared(Path::new("/")).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+    store.set_whiteout(Path::new("/another"), false).unwrap();
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(
+        store.state(Path::new("/another")).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+}
+
+#[test]
 fn metadata_store_creates_and_validates_directory_markers() {
     let root = tempfile();
     let store = MetadataStore::new(&root).unwrap();
@@ -397,6 +429,50 @@ fn encrypted_metadata_uses_the_physical_name_as_an_opaque_record_key() {
         path.file_name().unwrap()
     );
 
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn long_encrypted_metadata_survives_reopen_and_rejects_substituted_names() {
+    let root = tempfile();
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let store = MetadataStore::encrypted(&root, cipher.clone()).unwrap();
+    let path = Path::new("/tmp").join("x".repeat(255));
+    store.set_whiteout(&path, true).unwrap();
+    let physical = store.encrypted_name(&path).unwrap().unwrap();
+    let marker = store.path(Path::new("/tmp")).unwrap();
+    drop(store);
+    let reopened = MetadataStore::encrypted(&root, cipher.clone()).unwrap();
+    assert_eq!(reopened.state(&path).unwrap(), Some(EntryState::Whiteout));
+    assert_eq!(
+        reopened.encrypted_name(&path).unwrap(),
+        Some(physical.clone())
+    );
+    drop(reopened);
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    let mut value = original.clone();
+    let records = value["entries"].as_object_mut().unwrap();
+    let mut record = records.remove(physical.to_str().unwrap()).unwrap();
+    let ciphertext = record
+        .as_object_mut()
+        .unwrap()
+        .remove("encrypted_name")
+        .unwrap();
+    records.insert(ciphertext.as_str().unwrap().to_owned(), record);
+    std::fs::write(&marker, serde_json::to_vec(&value).unwrap()).unwrap();
+    let reopened = MetadataStore::encrypted(&root, cipher.clone()).unwrap();
+    assert!(
+        reopened.state(&path).is_err(),
+        "an oversized physical name must be rejected"
+    );
+    drop(reopened);
+    let mut value = original;
+    value["entries"][physical.to_str().unwrap()]["encrypted_name"] =
+        cipher.encrypt_name(&vec![b'y'; 255]).unwrap().into();
+    std::fs::write(&marker, serde_json::to_vec(&value).unwrap()).unwrap();
+    let reopened = MetadataStore::encrypted(&root, cipher).unwrap();
+    assert!(reopened.state(&path).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
 

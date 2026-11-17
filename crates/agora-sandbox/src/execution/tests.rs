@@ -181,7 +181,11 @@ async fn execution_controller_rejects_an_invalid_token() {
         }
     );
 
-    let prepared = controller.prepare(PathBuf::from("/bin/sh")).await.unwrap();
+    let prepared = controller
+        .preparer()
+        .prepare(PathBuf::from("/bin/sh"))
+        .await
+        .unwrap();
 
     assert!(prepared.is_file());
     controller.shutdown().await.unwrap();
@@ -194,7 +198,11 @@ async fn execution_controller_prepares_and_reuses_the_root_executable() {
     let directory = root.cache();
     let controller = ExecutionController::start(directory.clone()).await.unwrap();
 
-    let prepared = controller.prepare(PathBuf::from("/bin/sh")).await.unwrap();
+    let prepared = controller
+        .preparer()
+        .prepare(PathBuf::from("/bin/sh"))
+        .await
+        .unwrap();
 
     assert!(prepared.starts_with(&directory));
     assert!(prepared.is_file());
@@ -202,7 +210,11 @@ async fn execution_controller_prepares_and_reuses_the_root_executable() {
     assert!(prepared.is_file());
 
     let controller = ExecutionController::start(directory).await.unwrap();
-    let reused = controller.prepare(PathBuf::from("/bin/sh")).await.unwrap();
+    let reused = controller
+        .preparer()
+        .prepare(PathBuf::from("/bin/sh"))
+        .await
+        .unwrap();
     assert_eq!(reused, prepared);
     controller.shutdown().await.unwrap();
 }
@@ -248,7 +260,11 @@ async fn execution_controller_isolates_a_malformed_hook_request() {
     stream.write_all(&0_u32.to_be_bytes()).await.unwrap();
     stream.shutdown().await.unwrap();
 
-    let prepared = controller.prepare(PathBuf::from("/bin/sh")).await.unwrap();
+    let prepared = controller
+        .preparer()
+        .prepare(PathBuf::from("/bin/sh"))
+        .await
+        .unwrap();
 
     assert!(prepared.is_file());
     controller.shutdown().await.unwrap();

@@ -276,7 +276,7 @@ where
     }
 
     pub(in crate::daemon) fn route_text(&self, input: &str) -> CommandResolution<H> {
-        let input = input.trim();
+        let input = input.trim_start();
         if !input.starts_with('/') {
             return CommandResolution::AgentInput;
         }
@@ -287,11 +287,23 @@ where
         let remaining = parts.collect::<Vec<_>>();
 
         if command_name == HELP {
-            return if remaining.is_empty() {
-                CommandResolution::Reply(self.help())
-            } else {
-                CommandResolution::Reply(i18n::usage("/help"))
-            };
+            let mut commands = &self.commands;
+            let mut selected = None;
+            let mut path = Vec::new();
+            for name in &remaining {
+                let Some(command) = commands.iter().find(|command| command.name == *name) else {
+                    return CommandResolution::Reply(i18n::unknown_command(&format!(
+                        "/{}",
+                        remaining.join(" ")
+                    )));
+                };
+                path.push(command.name);
+                selected = Some(command);
+                commands = &command.subcommands;
+            }
+            return CommandResolution::Reply(
+                selected.map_or_else(|| self.help(), |command| command.help(&path)),
+            );
         }
 
         let Some(command) = self
@@ -303,7 +315,7 @@ where
         };
 
         let mut path = vec![command.name];
-        Self::resolve(command, &mut path, &remaining)
+        Self::resolve(command, &mut path, &remaining, input)
     }
 
     pub(in crate::daemon) fn route_structured(
@@ -374,9 +386,14 @@ where
         command: &CommandNode<H>,
         path: &mut Vec<&'static str>,
         remaining: &[&str],
+        source: &str,
     ) -> CommandResolution<H> {
         if let Some(token) = remaining.first() {
-            if *token == HELP {
+            if *token == HELP
+                && (command.arguments.is_empty()
+                    || remaining.len()
+                        < command.arguments.iter().filter(|arg| arg.required).count())
+            {
                 return if remaining.len() == 1 {
                     CommandResolution::Reply(command.help(path))
                 } else {
@@ -389,7 +406,7 @@ where
                 .find(|subcommand| subcommand.name == *token)
             {
                 path.push(subcommand.name);
-                return Self::resolve(subcommand, path, &remaining[1..]);
+                return Self::resolve(subcommand, path, &remaining[1..], source);
             }
         }
 
@@ -428,7 +445,18 @@ where
                 .enumerate()
                 .filter_map(|(index, definition)| {
                     let value = if definition.consume_remaining {
-                        remaining[index..].join(" ")
+                        // Tokens are slices of source. Keep the original tail, including
+                        // indentation, newlines and trailing spaces, instead of joining words.
+                        let first = remaining.get(index)?;
+                        let offset = if index > 0 {
+                            let previous = remaining[index - 1];
+                            let end = previous.as_ptr() as usize - source.as_ptr() as usize
+                                + previous.len();
+                            end + source[end..].chars().next()?.len_utf8()
+                        } else {
+                            first.as_ptr() as usize - source.as_ptr() as usize
+                        };
+                        source[offset..].to_string()
                     } else {
                         remaining.get(index)?.to_string()
                     };

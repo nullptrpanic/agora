@@ -1,6 +1,7 @@
 use super::channel::TelegramReplyTarget;
 use crate::config::TelegramChannelConfig;
 use crate::http;
+use crate::task::OutputImage;
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Client;
 use reqwest::header::CONTENT_TYPE;
@@ -48,6 +49,51 @@ impl TelegramApi {
 
     pub(super) fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(super) async fn send_photo(
+        &self,
+        target: &TelegramReplyTarget,
+        image: &OutputImage,
+    ) -> Result<()> {
+        let part = reqwest::multipart::Part::bytes(image.data().to_vec())
+            .file_name(image.file_name().to_string())
+            .mime_str(image.media_type())?;
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", target.chat_id.to_string())
+            .text(
+                "reply_parameters",
+                serde_json::to_string(&ReplyParameters {
+                    message_id: target.message_id,
+                })?,
+            )
+            .part("photo", part);
+        if let Some(thread_id) = target.message_thread_id {
+            form = form.text("message_thread_id", thread_id.to_string());
+        }
+        // sendPhoto is non-idempotent. A lost response must not send another photo.
+        let response = self
+            .client
+            .post(self.method_url("sendPhoto"))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| Self::safe_transport_error("sendPhoto", "request", &error, false))?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("telegram sendPhoto failed http status={status}");
+        }
+        let envelope = response
+            .json::<TelegramResponse<TelegramSentMessage>>()
+            .await
+            .map_err(|error| Self::safe_transport_error("sendPhoto", "response", &error, false))?;
+        if !envelope.ok {
+            bail!("telegram sendPhoto failed code={:?}", envelope.error_code);
+        }
+        envelope
+            .result
+            .ok_or_else(|| anyhow!("telegram sendPhoto response missing result"))?;
+        Ok(())
     }
 
     pub(super) async fn bot_username(&self) -> Result<String> {
@@ -228,8 +274,8 @@ impl TelegramApi {
         markdown: &str,
         callback_data: Option<&str>,
     ) -> Result<()> {
-        let _: TelegramSentMessage = self
-            .request(
+        let result = self
+            .request_with_attempts::<_, TelegramSentMessage>(
                 "editMessageText",
                 &EditRichMessageRequest {
                     chat_id,
@@ -237,9 +283,14 @@ impl TelegramApi {
                     rich_message: InputRichMessage { markdown },
                     reply_markup: TelegramInlineKeyboardMarkup::stop_or_empty(callback_data),
                 },
+                TELEGRAM_REQUEST_MAX_ATTEMPTS,
             )
-            .await?;
-        Ok(())
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if error.message_not_modified => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn request<B, T>(&self, method: &str, body: &B) -> Result<T>
@@ -339,10 +390,14 @@ impl TelegramApi {
             let description = envelope
                 .description
                 .unwrap_or_else(|| "unknown Telegram API error".to_string());
-            return Err(TelegramApiError::new(
+            return Err(TelegramApiError {
                 retryable,
-                format!("telegram {method} failed code={code}: {description}"),
-            ));
+                message_not_modified: method == "editMessageText"
+                    && error_code == Some(400)
+                    && (description == "Bad Request: message is not modified"
+                        || description.starts_with("Bad Request: message is not modified: ")),
+                message: format!("telegram {method} failed code={code}: {description}"),
+            });
         }
     }
 
@@ -405,6 +460,7 @@ impl TelegramApi {
 #[derive(Debug)]
 struct TelegramApiError {
     retryable: bool,
+    message_not_modified: bool,
     message: String,
 }
 
@@ -412,6 +468,7 @@ impl TelegramApiError {
     fn new(retryable: bool, message: impl Into<String>) -> Self {
         Self {
             retryable,
+            message_not_modified: false,
             message: message.into(),
         }
     }

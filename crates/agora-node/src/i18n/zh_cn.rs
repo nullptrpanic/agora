@@ -22,6 +22,16 @@ pub(crate) const RUN_STOPPED_BODY: &str = "已按请求停止任务，已有输�
 pub(crate) const RUN_INTERRUPTED_BODY: &str =
     "Agora Node 即将退出，本次任务已中断，当前输出已保留。\nNode 恢复后，请重新发送消息继续。";
 pub(crate) const STOP_TASK: &str = "结束任务";
+pub(crate) const IMAGE_SENDING: &str = "正在发送图片附件…";
+pub(crate) const IMAGE_SENT: &str = "图片附件已发送。";
+pub(crate) const IMAGE_SEND_FAILED: &str = "图片未确认送达，请重新请求发送；文字回答已保留。";
+pub(crate) const IMAGE_UNAVAILABLE: &str =
+    "图片无法发送：文件不可读、超出允许范围，或格式/大小/数量不受支持。";
+pub(crate) const IMAGE_REFERENCE: &str = "（图片见本话题的附件；发送状态见任务过程）";
+pub(crate) const IMAGE_REFERENCE_FAILED: &str = "（图片无法发送，详见任务过程）";
+pub(crate) const STOP_REQUEST_ACCEPTED: &str = "停止请求已受理，正在结束任务。";
+pub(crate) const STOP_BUTTON_EXPIRED: &str =
+    "任务已结束或按钮已失效；如需停止当前对话的任务，请发送 /stop。";
 pub(crate) const TOTAL: &str = "Total";
 pub(crate) const INPUT: &str = "Input";
 pub(crate) const OUTPUT: &str = "Output";
@@ -55,7 +65,9 @@ pub(crate) const STOP_AGENT_ARGUMENT_DESCRIPTION: &str =
     "已配置的 Agent 名称；省略时停止全部 Agent。";
 pub(crate) const RESET_COMMAND_DESCRIPTION: &str = "停止任务并重置后端 Agent 会话。";
 pub(crate) const RESET_SUCCESSFUL: &str = "重置成功。";
-pub(crate) const ASK_COMMAND_DESCRIPTION: &str = "向指定 Agent 提问或控制 Agent 的消息接收状态。";
+pub(crate) const ASK_COMMAND_DESCRIPTION: &str = "向指定 Agent 提问。";
+pub(crate) const AGENT_COMMAND_DESCRIPTION: &str = "管理 Agent 的消息接收状态。";
+pub(crate) const AGENT_REPLY_TOO_LARGE: &str = "Agent 列表或回复超出卡片大小限制，无法展示完整列表和按钮。请使用 /agent status {agent_name} 查看单个状态，使用 /agent enable {agent_name} 或 /agent disable {agent_name} 管理消息接收。";
 pub(crate) const AGENT_NAME_ARGUMENT_DESCRIPTION: &str = "当前对话中已配置的 Agent 名称。";
 pub(crate) const ASK_PROMPT_ARGUMENT_DESCRIPTION: &str = "仅发送给指定 Agent 的提示词。";
 pub(crate) const ASK_LIST_DESCRIPTION: &str = "列出所有已订阅 Agent 及其当前状态。";
@@ -179,11 +191,14 @@ pub(crate) fn reset_failed(agent_names: &[String]) -> String {
 }
 
 pub(crate) fn command_details_hint(command_path: &str) -> String {
-    format!("使用 {command_path} {{子命令}} help 查看详情。")
+    format!(
+        "使用 /help {} {{子命令}} 查看详情。",
+        command_path.trim_start_matches('/')
+    )
 }
 
 pub(crate) fn root_command_details_hint() -> &'static str {
-    "使用 /{command} help 查看详情。"
+    "使用 /help {command} 查看详情。"
 }
 
 pub(crate) fn usage(syntax: &str) -> String {

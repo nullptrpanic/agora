@@ -6,6 +6,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command as TokioCommand};
 
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 #[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 
@@ -210,9 +212,23 @@ impl Command {
         };
         process_group.terminate()?;
 
+        // An escaped descendant can retain the pipes even after the direct child
+        // and its process group have exited. Draining must not hold the run open.
+        let mut remaining_drain_wait = OUTPUT_DRAIN_TIMEOUT;
         while stdout_open || stderr_open {
+            let wait_started = tokio::time::Instant::now();
             tokio::select! {
+                biased;
+                _ = tokio::time::sleep(remaining_drain_wait) => {
+                    agora_core::logger::info!(
+                        "agent command output drain timed out after child exit program={} exit_code={}",
+                        self.program,
+                        exit_status_code(status)
+                    );
+                    break;
+                }
                 result = stdout.read(&mut stdout_buffer), if stdout_open => {
+                    remaining_drain_wait = remaining_drain_wait.saturating_sub(wait_started.elapsed());
                     match result.context("read agent command stdout failed")? {
                         0 => stdout_open = false,
                         size => {
@@ -222,6 +238,7 @@ impl Command {
                     }
                 }
                 result = stderr.read(&mut stderr_buffer), if stderr_open => {
+                    remaining_drain_wait = remaining_drain_wait.saturating_sub(wait_started.elapsed());
                     match result.context("read agent command stderr failed")? {
                         0 => stderr_open = false,
                         size => {
