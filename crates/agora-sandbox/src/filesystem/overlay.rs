@@ -282,6 +282,7 @@ pub(crate) struct DirectoryView {
     primary: PathBuf,
     lower: Option<PathBuf>,
     hidden: BTreeSet<OsString>,
+    hidden_upper: BTreeSet<OsString>,
     aliases: HashMap<OsString, OsString>,
     native_snapshot: Option<NativeDirectorySnapshot>,
 }
@@ -371,6 +372,7 @@ impl DirectoryView {
             primary: path,
             lower: None,
             hidden: BTreeSet::new(),
+            hidden_upper: BTreeSet::new(),
             aliases: HashMap::new(),
             native_snapshot: None,
         }
@@ -392,6 +394,10 @@ impl DirectoryView {
         &self.hidden
     }
 
+    pub(crate) fn hidden_upper(&self) -> &BTreeSet<OsString> {
+        &self.hidden_upper
+    }
+
     pub(crate) fn aliases(&self) -> &HashMap<OsString, OsString> {
         &self.aliases
     }
@@ -400,6 +406,7 @@ impl DirectoryView {
         self.primary == self.logical
             && self.lower.is_none()
             && self.hidden.is_empty()
+            && self.hidden_upper.is_empty()
             && self.aliases.is_empty()
     }
 
@@ -1643,12 +1650,13 @@ impl OverlayStore {
         if upper_exists {
             self.reconcile_directory_locked(path)?;
         }
-        let mut hidden = self
+        let hidden = self
             .metadata
             .entries(path)?
             .into_iter()
             .filter_map(|(name, state)| matches!(state, EntryState::Whiteout).then_some(name))
             .collect::<BTreeSet<_>>();
+        let mut hidden_upper = BTreeSet::new();
         let mut aliases = HashMap::new();
         aliases.extend(
             self.metadata
@@ -1660,7 +1668,7 @@ impl OverlayStore {
             for entry in fs::read_dir(&upper)? {
                 let name = entry?.file_name();
                 if namespace::is_control_name(&name) && !aliases.contains_key(&name) {
-                    hidden.insert(name);
+                    hidden_upper.insert(name);
                     continue;
                 }
                 let logical = aliases
@@ -1685,6 +1693,7 @@ impl OverlayStore {
             primary,
             lower,
             hidden,
+            hidden_upper,
             aliases,
             native_snapshot,
         })

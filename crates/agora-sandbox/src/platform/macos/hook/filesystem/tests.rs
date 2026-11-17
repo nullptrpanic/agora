@@ -3929,6 +3929,52 @@ fn directory_cursor_prefers_upper_entries_and_hides_whiteouts() {
 }
 
 #[test]
+fn directory_cursor_keeps_business_names_separate_from_upper_controls() {
+    let fixture = Fixture::new();
+    let lower = fixture.lower.join("directory");
+    std::fs::create_dir(&lower).unwrap();
+    std::fs::write(lower.join(".metadata"), b"business data").unwrap();
+    std::fs::write(lower.join("removed"), b"host").unwrap();
+    fixture
+        .runtime
+        .filesystem
+        .remove(&lower.join("removed"), false)
+        .unwrap();
+    let view = fixture.runtime.filesystem.directory_view(&lower).unwrap();
+    let mut cursor = DirectoryCursor::filter(&view);
+    assert!(cursor.include(b".metadata", false).is_none());
+    assert_eq!(cursor.include(b".metadata", true).unwrap(), b".metadata");
+
+    // A user-created reserved name is encoded only in upper. A literal lower
+    // name equal to that encoding must not be decoded or deduplicated with it.
+    let path = Fixture::c_path(&lower.join(".metadata"));
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_WRONLY, 0);
+        assert!(descriptor >= 0);
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+    let view = fixture.runtime.filesystem.directory_view(&lower).unwrap();
+    let physical = view
+        .aliases()
+        .iter()
+        .find(|(_, name)| name.as_bytes() == b".metadata")
+        .unwrap()
+        .0;
+    let mut cursor = DirectoryCursor::filter(&view);
+    assert!(cursor.include(b".metadata", false).is_none());
+    assert_eq!(
+        cursor.include(physical.as_bytes(), false).unwrap(),
+        b".metadata"
+    );
+    assert!(cursor.include(b".metadata", true).is_none());
+    assert_eq!(
+        cursor.include(physical.as_bytes(), true).unwrap(),
+        physical.as_bytes()
+    );
+    assert!(cursor.include(b"removed", true).is_none());
+}
+
+#[test]
 fn filesystem_ffi_panics_fail_closed_with_io_error() {
     unsafe { *libc::__error() = 0 };
 

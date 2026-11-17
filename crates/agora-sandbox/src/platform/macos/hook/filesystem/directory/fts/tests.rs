@@ -391,51 +391,339 @@ fn supported_attributes() -> libc::attrlist {
     attributes
 }
 
+fn bulk_names(buffer: &[u8], count: libc::c_int, with_error: bool) -> Vec<Vec<u8>> {
+    let mut offset = 0;
+    (0..count)
+        .map(|_| {
+            let length =
+                u32::from_ne_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+            let reference = offset + 24 + usize::from(with_error) * 4;
+            let delta =
+                i32::from_ne_bytes(buffer[reference..reference + 4].try_into().unwrap()) as usize;
+            let name_length =
+                u32::from_ne_bytes(buffer[reference + 4..reference + 8].try_into().unwrap())
+                    as usize;
+            let name = buffer[reference + delta..reference + delta + name_length - 1].to_vec();
+            offset += length;
+            name
+        })
+        .collect()
+}
+
 #[test]
-fn bulk_attribute_records_encode_compact_and_full_layouts() {
+fn direct_bulk_merges_logical_names_and_preserves_cursor_boundaries() {
+    let root = tempfile::tempdir().unwrap();
+    let lower = root.path().join("lower");
+    std::fs::create_dir(&lower).unwrap();
+    std::fs::write(lower.join(".metadata"), b"business").unwrap();
+    std::fs::write(lower.join("lower"), b"host").unwrap();
+    std::fs::write(lower.join("removed"), b"removed").unwrap();
+    let runtime = FilesystemHookRuntime::new(root.path().join("workdir/fs")).unwrap();
+    let upper = runtime
+        .filesystem
+        .prepare_write(&lower.join("upper"), true)
+        .unwrap();
+    std::fs::write(upper, b"sandbox").unwrap();
+    runtime
+        .filesystem
+        .remove(&lower.join("removed"), false)
+        .unwrap();
+    let path = CString::new(lower.as_os_str().as_bytes()).unwrap();
+    with_test_runtime(&runtime, || unsafe {
+        // Deliberately no FtsVirtualBulk: this is the public API's direct path.
+        let fd = agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY, 0);
+        assert!(fd >= 0);
+        let mut attrs = supported_attributes();
+        attrs.commonattr &= !libc::ATTR_CMN_OBJTYPE;
+        let mut buffer = [0_u8; 48];
+        let protected = libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        assert_ne!(protected, libc::MAP_FAILED);
+        assert_eq!(
+            sandbox_getattrlistbulk(fd, (&raw mut attrs).cast(), protected, 4096, 0),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::EFAULT);
+        assert_eq!(libc::munmap(protected, 4096), 0);
+        assert_eq!(
+            sandbox_getattrlistbulk(
+                fd,
+                std::ptr::dangling_mut(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::EFAULT);
+        let mut names = Vec::new();
+        for _ in 0..16 {
+            let count = sandbox_getattrlistbulk(
+                fd,
+                (&raw mut attrs).cast(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+            );
+            assert!(count >= 0, "{}", io::Error::last_os_error());
+            if count == 0 {
+                break;
+            }
+            names.extend(bulk_names(&buffer, count, false));
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            [b".metadata".to_vec(), b"lower".to_vec(), b"upper".to_vec()]
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                sandbox_getattrlistbulk(
+                    fd,
+                    (&raw mut attrs).cast(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    0
+                ),
+                0
+            );
+        }
+        assert_eq!(libc::lseek(fd, 0, libc::SEEK_SET), 0);
+        assert_eq!(
+            sandbox_getattrlistbulk(
+                fd,
+                (&raw mut attrs).cast(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0
+            ),
+            1
+        );
+        assert_eq!(agora_sandbox_close(fd), 0);
+        let reopened =
+            agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY, 0);
+        assert!(reopened >= 0);
+        assert_eq!(
+            sandbox_getattrlistbulk(
+                reopened,
+                (&raw mut attrs).cast(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0
+            ),
+            1
+        );
+        let alias = agora_sandbox_dup(reopened);
+        assert!(alias >= 0);
+        let alias_names = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    with_test_runtime(&runtime, || {
+                        let mut attrs = attrs;
+                        let mut buffer = [0_u8; 256];
+                        let count = sandbox_getattrlistbulk(
+                            alias,
+                            (&raw mut attrs).cast(),
+                            buffer.as_mut_ptr().cast(),
+                            buffer.len(),
+                            0,
+                        );
+                        assert_eq!(count, 2);
+                        bulk_names(&buffer, count, false)
+                    })
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(alias_names.len(), 2);
+        assert_eq!(
+            sandbox_getattrlistbulk(
+                reopened,
+                (&raw mut attrs).cast(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0
+            ),
+            0
+        );
+        assert_eq!(agora_sandbox_close(alias), 0);
+        let mut unsupported = attrs;
+        unsupported.volattr = libc::ATTR_VOL_SIZE;
+        assert_eq!(
+            sandbox_getattrlistbulk(
+                reopened,
+                (&raw mut unsupported).cast(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(agora_sandbox_close(reopened), 0);
+    });
+}
+
+#[test]
+fn bulk_attribute_records_follow_requested_and_returned_bitmaps() {
     let entry = FtsBulkEntry {
         name: b"abc".to_vec(),
         object_type: DARWIN_VNODE_TYPE_DIRECTORY,
     };
-    let compact = fts_attr_record(&entry, &supported_attributes()).unwrap();
-    assert_eq!(compact.len(), 60);
-    assert_eq!(u32::from_ne_bytes(compact[0..4].try_into().unwrap()), 60);
-    assert_eq!(i32::from_ne_bytes(compact[24..28].try_into().unwrap()), 32);
+    let compact = attributes::record(
+        &entry.name,
+        Path::new("/abc"),
+        entry.object_type,
+        None,
+        0,
+        &supported_attributes(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(compact.len(), 40);
+    assert_eq!(u32::from_ne_bytes(compact[0..4].try_into().unwrap()), 40);
+    assert_eq!(i32::from_ne_bytes(compact[24..28].try_into().unwrap()), 12);
     assert_eq!(u32::from_ne_bytes(compact[28..32].try_into().unwrap()), 4);
     assert_eq!(
-        u32::from_ne_bytes(compact[36..40].try_into().unwrap()),
+        u32::from_ne_bytes(compact[32..36].try_into().unwrap()),
         DARWIN_VNODE_TYPE_DIRECTORY
     );
-    assert_eq!(&compact[56..59], b"abc");
+    assert_eq!(&compact[36..39], b"abc");
 
     let mut full_attributes = supported_attributes();
     full_attributes.commonattr |= libc::ATTR_CMN_CRTIME;
-    let full = fts_attr_record(&entry, &full_attributes).unwrap();
-    assert_eq!(full.len(), 160);
-    assert_eq!(i32::from_ne_bytes(full[24..28].try_into().unwrap()), 132);
-    assert_eq!(&full[156..159], b"abc");
+    let full = attributes::record(
+        &entry.name,
+        Path::new("/abc"),
+        entry.object_type,
+        None,
+        0,
+        &full_attributes,
+        u64::from(libc::FSOPT_PACK_INVAL_ATTRS),
+    )
+    .unwrap();
+    assert_eq!(full.len(), 56);
+    assert_eq!(i32::from_ne_bytes(full[24..28].try_into().unwrap()), 28);
+    assert_eq!(&full[52..55], b"abc");
+    assert_eq!(
+        u32::from_ne_bytes(full[4..8].try_into().unwrap()),
+        supported_attributes().commonattr
+    );
 }
 
 #[test]
 fn bulk_attribute_support_rejects_unsupported_bitmaps() {
     let supported = supported_attributes();
-    assert!(fts_attributes_supported(&supported));
+    assert!(attributes::supported(&supported, 0));
 
     let mut attributes = supported;
     attributes.bitmapcount = 0;
-    assert!(!fts_attributes_supported(&attributes));
+    assert!(!attributes::supported(&attributes, 0));
     let mut attributes = supported;
     attributes.commonattr &= !libc::ATTR_CMN_NAME;
-    assert!(!fts_attributes_supported(&attributes));
+    assert!(!attributes::supported(&attributes, 0));
     let mut attributes = supported;
     attributes.volattr = 1;
-    assert!(!fts_attributes_supported(&attributes));
+    assert!(!attributes::supported(&attributes, 0));
     let mut attributes = supported;
-    attributes.dirattr = 1;
-    assert!(!fts_attributes_supported(&attributes));
+    attributes.dirattr = 0x8000_0000;
+    assert!(!attributes::supported(&attributes, 0));
     let mut attributes = supported;
     attributes.forkattr = 1;
-    assert!(!fts_attributes_supported(&attributes));
+    assert!(!attributes::supported(&attributes, 0));
+}
+
+#[test]
+fn bulk_attributes_match_native_layout_for_common_file_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("abc");
+    std::fs::write(&file, b"seven!!").unwrap();
+    let path = CString::new(file.as_os_str().as_bytes()).unwrap();
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    assert_eq!(unsafe { libc::lstat(path.as_ptr(), &mut status) }, 0);
+    let metadata = attributes::Metadata {
+        status,
+        filesystem_id: [0; 8],
+    };
+    let mut requested = supported_attributes();
+    requested.commonattr |= libc::ATTR_CMN_DEVID
+        | libc::ATTR_CMN_FILEID
+        | libc::ATTR_CMN_OWNERID
+        | libc::ATTR_CMN_GRPID
+        | libc::ATTR_CMN_ACCESSMASK
+        | libc::ATTR_CMN_CRTIME
+        | libc::ATTR_CMN_MODTIME
+        | libc::ATTR_CMN_CHGTIME
+        | libc::ATTR_CMN_ACCTIME;
+    requested.fileattr =
+        libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_DATALENGTH | libc::ATTR_FILE_IOBLOCKSIZE;
+    let record = attributes::record(b"abc", &file, 1, Some(&metadata), 0, &requested, 0).unwrap();
+    let mut native = vec![0_u8; record.len()];
+    assert_eq!(
+        unsafe {
+            libc::getattrlist(
+                path.as_ptr(),
+                (&raw mut requested).cast(),
+                native.as_mut_ptr().cast(),
+                native.len(),
+                libc::FSOPT_NOFOLLOW,
+            )
+        },
+        0
+    );
+    assert_eq!(record, native);
+
+    // Physical ciphertext size must not leak into the logical data-length field.
+    let mut logical_metadata = metadata;
+    logical_metadata.status.st_size = 3;
+    let logical =
+        attributes::record(b"abc", &file, 1, Some(&logical_metadata), 0, &requested, 0).unwrap();
+    assert_eq!(
+        i64::from_ne_bytes(
+            logical[logical.len() - 12..logical.len() - 4]
+                .try_into()
+                .unwrap()
+        ),
+        3
+    );
+}
+
+#[test]
+fn bulk_error_records_keep_name_error_and_invalid_field_layout() {
+    let mut requested = supported_attributes();
+    requested.commonattr |=
+        attributes::ATTR_CMN_ERROR | libc::ATTR_CMN_CRTIME | libc::ATTR_CMN_FULLPATH;
+    requested.fileattr = libc::ATTR_FILE_DATALENGTH;
+    for options in [0, u64::from(libc::FSOPT_PACK_INVAL_ATTRS)] {
+        let record = attributes::record(
+            b"missing",
+            Path::new("/logical/missing"),
+            1,
+            None,
+            libc::ENOENT,
+            &requested,
+            options,
+        )
+        .unwrap();
+        assert_eq!(
+            i32::from_ne_bytes(record[24..28].try_into().unwrap()),
+            libc::ENOENT
+        );
+        assert_eq!(bulk_names(&record, 1, true), [b"missing".to_vec()]);
+        let returned = u32::from_ne_bytes(record[4..8].try_into().unwrap());
+        assert_eq!(returned & libc::ATTR_CMN_CRTIME, 0);
+        assert!(
+            record
+                .windows(b"/logical/missing".len())
+                .any(|bytes| bytes == b"/logical/missing")
+        );
+    }
 }
 
 #[test]
@@ -715,11 +1003,24 @@ fn virtual_bulk_delegates_unsupported_recursive_and_unmanaged_requests() {
 }
 
 #[test]
-fn virtual_bulk_delegates_before_reading_tls_when_the_hook_is_unavailable() {
-    assert!(
-        active_fts_bulk_guard_with(None, || panic!(
-            "FTS TLS must not be read before initialization"
-        ))
-        .is_none()
-    );
+fn recursive_bulk_does_not_touch_the_cursor_registry() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("native"), b"x").unwrap();
+    let fd = std::fs::File::open(root.path()).unwrap();
+    let runtime = FilesystemHookRuntime::new(root.path().join("workdir/fs")).unwrap();
+    with_test_runtime(&runtime, || unsafe {
+        let _guard = FilesystemHookGuard::enter().unwrap();
+        let _cursors = lock(bulk_cursors());
+        let mut attributes = supported_attributes();
+        let mut buffer = [0_u8; 4096];
+        assert!(
+            sandbox_getattrlistbulk(
+                fd.as_raw_fd(),
+                (&raw mut attributes).cast(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0
+            ) > 0
+        );
+    });
 }

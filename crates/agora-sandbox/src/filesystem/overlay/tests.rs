@@ -1178,10 +1178,9 @@ fn directory_view_keeps_lower_entries_lazy_and_tracks_whiteouts() {
     let view = fixture.store.directory_view(&fixture.lower).unwrap();
     let upper_names = std::fs::read_dir(view.primary())
         .unwrap()
-        .map(|entry| {
-            let name = entry.unwrap().file_name();
-            view.aliases().get(&name).cloned().unwrap_or(name)
-        })
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| !view.hidden_upper().contains(name))
+        .map(|name| view.aliases().get(&name).cloned().unwrap_or(name))
         .filter(|name| !view.hidden().contains(name))
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(upper_names.len(), 1);
@@ -1342,6 +1341,7 @@ fn case_only_file_rename_updates_the_physical_directory_entry() {
     let visible = std::fs::read_dir(view.primary())
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
+        .filter(|name| !view.hidden_upper().contains(name))
         .filter(|name| !view.hidden().contains(name))
         .collect::<std::collections::BTreeSet<_>>();
     assert!(visible.contains(target.file_name().unwrap()));
@@ -2261,7 +2261,7 @@ fn overlay_handles_missing_cached_entries_cow_ancestors_and_type_errors() {
             .store
             .directory_view(Path::new("/"))
             .unwrap()
-            .hidden()
+            .hidden_upper()
             .contains(std::ffi::OsStr::new(".vfs.lock"))
     );
 }

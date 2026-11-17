@@ -743,7 +743,9 @@ unsafe fn bounded_process_vectors(
     Ok(vectors)
 }
 
-unsafe fn copy_process_value<T>(pointer: *const T) -> std::result::Result<T, libc::c_int> {
+pub(super) unsafe fn copy_process_value<T>(
+    pointer: *const T,
+) -> std::result::Result<T, libc::c_int> {
     let bytes = unsafe { copy_process_bytes(pointer.cast(), std::mem::size_of::<T>()) }?;
     Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
 }

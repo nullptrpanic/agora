@@ -1,10 +1,12 @@
+mod attributes;
 mod fts;
 
 #[cfg(test)]
 mod tests;
 
 pub(in crate::platform::hook::filesystem) use fts::{
-    active_fts_logical_path, register_active_fts_mapping,
+    active_fts_logical_path, duplicate_bulk_descriptor, forget_bulk_descriptor,
+    register_active_fts_mapping,
 };
 
 #[cfg(test)]
@@ -31,6 +33,7 @@ pub(super) struct DirectoryCursor {
     sources: Vec<DirectorySource>,
     source_index: usize,
     hidden: HashSet<Vec<u8>>,
+    hidden_upper: HashSet<Vec<u8>>,
     aliases: HashMap<Vec<u8>, Vec<u8>>,
     seen: HashSet<Vec<u8>>,
     remote_names: HashSet<Vec<u8>>,
@@ -81,6 +84,11 @@ impl DirectoryCursor {
             source_index: 0,
             hidden: view
                 .hidden()
+                .iter()
+                .map(|name| name.as_bytes().to_vec())
+                .collect(),
+            hidden_upper: view
+                .hidden_upper()
                 .iter()
                 .map(|name| name.as_bytes().to_vec())
                 .collect(),
@@ -148,6 +156,7 @@ impl DirectoryCursor {
                 sources,
                 source_index: 0,
                 hidden: HashSet::new(),
+                hidden_upper: HashSet::new(),
                 aliases: HashMap::new(),
                 seen: HashSet::new(),
                 remote_names: HashSet::new(),
@@ -181,14 +190,16 @@ impl DirectoryCursor {
     }
 
     pub(super) fn include(&mut self, name: &[u8], lower: bool) -> Option<Vec<u8>> {
-        let visible = self
-            .aliases
-            .get(name)
-            .map(Vec::as_slice)
-            .unwrap_or(name)
-            .to_vec();
-        if self.hidden.contains(name)
-            || self.hidden.contains(&visible)
+        if !lower && self.hidden_upper.contains(name) {
+            return None;
+        }
+        let visible = if lower {
+            name
+        } else {
+            self.aliases.get(name).map(Vec::as_slice).unwrap_or(name)
+        }
+        .to_vec();
+        if self.hidden.contains(&visible)
             || self.remote_names.contains(&visible)
             || lower && self.seen.contains(&visible)
         {

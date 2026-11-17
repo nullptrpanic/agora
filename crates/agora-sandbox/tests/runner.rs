@@ -211,6 +211,53 @@ fn sandbox_config_in(workdir: impl AsRef<Path>) -> SandboxConfig {
 }
 
 #[cfg(target_os = "macos")]
+#[tokio::test]
+async fn foundation_enumerates_logical_encrypted_directories() {
+    let directory = tempfile::tempdir().unwrap();
+    // Foundation canonicalizes /var to /private/var. Keep the C writes and
+    // Foundation reads in one logical namespace; alias unification is separate.
+    let lower = directory.path().canonicalize().unwrap().join("lower");
+    std::fs::create_dir(&lower).unwrap();
+    for name in [".metadata", "lower.txt", "removed.txt"] {
+        std::fs::write(lower.join(name), b"host").unwrap();
+    }
+    let executable = directory.path().join("directory-foundation");
+    let build = Command::new("/usr/bin/xcrun")
+        .args([
+            "clang",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-framework",
+            "Foundation",
+            "-o",
+        ])
+        .arg(&executable)
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/directory-foundation.m"))
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let outcome = tokio::time::timeout(
+        sandbox_lifecycle_timeout(30),
+        Sandbox::new(
+            sandbox_config_in(directory.path().join("workdir")),
+            NoopCallback,
+        )
+        .run(SandboxCommand::new(&executable).arg(&lower)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(outcome.status().success(), "{:?}", outcome.status());
+    assert!(!lower.join("upper.txt").exists());
+    assert!(lower.join("removed.txt").exists());
+}
+
+#[cfg(target_os = "macos")]
 fn python3() -> PathBuf {
     let homebrew = PathBuf::from("/opt/homebrew/bin/python3");
     if homebrew.is_file() {

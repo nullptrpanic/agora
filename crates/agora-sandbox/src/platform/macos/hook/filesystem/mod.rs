@@ -1304,6 +1304,7 @@ impl FilesystemHookRuntime {
     }
 
     fn duplicate_descriptor_under_lease(&self, source: libc::c_int, destination: libc::c_int) {
+        directory::duplicate_bulk_descriptor(source, destination);
         let mut files = lock(&self.open_files);
         let close_on_exec = files
             .get(&source)
@@ -2257,6 +2258,7 @@ impl FilesystemHookRuntime {
 
     fn unregister_directory(&self, descriptor: libc::c_int) {
         lock(&self.directory_descriptors).remove(&descriptor);
+        directory::forget_bulk_descriptor(descriptor);
     }
 
     fn logical_current_directory(&self) -> Result<CString> {
