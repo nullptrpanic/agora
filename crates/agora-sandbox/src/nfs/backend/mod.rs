@@ -72,9 +72,11 @@ pub(crate) trait RemoteStorage: Send + Sync + 'static {
         destination: &mut File,
         max_length: u64,
     ) -> impl Future<Output = StorageResult<RemoteMetadata>> + Send;
-    /// Replaces `path` only when its current identity still matches `expected`.
-    /// Implementations must keep the comparison and mutation in one backend
-    /// critical section so an external writer cannot race between them.
+    /// Checks `expected` and atomically publishes a complete replacement of `path`.
+    /// Serialize comparison and publication with cooperating writers. The strength
+    /// of conflict detection against non-cooperating clients is backend-specific:
+    /// SMB revalidates before rename, but cannot provide server-side CAS against
+    /// external clients that replace the path between that check and the rename.
     fn write_from_if_unchanged(
         &self,
         path: &RemotePath,
