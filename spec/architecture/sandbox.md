@@ -176,6 +176,8 @@ Inherited control-stream acquisition has one 30-second total deadline across its
 
 ### Native I/O adapters and bulk directory attributes
 
+Before native `aio_read`, `LIO_READ`, `sendfile`, or a data-copy `fcopyfile` source can access a managed plaintext vnode, the hook validates the logical descriptor access mode and returns `EBADF` for an `O_WRONLY` open. Native asynchronous writes and data-copy destinations similarly reject a logically read-only descriptor before snapshot preparation or submission. This check does not make unsupported encrypted asynchronous writes supported: writable encrypted `aio_write`, `LIO_WRITE`, and opaque copy destinations still return `ENOTSUP` as described above.
+
 Interposed `getattrlistbulk` uses the merged directory view for direct callers as well as FTS, including Foundation enumeration. Names, object types, common logical stat attributes, filesystem IDs, and file data lengths are packed according to the requested Darwin bitmaps, with four-byte field alignment, relative string references, and accurate returned-attribute masks. Requested attributes not represented by the logical metadata model are omitted, or zero-filled without their returned bit when `FSOPT_PACK_INVAL_ATTRS` is used. Unsupported bitmap layouts/options on a managed view return `ENOTSUP`, never raw upper entries; native-only views still delegate to libc. The native open-file offset tracks the virtual cursor so ordinary rewind, FD reuse and sequential handoff/duplication do not restart or skip entries. EOF remains EOF until rewind, and close releases cached listings. Traversal remains a per-open snapshot, not a new directory-change notification or arbitrary native `seekdir`/`telldir` facility.
 
 ## Executable Preparation

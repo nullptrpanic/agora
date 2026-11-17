@@ -825,6 +825,9 @@ pub unsafe extern "C" fn agora_sandbox_sendfile(
             drop(guard);
             return unsafe { original(descriptor, socket, offset, length, headers, flags) };
         };
+        if let Err(error) = open.managed().check_native_access(descriptor, false) {
+            return unsafe { fail(&error, -1) };
+        }
         if offset < 0 {
             drop(guard);
             return unsafe { original(descriptor, socket, offset, length, headers, flags) };
@@ -863,6 +866,15 @@ pub unsafe extern "C" fn agora_sandbox_fcopyfile(
             drop(guard);
             return unsafe { original(source, destination, state, flags) };
         };
+        if flags & libc::COPYFILE_DATA != 0 {
+            for (descriptor, write) in [(source, false), (destination, true)] {
+                if let Some(open) = runtime.tracked_open(descriptor)
+                    && let Err(error) = open.managed().check_native_access(descriptor, write)
+                {
+                    return unsafe { fail(&error, -1) };
+                }
+            }
+        }
         if let Err(error) = prepare_native_snapshot_descriptor(runtime, destination) {
             return unsafe { fail(&error, -1) };
         }
@@ -913,9 +925,7 @@ pub unsafe extern "C" fn agora_sandbox_aio_read(control: *mut libc::aiocb) -> li
                 return -1;
             }
         };
-        if let Some(range) = aio_read_range(&copied)
-            && let Err(error) = materialize_descriptor(runtime, copied.aio_fildes, Some(range))
-        {
+        if let Err(error) = prepare_async_read_descriptor(runtime, &copied) {
             return unsafe { fail(&error, -1) };
         }
         drop(guard);
@@ -994,9 +1004,7 @@ pub unsafe extern "C" fn agora_sandbox_lio_listio(
                 }
             };
             let materialized = match control.aio_lio_opcode {
-                libc::LIO_READ => aio_read_range(&control)
-                    .map(|range| materialize_descriptor(runtime, control.aio_fildes, Some(range)))
-                    .transpose(),
+                libc::LIO_READ => prepare_async_read_descriptor(runtime, &control).map(Some),
                 libc::LIO_WRITE => {
                     let materialized = prepare_async_write_descriptor(runtime, control.aio_fildes);
                     if materialized.is_ok() {
@@ -1019,15 +1027,19 @@ pub unsafe extern "C" fn agora_sandbox_lio_listio(
     })
 }
 
-fn materialize_descriptor(
+fn prepare_async_read_descriptor(
     runtime: &FilesystemHookRuntime,
-    descriptor: libc::c_int,
-    range: Option<LocalByteRange>,
+    control: &libc::aiocb,
 ) -> Result<()> {
-    let Some(open) = runtime.tracked_open(descriptor) else {
+    let Some(open) = runtime.tracked_open(control.aio_fildes) else {
         return Ok(());
     };
-    open.managed().materialize(runtime, range)
+    open.managed()
+        .check_native_access(control.aio_fildes, false)?;
+    if let Some(range) = aio_read_range(control) {
+        open.managed().materialize(runtime, Some(range))?;
+    }
+    Ok(())
 }
 
 fn prepare_native_snapshot_descriptor(
@@ -1047,6 +1059,7 @@ fn prepare_async_write_descriptor(
     let Some(open) = runtime.tracked_open(descriptor) else {
         return Ok(());
     };
+    open.managed().check_native_access(descriptor, true)?;
     if !open.managed().supports_async_write() {
         return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into());
     }

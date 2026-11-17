@@ -104,6 +104,26 @@ impl ManagedContent {
         self.backend.merge_status_flags(&self.state, native)
     }
 
+    /// Native adapters see the backing FD's access mode, which can be broader
+    /// than the logical open. Check it before handing I/O to libc.
+    pub(super) fn check_native_access(&self, descriptor: libc::c_int, write: bool) -> Result<()> {
+        let native = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if native < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mode = self.merge_status_flags(native)? & libc::O_ACCMODE;
+        if mode
+            == if write {
+                libc::O_RDONLY
+            } else {
+                libc::O_WRONLY
+            }
+        {
+            return Err(std::io::Error::from_raw_os_error(libc::EBADF).into());
+        }
+        Ok(())
+    }
+
     pub(super) fn native_status_flags(&self, requested: libc::c_int) -> libc::c_int {
         self.backend.native_status_flags(requested)
     }
