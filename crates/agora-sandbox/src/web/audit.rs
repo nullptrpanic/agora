@@ -250,9 +250,12 @@ impl LogCursor {
     fn consume(&mut self, appended: Vec<u8>) -> io::Result<Vec<CursorItem>> {
         self.pending.extend(appended);
         let mut items = Vec::new();
-        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
-            let mut line = self.pending.drain(..=newline).collect::<Vec<_>>();
-            line.pop();
+        let mut consumed = 0;
+        for record in self.pending.split_inclusive(|byte| *byte == b'\n') {
+            let Some(line) = record.strip_suffix(b"\n") else {
+                break;
+            };
+            consumed += record.len();
             if self.dropping_oversized {
                 self.dropping_oversized = false;
                 continue;
@@ -266,7 +269,7 @@ impl LogCursor {
             if line.is_empty() {
                 continue;
             }
-            match normalize_line(self.next_id, &line) {
+            match normalize_line(self.next_id, line) {
                 Ok(Some(event)) => {
                     self.next_id += 1;
                     items.push(CursorItem::Event(event));
@@ -275,6 +278,7 @@ impl LogCursor {
                 Err(error) => items.push(CursorItem::Diagnostic(error.to_string())),
             }
         }
+        self.pending.drain(..consumed);
         if self.pending.len() > MAX_LINE_BYTES {
             self.pending.clear();
             self.dropping_oversized = true;
