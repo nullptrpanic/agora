@@ -619,21 +619,10 @@ where
                 "remote path is not a directory",
             ));
         }
-        let backend_flags = flags & !libc::O_TRUNC;
-        let (backend, metadata, created) =
-            self.storage.open_file(&path, backend_flags, mode).await?;
-        let mut temporary = tempfile::NamedTempFile::new_in(&self.staging)
+        // Allocate all local descriptors before acquiring a server handle (or
+        // creating a remote file). FD exhaustion must have no remote effect.
+        let temporary = tempfile::NamedTempFile::new_in(&self.staging)
             .map_err(|error| storage_io("failed to create anonymous remote file", error))?;
-        temporary
-            .as_file_mut()
-            .set_len(metadata.size)
-            .map_err(|error| storage_io("failed to size remote placeholder", error))?;
-        temporary
-            .flush()
-            .map_err(|error| storage_io("failed to flush anonymous remote file", error))?;
-        let retained = temporary
-            .reopen()
-            .map_err(|error| storage_io("failed to retain anonymous remote file", error))?;
         let mut options = OpenOptions::new();
         options.read(readable).write(writable).custom_flags(
             libc::O_CLOEXEC
@@ -644,11 +633,25 @@ where
             .map_err(|error| storage_io("failed to open anonymous remote file", error))?;
         std::fs::remove_file(temporary.path())
             .map_err(|error| storage_io("failed to unlink anonymous remote file", error))?;
-        drop(temporary);
+        let retained = temporary.into_file();
         set_close_on_exec(&application)?;
         let replay = application
             .try_clone()
             .map_err(|error| storage_io("failed to retain remote descriptor", error))?;
+        let (mut backend, metadata, created) = self
+            .storage
+            .open_file(&path, flags & !libc::O_TRUNC, mode)
+            .await?;
+        if metadata.size != 0
+            && let Err(error) = retained.set_len(metadata.size)
+        {
+            self.storage.close_file(&mut backend).await?;
+            if created {
+                self.remove_created_if_unchanged(&path, Some(&metadata))
+                    .await?;
+            }
+            return Err(storage_io("failed to size remote placeholder", error));
+        }
         let handle = Uuid::new_v4().simple().to_string();
         self.handles.lock().await.insert(
             handle.clone(),
@@ -1512,13 +1515,21 @@ where
             return Ok(());
         }
         let _mutation = self.lock_root(path.root()).await;
-        match self.storage.stat(&path).await {
+        self.remove_created_if_unchanged(&path, baseline.as_ref())
+            .await
+    }
+
+    // The caller already owns the root mutation lock.
+    async fn remove_created_if_unchanged(
+        &self,
+        path: &RemotePath,
+        baseline: Option<&RemoteMetadata>,
+    ) -> StorageResult<()> {
+        match self.storage.stat(path).await {
             Ok(current)
-                if baseline
-                    .as_ref()
-                    .is_some_and(|baseline| baseline.identity == current.identity) =>
+                if baseline.is_some_and(|baseline| baseline.identity == current.identity) =>
             {
-                self.storage.remove(&path, false).await
+                self.storage.remove(path, false).await
             }
             Ok(_) => Ok(()),
             Err(error) if error.errno() == libc::ENOENT => Ok(()),

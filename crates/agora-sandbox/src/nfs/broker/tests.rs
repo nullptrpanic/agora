@@ -67,6 +67,27 @@ async fn materialize(broker: &Broker<MemoryStorage>, handle: &str) -> Response {
 }
 
 #[tokio::test]
+async fn failed_local_open_staging_leaves_no_remote_file() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    let staging = root.path().join("staging");
+    let broker = Broker::new(Arc::clone(&storage), &staging).unwrap();
+    std::fs::remove_dir(&staging).unwrap();
+    let reply = broker
+        .handle(Request::Open {
+            path: path("new"),
+            flags: libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            mode: 0o600,
+        })
+        .await;
+    assert!(matches!(reply.response, Response::Error { .. }));
+    assert_eq!(
+        storage.stat(&path("new")).await.unwrap_err().errno(),
+        libc::ENOENT
+    );
+}
+
+#[tokio::test]
 async fn broker_write_only_snapshot_detects_changed_baselines() {
     let root = tempfile::tempdir().unwrap();
     let storage = Arc::new(MemoryStorage::default());
