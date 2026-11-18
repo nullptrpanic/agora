@@ -1,9 +1,63 @@
-use super::{FilesystemMode, FilesystemWorkspace, PlainWorkspace};
+use super::{FilesystemMode, FilesystemWorkspace, PlainWorkspace, lock_workspace};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 
 fn temporary_directory(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("agora-workspace-{name}-{}", uuid::Uuid::new_v4()))
+}
+
+#[test]
+fn workspace_lock_is_released_by_the_owner_even_with_an_inherited_fd() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = lock_workspace(directory.path()).unwrap();
+    // dup and fork retain the same kernel open file description.
+    let inherited = owner.file.try_clone().unwrap();
+    assert!(lock_workspace(directory.path()).is_err());
+    drop(owner);
+    let next = lock_workspace(directory.path()).expect("owner finished while another FD survived");
+    drop(inherited);
+    assert!(lock_workspace(directory.path()).is_err());
+    drop(next);
+}
+
+#[test]
+fn forked_child_dropping_its_workspace_copy_does_not_unlock_the_parent() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = lock_workspace(directory.path()).unwrap();
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0);
+    if child == 0 {
+        drop(owner);
+        unsafe { libc::_exit(0) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert_eq!(status, 0);
+    assert!(lock_workspace(directory.path()).is_err());
+    drop(owner);
+    assert!(lock_workspace(directory.path()).is_ok());
+}
+
+#[test]
+fn plain_mode_reads_the_key_marker_only_under_the_workspace_lock() {
+    let workdir = tempfile::tempdir().unwrap();
+    let root = workdir.path().join("fs");
+    std::fs::create_dir(&root).unwrap();
+    let owner = lock_workspace(&root).unwrap();
+    std::fs::write(root.join(".key.json"), b"encrypted workspace").unwrap();
+    assert!(
+        PlainWorkspace::start(workdir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("already in use")
+    );
+    drop(owner);
+    assert!(
+        PlainWorkspace::start(workdir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("encrypted filesystem state")
+    );
 }
 
 #[test]
@@ -28,6 +82,9 @@ fn plain_workspace_is_persistent_and_exclusive() {
     std::fs::write(workspace.root().join("marker"), b"persisted").unwrap();
 
     let error = PlainWorkspace::start(&workdir).unwrap_err();
+    assert!(error.to_string().contains("filesystem is already in use"));
+    let error = FilesystemWorkspace::start(&workdir, FilesystemMode::Encrypted, Some(b"secret"))
+        .unwrap_err();
     assert!(error.to_string().contains("filesystem is already in use"));
     drop(workspace);
 

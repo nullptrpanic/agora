@@ -1,6 +1,7 @@
 use super::crypto::FileCipher;
 use super::metadata::{EntryState, Materializer, MetadataStore};
 use super::namespace;
+use super::workspace::{LOCK_FILE, WorkspaceLock, lock_workspace};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -20,7 +21,6 @@ thread_local! {
 }
 
 const ROOT_DIRECTORY: &str = "fs";
-const LOCK_FILE: &str = ".fs.lock";
 const KEY_FILE: &str = ".key.json";
 const VFS_LOCK_FILE: &str = ".vfs.lock";
 const DIRECTORY_METADATA_FILE: &str = ".metadata";
@@ -82,7 +82,7 @@ enum KeyMetadataPublication {
 
 pub(crate) struct EncryptedWorkspace {
     root: PathBuf,
-    _lock: File,
+    _lock: WorkspaceLock,
     cipher: FileCipher,
     #[cfg(test)]
     salt: Vec<u8>,
@@ -107,7 +107,7 @@ impl EncryptedWorkspace {
         let workdir = Self::resolved_destination(workdir)?;
         let root = workdir.join(ROOT_DIRECTORY);
         Self::prepare_directory(&root)?;
-        let lock = Self::lock(&root)?;
+        let lock = lock_workspace(&root)?;
         Self::recover_migration(&root)?;
         let metadata = if root.join(KEY_FILE).exists() {
             Self::read_key_metadata(&root)?
@@ -191,7 +191,7 @@ impl EncryptedWorkspace {
                 root.join(KEY_FILE).display()
             );
         }
-        let _lock = Self::lock(&root)?;
+        let _lock = lock_workspace(&root)?;
         Self::recover_migration(&root)?;
         Self::cleanup_orphaned_staging(&root)?;
         let metadata = Self::read_key_metadata(&root)?;
@@ -423,24 +423,6 @@ impl EncryptedWorkspace {
 
     fn prepare_directory(directory: &Path) -> Result<()> {
         crate::managed_fs::prepare_owned_directory(directory, "encrypted filesystem root").map(drop)
-    }
-
-    fn lock(root: &Path) -> Result<File> {
-        let path = root.join(LOCK_FILE);
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600);
-        let lock = crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600))
-            .with_context(|| format!("failed to open filesystem lock {}", path.display()))?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("filesystem is already in use: {}", root.display()));
-        }
-        Ok(lock)
     }
 
     fn new_key_metadata(passphrase: &[u8]) -> Result<KeyMetadata> {

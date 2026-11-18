@@ -8,7 +8,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const ROOT_DIRECTORY: &str = "fs";
-const LOCK_FILE: &str = ".fs.lock";
+pub(super) const LOCK_FILE: &str = ".fs.lock";
 const KEY_FILE: &str = ".key.json";
 
 #[derive(Debug)]
@@ -65,7 +65,7 @@ impl FilesystemWorkspace {
 #[derive(Debug)]
 pub(crate) struct PlainWorkspace {
     root: PathBuf,
-    _lock: File,
+    _lock: WorkspaceLock,
 }
 
 impl PlainWorkspace {
@@ -73,13 +73,13 @@ impl PlainWorkspace {
         let workdir = EncryptedWorkspace::resolved_destination(workdir)?;
         let root = workdir.join(ROOT_DIRECTORY);
         Self::prepare_directory(&root, "plain filesystem root")?;
+        let lock = lock_workspace(&root)?;
         if root.join(KEY_FILE).exists() {
             bail!(
                 "encrypted filesystem state exists at {}; use encrypted filesystem mode",
                 root.display()
             );
         }
-        let lock = Self::lock(&root)?;
         Ok(Self { root, _lock: lock })
     }
 
@@ -90,24 +90,47 @@ impl PlainWorkspace {
     fn prepare_directory(directory: &Path, description: &str) -> Result<()> {
         crate::managed_fs::prepare_owned_directory(directory, description).map(drop)
     }
+}
 
-    fn lock(directory: &Path) -> Result<File> {
-        let path = directory.join(LOCK_FILE);
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600);
-        let lock = crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600))
-            .with_context(|| format!("failed to open filesystem lock {}", path.display()))?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("filesystem is already in use: {}", directory.display()));
+#[derive(Debug)]
+pub(super) struct WorkspaceLock {
+    file: File,
+    owner: u32,
+}
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        // fork duplicates the open file description. Only the owning process
+        // ends the lease; it need not wait for an unrelated child to exec.
+        if self.owner == std::process::id() {
+            while self
+                .file
+                .unlock()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::Interrupted)
+            {}
         }
-        Ok(lock)
     }
+}
+
+pub(super) fn lock_workspace(directory: &Path) -> Result<WorkspaceLock> {
+    let path = directory.join(LOCK_FILE);
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600);
+    let lock = crate::managed_fs::open_owned_regular(&mut options, &path, Some(0o600))
+        .with_context(|| format!("failed to open filesystem lock {}", path.display()))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("filesystem is already in use: {}", directory.display()));
+    }
+    Ok(WorkspaceLock {
+        file: lock,
+        owner: std::process::id(),
+    })
 }
 
 #[cfg(test)]
