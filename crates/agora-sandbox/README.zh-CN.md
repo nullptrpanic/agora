@@ -235,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-`SandboxCommand` 还支持 `args`、`env`、`current_dir` 和标准 `Stdio` 配置。`spawn` 返回一个仍在运行的 `SandboxChild`；管道读取、执行超时和输出上限由调用方负责。
+`SandboxCommand` 还支持 `args`、`env`、`current_dir` 和标准 `Stdio` 配置。`run` 默认继承 stdout 和 stderr，只返回退出状态，不返回输出。显式将某个流设为 `Stdio::piped()` 时，`run` 会持续读取并丢弃该流。要读取输出或控制超时、字节上限，请使用 `spawn`，从返回的 `SandboxChild` 读取管道。
 
 ## 安全模型与限制
 

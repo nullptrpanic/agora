@@ -393,6 +393,28 @@ async fn sandbox_spawn_returns_a_running_child() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn status_only_run_does_not_stall_on_full_output_pipes() {
+    let root = tempfile::tempdir().unwrap();
+    let config = SandboxConfig::new(built_hook_library()).with_workdir(root.path());
+    let command = SandboxCommand::new("/bin/sh")
+        .args([
+            "-c",
+            "/usr/bin/head -c 2097152 /dev/zero; /usr/bin/head -c 2097152 /dev/zero >&2; exit 7",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        Sandbox::new(config, NoopCallback).run(command),
+    )
+    .await
+    .expect("status-only run stalled on an unread pipe")
+    .unwrap();
+    assert_eq!(result.status().code(), Some(7));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn sandbox_child_exposes_standard_piped_output_fields() {
     let root = std::env::temp_dir().join(format!("agora-piped-run-{}", uuid::Uuid::new_v4()));
     let config = SandboxConfig::new(built_hook_library())

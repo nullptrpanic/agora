@@ -848,7 +848,25 @@ where
     #[cfg(target_os = "macos")]
     pub async fn run(self, command: SandboxCommand) -> Result<SandboxOutcome> {
         let mut child = self.spawn_with_foreground(command, true).await?;
-        child.wait().await
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        if stdout.is_none() && stderr.is_none() {
+            return child.wait().await;
+        }
+        async fn drain(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> std::io::Result<()> {
+            if let Some(mut pipe) = pipe {
+                tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await?;
+            }
+            Ok(())
+        }
+        let wait = child.wait();
+        tokio::pin!(wait);
+        tokio::select! {
+            outcome = &mut wait => outcome,
+            drained = async { tokio::try_join!(drain(stdout), drain(stderr)) } => {
+                drained.context("failed to drain sandbox output pipes")?;
+                wait.await
+            }
+        }
     }
 
     #[cfg(not(target_os = "macos"))]

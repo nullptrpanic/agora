@@ -125,8 +125,10 @@ Current status:
   `wait` method closes an owned piped stdin, shuts the runtime down once, and returns the cached exit
   status on later calls, matching the standard child lifecycle where the sandbox-specific runtime
   ownership permits it.
-  `Sandbox::run` is the foreground convenience path that waits for that child and returns its exit
-  status. The caller owns pipe draining, streaming, output limits, and execution timeout policy.
+  `Sandbox::run` returns only the foreground child's exit status. Output is inherited by default.
+  If a caller explicitly pipes stdout or stderr, `run` drains and discards the configured streams
+  concurrently without buffering the output in memory. To consume output or impose an output limit
+  or timeout, use `spawn` and the child's pipe handles.
   Dropping a live child terminates its complete process group. Sandbox initialization and execution
   errors remain fail-closed rather than falling back to an unsandboxed command.
 - `runner/runtime.rs` owns reusable filesystem, local and NFS Broker, network, execution, and audit

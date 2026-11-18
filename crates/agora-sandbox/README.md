@@ -235,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-`SandboxCommand` also supports `args`, `env`, `current_dir`, and standard `Stdio` configuration. `spawn` returns a live `SandboxChild`; the caller owns pipe draining, execution timeouts, and output limits.
+`SandboxCommand` also supports `args`, `env`, `current_dir`, and standard `Stdio` configuration. `run` inherits stdout and stderr by default. It returns the exit status, not the output: if you explicitly set either stream to `Stdio::piped()`, `run` drains and discards that stream. To read the output or apply a timeout or byte limit, use `spawn` and read the pipes on the returned `SandboxChild`.
 
 ## Security Model and Limitations
 
