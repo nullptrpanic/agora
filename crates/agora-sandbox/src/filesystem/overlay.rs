@@ -716,6 +716,44 @@ impl OverlayStore {
         Ok(())
     }
 
+    pub(super) fn commit_broker_create(
+        &self,
+        mut staged: StagedWrite,
+        lease: &File,
+        mode: u32,
+        authorize_existing: impl FnOnce(&OverlayTransaction<'_>, &Path) -> Result<()>,
+    ) -> Result<(File, bool)> {
+        let result = self.transaction(|tx| {
+            let destination = self
+                .attached_write_destination(lease)?
+                .filter(|path| path == staged.destination())
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ESTALE))?;
+            let existing = self.metadata.state(&staged.logical)? == Some(EntryState::Cow);
+            if existing {
+                if staged.reservation.is_some() {
+                    return Err(std::io::Error::from_raw_os_error(libc::EEXIST).into());
+                }
+                authorize_existing(tx, &staged.logical)?;
+            } else {
+                let cipher = self
+                    .cipher
+                    .as_ref()
+                    .context("encrypted create requires a cipher")?;
+                cipher.encrypt(&mut tempfile::tempfile()?, &destination)?;
+                self.metadata.set_with_attributes(
+                    &staged.logical,
+                    EntryState::Cow,
+                    Some(FileAttributes::created_file(mode)),
+                )?;
+            }
+            // The kernel reference prevents inode recycling while the Broker
+            // opens this name. Never adopt a replacement from that interval.
+            Ok((File::open(destination)?, !existing))
+        })?;
+        staged.commit();
+        Ok(result)
+    }
+
     pub(crate) fn publish_encrypted(
         &self,
         plaintext: &mut File,
@@ -743,34 +781,35 @@ impl OverlayStore {
             .as_ref()
             .context("encrypted writeback requires a filesystem cipher")?;
         self.with_lock(|| {
-            let Some(destination) = Self::read_write_lease_destination(lease)? else {
+            let Some(destination) = self.attached_write_destination(lease)? else {
                 return Ok(None);
             };
-            if !self.is_internal(&destination) {
-                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
-            }
-            let lease_path = namespace::write_lease_path(&destination)?;
-            let mut options = OpenOptions::new();
-            options.read(true);
-            let current_lease =
-                match crate::managed_fs::open_owned_regular(&mut options, &lease_path, Some(0o600))
-                {
-                    Ok(current) => current,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                    Err(error) => return Err(error.into()),
-                };
-            let held_identity = lease
-                .metadata()
-                .map(|metadata| (metadata.dev(), metadata.ino()))?;
-            let current_identity = current_lease
-                .metadata()
-                .map(|metadata| (metadata.dev(), metadata.ino()))?;
-            if held_identity != current_identity {
-                return Ok(None);
-            }
             publish(cipher, plaintext, &destination)?;
             Ok(Some(destination))
         })
+    }
+
+    // Caller holds the overlay transaction lock.
+    fn attached_write_destination(&self, lease: &File) -> Result<Option<PathBuf>> {
+        let Some(destination) = Self::read_write_lease_destination(lease)? else {
+            return Ok(None);
+        };
+        if !self.is_internal(&destination) {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+        }
+        let path = namespace::write_lease_path(&destination)?;
+        let current = match crate::managed_fs::open_owned_regular(
+            File::options().read(true),
+            &path,
+            Some(0o600),
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok((BackingIdentity::from_metadata(&current.metadata()?)
+            == BackingIdentity::from_metadata(&lease.metadata()?))
+        .then_some(destination))
     }
 
     #[cfg(test)]

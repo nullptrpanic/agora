@@ -441,9 +441,6 @@ impl PreparedOpen {
 
     fn into_parts(self) -> (OpenTarget, OpenFile) {
         let (target, prepared_content, layer) = self.prepared.into_parts();
-        // Broker-managed encrypted opens may still carry the eager fallback
-        // produced by the overlay plan. The Broker has always been the
-        // authoritative writeback owner in that case.
         let writable = self.file.mode.access != FileAccessMode::Read;
         let content = self
             .content
@@ -1127,14 +1124,15 @@ impl FilesystemHookRuntime {
         match &mut prepared.prepared {
             PreparedOpenFile::Local(local) => {
                 self.filesystem.commit_open(local)?;
-                prepared.identity = local
-                    .encrypted_backing_identity()?
-                    .map(|(device, inode)| LogicalFileIdentity { device, inode });
                 if let Some(client) = &self.local
-                    && let Some((path, flags)) = local.local_broker_request()
+                    && let Some((path, flags, published)) = local.local_broker_request()
                 {
-                    let opened = client.open(&path, flags)?;
+                    let opened = client.open(path, flags, published)?;
                     let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
+                    prepared.identity = Some(LogicalFileIdentity {
+                        device: opened.identity.device,
+                        inode: opened.identity.inode,
+                    });
                     *local.target_mut() = OpenTarget::Descriptor(opened.descriptor);
                     prepared.content = Some(ManagedContent::encrypted(
                         EncryptedContent {
@@ -1146,6 +1144,10 @@ impl FilesystemHookRuntime {
                         },
                         writable,
                     ));
+                } else {
+                    prepared.identity = local
+                        .encrypted_backing_identity()?
+                        .map(|(device, inode)| LogicalFileIdentity { device, inode });
                 }
                 Ok(())
             }
@@ -1172,32 +1174,38 @@ impl FilesystemHookRuntime {
             .cloned()
             .collect::<Vec<_>>();
         for open in writers {
-            loop {
-                let descriptor =
-                    lock(&self.open_files)
-                        .iter()
-                        .find_map(|(&descriptor, candidate)| {
-                            Arc::ptr_eq(candidate, &open).then_some(descriptor)
-                        });
-                let Some(descriptor) = descriptor else {
-                    break;
-                };
-                let _operation = self.operations.acquire(
-                    mapping::OperationRequest::new()
-                        .descriptor_registry_shared()
-                        .descriptor_shared(descriptor),
-                );
-                if !self
-                    .tracked_open(descriptor)
-                    .is_some_and(|current| Arc::ptr_eq(&current, &open))
-                {
-                    continue;
-                }
-                self.commit_open_file(descriptor, &open, false)?;
-                break;
-            }
+            self.with_live_descriptor(&open, |descriptor| {
+                self.commit_open_file(descriptor, &open, false)
+            })?;
         }
         Ok(())
+    }
+
+    fn with_live_descriptor(
+        &self,
+        open: &Arc<OpenFile>,
+        operation: impl FnOnce(libc::c_int) -> Result<()>,
+    ) -> Result<()> {
+        loop {
+            let descriptor = lock(&self.open_files)
+                .iter()
+                .find_map(|(&fd, candidate)| Arc::ptr_eq(candidate, open).then_some(fd));
+            let Some(descriptor) = descriptor else {
+                return Ok(());
+            };
+            let _lease = self.operations.acquire(
+                mapping::OperationRequest::new()
+                    .descriptor_registry_shared()
+                    .descriptor_shared(descriptor),
+            );
+            // close or dup2 may have reassigned this fd before we obtained its lease.
+            if self
+                .tracked_open(descriptor)
+                .is_some_and(|current| Arc::ptr_eq(&current, open))
+            {
+                return operation(descriptor);
+            }
+        }
     }
 
     fn prepare_descriptor_mutation(&self, descriptor: libc::c_int) -> Result<StagedWrite> {
@@ -1774,36 +1782,15 @@ impl FilesystemHookRuntime {
         };
         self.finish_unreferenced(stale)?;
         for open in open_files {
-            loop {
-                let descriptor =
-                    lock(&self.open_files)
-                        .iter()
-                        .find_map(|(&descriptor, candidate)| {
-                            Arc::ptr_eq(candidate, &open).then_some(descriptor)
-                        });
-                let Some(descriptor) = descriptor else {
-                    break;
-                };
-                let _operation = self.operations.acquire(
-                    mapping::OperationRequest::new()
-                        .descriptor_registry_shared()
-                        .descriptor_shared(descriptor),
-                );
-                if !self
-                    .tracked_open(descriptor)
-                    .is_some_and(|current| Arc::ptr_eq(&current, &open))
-                {
-                    continue;
-                }
+            self.with_live_descriptor(&open, |descriptor| {
                 self.commit_open_file(descriptor, &open, true)
                     .with_context(|| {
                         format!(
                             "failed to synchronize descriptor {descriptor} for {}",
                             open.logical().display()
                         )
-                    })?;
-                break;
-            }
+                    })
+            })?;
         }
         Ok(())
     }

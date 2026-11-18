@@ -34,14 +34,23 @@ impl Fixture {
     }
 
     fn open(&self, path: &Path, writable: bool) -> (String, File) {
-        let mut reply = self.broker.handle(
+        self.open_flags(
+            path,
+            if writable {
+                libc::O_RDWR
+            } else {
+                libc::O_RDONLY
+            },
+        )
+    }
+
+    fn open_flags(&self, path: &Path, flags: libc::c_int) -> (String, File) {
+        let request_id = Uuid::new_v4().simple().to_string();
+        let mut reply = self.broker.handle_request(
+            request_id.clone(),
             Request::Open {
                 path: BackingPath::from_path(path),
-                flags: if writable {
-                    libc::O_RDWR
-                } else {
-                    libc::O_RDONLY
-                },
+                flags,
             },
             None,
         );
@@ -49,6 +58,12 @@ impl Fixture {
             panic!("unexpected open response: {:?}", reply.response);
         };
         assert_eq!(reply.descriptors.len(), 3);
+        assert_eq!(
+            self.broker
+                .handle(Request::Claim { request_id }, None)
+                .response,
+            Response::Success
+        );
         let content = reply.descriptors.remove(0);
         (handle, content)
     }
@@ -115,7 +130,7 @@ fn large_read_only_open_materializes_only_requested_ranges() {
 
     let offset = 512 * 1024 + 17;
     let mut cold = [1_u8; 32];
-    read_exact_at(&plaintext, &mut cold, offset).unwrap();
+    plaintext.read_exact_at(&mut cold, offset).unwrap();
     assert_eq!(cold, [0_u8; 32]);
 
     assert_eq!(
@@ -131,14 +146,16 @@ fn large_read_only_open_materializes_only_requested_ranges() {
             .response,
         Response::Success
     );
-    read_exact_at(&plaintext, &mut cold, offset).unwrap();
+    plaintext.read_exact_at(&mut cold, offset).unwrap();
     assert_eq!(
         &cold,
         &contents[offset as usize..offset as usize + cold.len()]
     );
 
     let mut untouched = [1_u8; 32];
-    read_exact_at(&plaintext, &mut untouched, 1536 * 1024).unwrap();
+    plaintext
+        .read_exact_at(&mut untouched, 1536 * 1024)
+        .unwrap();
     assert_eq!(untouched, [0_u8; 32]);
 }
 
@@ -215,7 +232,7 @@ fn small_read_only_open_remains_eager() {
     assert!(matches!(reply.response, Response::Open { lazy: false, .. }));
     let plaintext = reply.descriptors.remove(0);
     let mut contents = [0_u8; 9];
-    read_exact_at(&plaintext, &mut contents, 0).unwrap();
+    plaintext.read_exact_at(&mut contents, 0).unwrap();
     assert_eq!(&contents, b"plaintext");
 }
 
@@ -291,7 +308,7 @@ fn lazy_read_reports_corruption_only_when_the_block_is_materialized() {
         Response::Success
     );
     let mut prefix = [0_u8; 32];
-    read_exact_at(&plaintext, &mut prefix, 0).unwrap();
+    plaintext.read_exact_at(&mut prefix, 0).unwrap();
     assert_eq!(prefix, [b'x'; 32]);
 
     assert_error(
@@ -327,7 +344,7 @@ fn lazy_materialization_does_not_hide_an_unreported_plaintext_change() {
         panic!("unexpected open response: {:?}", reply.response);
     };
     let plaintext = reply.descriptors.remove(0);
-    write_all_at(&plaintext, b"changed", 0).unwrap();
+    plaintext.write_all_at(b"changed", 0).unwrap();
 
     assert_eq!(
         fixture
@@ -372,7 +389,9 @@ fn large_writable_first_open_is_lazy() {
     assert!(matches!(reply.response, Response::Open { lazy: true, .. }));
     let plaintext = reply.descriptors.remove(0);
     let mut cold = [1_u8; 32];
-    read_exact_at(&plaintext, &mut cold, contents.len() as u64 - 32).unwrap();
+    plaintext
+        .read_exact_at(&mut cold, contents.len() as u64 - 32)
+        .unwrap();
     assert_eq!(cold, [0_u8; 32]);
 }
 
@@ -401,7 +420,9 @@ fn large_writable_open_reuses_a_live_lazy_plaintext_vnode_without_materializing_
     let writer = reply.descriptors.remove(0);
 
     let mut untouched = [1_u8; 32];
-    read_exact_at(&reader, &mut untouched, contents.len() as u64 - 32).unwrap();
+    reader
+        .read_exact_at(&mut untouched, contents.len() as u64 - 32)
+        .unwrap();
     assert_eq!(untouched, [0_u8; 32]);
 
     let offset = 512 * 1024 + 17;
@@ -421,7 +442,7 @@ fn large_writable_open_reuses_a_live_lazy_plaintext_vnode_without_materializing_
             .response,
         Response::Success
     );
-    write_all_at(&writer, replacement, offset).unwrap();
+    writer.write_all_at(replacement, offset).unwrap();
     assert_eq!(
         fixture
             .broker
@@ -455,7 +476,9 @@ fn large_writable_open_reuses_a_live_lazy_plaintext_vnode_without_materializing_
         Response::Success
     );
     let mut materialized = vec![0_u8; PLAINTEXT_BLOCK_SIZE];
-    read_exact_at(&reader, &mut materialized, block_start).unwrap();
+    reader
+        .read_exact_at(&mut materialized, block_start)
+        .unwrap();
     let within = (offset - block_start) as usize;
     assert_eq!(
         &materialized[..within],
@@ -495,7 +518,7 @@ fn sync_encrypts_only_reported_ranges_and_propagates_them_to_peer_handles() {
     let path = fixture.encrypted("file", b"abcdef");
     let (first_id, first) = fixture.open(&path, true);
     let (_second_id, second) = fixture.open(&path, true);
-    write_all_at(&first, b"XY", 2).unwrap();
+    first.write_all_at(b"XY", 2).unwrap();
 
     let reply = fixture.broker.handle(
         Request::Sync {
@@ -509,7 +532,7 @@ fn sync_encrypts_only_reported_ranges_and_propagates_them_to_peer_handles() {
     assert_eq!(reply.response, Response::Success);
     assert_eq!(fixture.decrypt(&path), b"abXYef");
     let mut peer = [0_u8; 6];
-    read_exact_at(&second, &mut peer, 0).unwrap();
+    second.read_exact_at(&mut peer, 0).unwrap();
     assert_eq!(&peer, b"abXYef");
 }
 
@@ -531,11 +554,11 @@ fn subsequent_opens_reuse_the_live_plaintext_without_decrypting_again() {
 
     let (_second, second) = fixture.open(&path, false);
     let mut contents = [0_u8; 9];
-    read_exact_at(&second, &mut contents, 0).unwrap();
+    second.read_exact_at(&mut contents, 0).unwrap();
 
     assert_eq!(&contents, b"plaintext");
     let mut first_contents = [0_u8; 9];
-    read_exact_at(&first, &mut first_contents, 0).unwrap();
+    first.read_exact_at(&mut first_contents, 0).unwrap();
     assert_eq!(first_contents, contents);
 }
 
@@ -543,16 +566,7 @@ fn subsequent_opens_reuse_the_live_plaintext_without_decrypting_again() {
 fn truncation_remains_dirty_until_a_durable_sync() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("truncate-durability", b"plaintext");
-    let reply = fixture.broker.handle(
-        Request::Open {
-            path: BackingPath::from_path(&path),
-            flags: libc::O_RDWR | libc::O_TRUNC,
-        },
-        None,
-    );
-    let Response::Open { handle, .. } = reply.response else {
-        panic!("unexpected open response: {:?}", reply.response);
-    };
+    let (handle, _) = fixture.open_flags(&path, libc::O_RDWR | libc::O_TRUNC);
     let local = lock(&fixture.broker.handles).get(&handle).unwrap().clone();
     let shared = Arc::clone(&lock(&local).shared);
     assert!(lock(&shared.inner).needs_durable_sync);
@@ -646,7 +660,7 @@ fn completed_single_handle_writes_are_merged_until_the_batch_deadline() {
             .response,
         Response::Success
     );
-    write_all_at(&plaintext, b"WXYZ", 2).unwrap();
+    plaintext.write_all_at(b"WXYZ", 2).unwrap();
     assert_eq!(
         fixture
             .broker
@@ -698,7 +712,7 @@ fn completed_writes_are_visible_to_an_existing_peer_before_writeback() {
             .response,
         Response::Success
     );
-    write_all_at(&plaintext, b"WXYZ", 2).unwrap();
+    plaintext.write_all_at(b"WXYZ", 2).unwrap();
     assert_eq!(
         fixture
             .broker
@@ -715,7 +729,7 @@ fn completed_writes_are_visible_to_an_existing_peer_before_writeback() {
     );
 
     let mut contents = [0_u8; 8];
-    read_exact_at(&peer, &mut contents, 0).unwrap();
+    peer.read_exact_at(&mut contents, 0).unwrap();
     assert_eq!(&contents, b"abWXYZgh");
     assert_eq!(fixture.decrypt(&path), b"abcdefgh");
 }
@@ -741,7 +755,7 @@ fn syncing_one_handle_flushes_completed_writes_from_a_peer_handle() {
             .response,
         Response::Success
     );
-    write_all_at(&writing_file, b"WXYZ", 2).unwrap();
+    writing_file.write_all_at(b"WXYZ", 2).unwrap();
     assert_eq!(
         fixture
             .broker
@@ -854,6 +868,223 @@ fn ordinary_writes_can_overlap_without_becoming_append_or_materialization_races(
 }
 
 #[test]
+fn peer_sync_does_not_commit_an_unfinished_change_of_length() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("unconfirmed-eof", &vec![b'x'; 2 * 1024 * 1024]);
+    let (writer, file) = fixture.open(&path, true);
+    let (peer, _) = fixture.open(&path, true);
+    let range = ByteRange::new(8, 2 * 1024 * 1024).unwrap();
+    let id = "11111111111111111111111111111111".to_string();
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: writer.clone(),
+                    write_id: id.clone(),
+                    range
+                },
+                None
+            )
+            .response,
+        Response::Success
+    );
+    file.set_len(8).unwrap();
+    let sync = || {
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle: peer.clone(),
+                    ranges: vec![],
+                    durable: true,
+                },
+                None,
+            )
+            .response
+    };
+    assert_error(sync(), libc::EAGAIN);
+    assert_eq!(
+        fixture.cipher.open_file(&path).unwrap().len(),
+        2 * 1024 * 1024
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::FinishWrite {
+                    handle: writer,
+                    write_id: id,
+                    range
+                },
+                None
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(sync(), Response::Success);
+    assert_eq!(fixture.decrypt(&path), b"xxxxxxxx");
+}
+
+#[test]
+fn periodic_cleanup_drops_idle_inode_keys_and_keeps_live_vnodes() {
+    let fixture = Fixture::new();
+    let first = fixture.encrypted("live", b"live");
+    let second = fixture.encrypted("finished", b"finished");
+    let (_, live) = fixture.open(&first, false);
+    let (handle, _) = fixture.open(&second, false);
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Close {
+                    handle,
+                    ranges: vec![]
+                },
+                None
+            )
+            .response,
+        Response::Success
+    );
+    fixture.broker.expire_requests();
+    assert!(lock(&fixture.broker.open_locks).is_empty());
+    assert_eq!(lock(&fixture.broker.files).len(), 1);
+    assert_eq!(
+        fixture.open(&first, false).1.metadata().unwrap().ino(),
+        live.metadata().unwrap().ino()
+    );
+}
+
+#[test]
+fn peer_sync_during_a_lazy_write_preserves_cold_ciphertext() {
+    let fixture = Fixture::new();
+    let original = vec![b'x'; 2 * 1024 * 1024];
+    let path = fixture.encrypted("peer-sync-lazy", &original);
+    let (writer, file) = fixture.open(&path, true);
+    let (peer, _) = fixture.open(&path, true);
+    let (reader, _) = fixture.open(&path, false);
+    let range = ByteRange::new(2, 6).unwrap();
+    let write_id = "11111111111111111111111111111111".to_string();
+    let request = |r| fixture.broker.handle(r, None).response;
+    assert_eq!(
+        request(Request::BeginWrite {
+            handle: writer.clone(),
+            write_id: write_id.clone(),
+            range
+        }),
+        Response::Success
+    );
+    file.write_all_at(b"WXYZ", 2).unwrap();
+    assert_eq!(
+        request(Request::Sync {
+            handle: peer,
+            ranges: vec![],
+            durable: true
+        }),
+        Response::Success
+    );
+    assert_eq!(
+        request(Request::Close {
+            handle: reader,
+            ranges: vec![]
+        }),
+        Response::Success
+    );
+    assert_eq!(
+        request(Request::FinishWrite {
+            handle: writer.clone(),
+            write_id,
+            range
+        }),
+        Response::Success
+    );
+    assert_eq!(
+        request(Request::Close {
+            handle: writer,
+            ranges: vec![]
+        }),
+        Response::Success
+    );
+    let restored = fixture.decrypt(&path);
+    assert_eq!(&restored[..8], b"xxWXYZxx");
+    assert!(restored[8..].iter().all(|&byte| byte == b'x'));
+}
+
+#[test]
+fn abandoned_truncating_open_preserves_the_original_until_claim() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("claim-truncate", b"original contents");
+    let (peer, peer_fd) = fixture.open(&path, false);
+    for (index, claim) in [false, true].into_iter().enumerate() {
+        let request_id = format!("{index:032x}");
+        let reply = fixture.broker.handle_request(
+            request_id.clone(),
+            Request::Open {
+                path: BackingPath::from_path(&path),
+                flags: libc::O_WRONLY | libc::O_TRUNC,
+            },
+            None,
+        );
+        let Response::Open { handle, .. } = reply.response else {
+            panic!("open failed")
+        };
+        assert_eq!(fixture.decrypt(&path), b"original contents");
+        assert_eq!(peer_fd.metadata().unwrap().len(), 17);
+        let finish = if claim {
+            Request::Claim {
+                request_id: request_id.clone(),
+            }
+        } else {
+            Request::Abort { handle }
+        };
+        assert_eq!(
+            fixture.broker.handle(finish, None).response,
+            Response::Success
+        );
+        if claim {
+            assert_eq!(peer_fd.metadata().unwrap().len(), 0);
+            assert!(fixture.decrypt(&path).is_empty());
+            let (writer, fd) = fixture.open(&path, true);
+            fd.write_all_at(b"new", 0).unwrap();
+            assert_eq!(
+                fixture
+                    .broker
+                    .handle(
+                        Request::Close {
+                            handle: writer,
+                            ranges: vec![ByteRange::new(0, 3).unwrap()]
+                        },
+                        None
+                    )
+                    .response,
+                Response::Success
+            );
+            assert_eq!(
+                fixture
+                    .broker
+                    .handle(Request::Claim { request_id }, None)
+                    .response,
+                Response::Success
+            );
+            assert_eq!(fixture.decrypt(&path), b"new");
+        }
+    }
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Close {
+                    handle: peer,
+                    ranges: vec![]
+                },
+                None
+            )
+            .response,
+        Response::Success
+    );
+}
+
+#[test]
 fn explicit_sync_does_not_fail_only_because_an_ordinary_write_is_in_flight() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("concurrent-sync", b"abcdefgh");
@@ -890,7 +1121,7 @@ fn explicit_sync_does_not_fail_only_because_an_ordinary_write_is_in_flight() {
         Response::Success
     );
 
-    write_all_at(&writing_file, b"WXYZ", 2).unwrap();
+    writing_file.write_all_at(b"WXYZ", 2).unwrap();
     assert_eq!(
         fixture
             .broker
@@ -923,6 +1154,54 @@ fn explicit_sync_does_not_fail_only_because_an_ordinary_write_is_in_flight() {
 }
 
 #[test]
+fn queued_open_uses_the_generation_published_by_the_last_close() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("queued-open", b"old");
+    let (writer, fd) = fixture.open(&path, true);
+    let metadata = path.metadata().unwrap();
+    let gate = Arc::new(Mutex::new(()));
+    lock(&fixture.broker.open_locks).insert(
+        FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+        Arc::downgrade(&gate),
+    );
+    thread::scope(|scope| {
+        let held = lock(&gate);
+        let next = scope.spawn(|| fixture.open(&path, false));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&gate) == 1 {
+            assert!(
+                Instant::now() < deadline,
+                "second opener did not reach the inode gate"
+            );
+            thread::yield_now();
+        }
+        fd.write_all_at(b"-new", 3).unwrap();
+        assert_eq!(
+            fixture
+                .broker
+                .handle(
+                    Request::Close {
+                        handle: writer,
+                        ranges: vec![]
+                    },
+                    None
+                )
+                .response,
+            Response::Success
+        );
+        assert_eq!(fixture.decrypt(&path), b"old-new");
+        drop(held);
+        let (_, mut reopened) = next.join().unwrap();
+        let mut actual = Vec::new();
+        reopened.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, b"old-new");
+    });
+}
+
+#[test]
 fn opening_a_peer_reuses_pending_shared_plaintext_without_forcing_writeback() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("peer-open", b"abcdefgh");
@@ -942,7 +1221,7 @@ fn opening_a_peer_reuses_pending_shared_plaintext_without_forcing_writeback() {
             .response,
         Response::Success
     );
-    write_all_at(&plaintext, b"WXYZ", 2).unwrap();
+    plaintext.write_all_at(b"WXYZ", 2).unwrap();
     assert_eq!(
         fixture
             .broker
@@ -962,7 +1241,7 @@ fn opening_a_peer_reuses_pending_shared_plaintext_without_forcing_writeback() {
     let (_reader, peer) = fixture.open(&path, false);
 
     let mut contents = [0_u8; 8];
-    read_exact_at(&peer, &mut contents, 0).unwrap();
+    peer.read_exact_at(&mut contents, 0).unwrap();
     assert_eq!(&contents, b"abWXYZgh");
     assert_eq!(fixture.decrypt(&path), b"abcdefgh");
 }
@@ -1040,7 +1319,7 @@ fn append_reserves_the_current_shared_end_of_file() {
             .response,
         Response::Offset { offset: 8 }
     );
-    write_all_at(&plaintext, b"XYZ", 8).unwrap();
+    plaintext.write_all_at(b"XYZ", 8).unwrap();
     assert_eq!(
         fixture
             .broker
@@ -1102,7 +1381,7 @@ fn final_close_flushes_an_abandoned_active_write() {
             .response,
         Response::Success
     );
-    write_all_at(&plaintext, b"XYZ", 8).unwrap();
+    plaintext.write_all_at(b"XYZ", 8).unwrap();
 
     assert_eq!(
         fixture
@@ -1260,6 +1539,145 @@ fn request_cache_replays_and_claims_one_open_handle() {
 }
 
 #[test]
+fn waiting_truncate_claim_survives_ordinary_request_pressure() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("busy-truncate", b"original");
+    let (writer, _) = fixture.open(&path, true);
+    let write_id = "writer".to_owned();
+    let request = |r| fixture.broker.handle(r, None).response;
+    assert_eq!(
+        request(Request::BeginWrite {
+            handle: writer.clone(),
+            write_id: write_id.clone(),
+            range: ByteRange::new(0, 1).unwrap()
+        }),
+        Response::Success
+    );
+    let request_id = "truncate".to_owned();
+    let reply = fixture.broker.handle_request(
+        request_id.clone(),
+        Request::Open {
+            path: BackingPath::from_path(&path),
+            flags: libc::O_WRONLY | libc::O_TRUNC,
+        },
+        None,
+    );
+    assert!(matches!(reply.response, Response::Open { .. }));
+    let claim = || {
+        request(Request::Claim {
+            request_id: request_id.clone(),
+        })
+    };
+    assert_error(claim(), libc::EAGAIN);
+    for i in 0..=REQUEST_CACHE_CAPACITY {
+        assert_eq!(
+            fixture
+                .broker
+                .handle_request(i.to_string(), Request::Ping, None)
+                .response,
+            Response::Success
+        );
+    }
+    assert_eq!(fixture.decrypt(&path), b"original");
+    assert_eq!(
+        request(Request::CancelWrite {
+            handle: writer,
+            write_id
+        }),
+        Response::Success
+    );
+    assert_eq!(claim(), Response::Success);
+    assert!(fixture.decrypt(&path).is_empty());
+}
+
+#[test]
+fn cold_truncating_open_advertises_the_claimed_empty_vnode() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("cold-truncate", b"original");
+    let request_id = "truncate".to_owned();
+    let reply = fixture.broker.handle_request(
+        request_id.clone(),
+        Request::Open {
+            path: BackingPath::from_path(&path),
+            flags: libc::O_WRONLY | libc::O_TRUNC,
+        },
+        None,
+    );
+    let Response::Open { lazy, .. } = reply.response else {
+        panic!("open failed");
+    };
+    assert_eq!(fixture.decrypt(&path), b"original");
+    assert_eq!(
+        fixture
+            .broker
+            .handle(Request::Claim { request_id }, None)
+            .response,
+        Response::Success
+    );
+    assert_eq!(reply.descriptors[0].metadata().unwrap().len(), 0);
+    assert!(!lazy);
+}
+
+#[test]
+fn unclaimed_open_capacity_retries_after_abort_without_reopening_the_old_request() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("bounded-open", b"original");
+    let open = |id: &str| {
+        fixture
+            .broker
+            .handle_request(
+                id.to_owned(),
+                Request::Open {
+                    path: BackingPath::from_path(&path),
+                    flags: libc::O_RDWR,
+                },
+                None,
+            )
+            .response
+    };
+    let first = open("first");
+    let Response::Open { handle, .. } = &first else {
+        panic!("open failed")
+    };
+    // Populate the other reservations without relying on the host's open-file limit.
+    {
+        let mut cache = lock(&fixture.broker.requests);
+        for i in 1..REQUEST_CACHE_CAPACITY {
+            let mut response = first.clone();
+            let Response::Open { handle, .. } = &mut response else {
+                unreachable!()
+            };
+            *handle = i.to_string();
+            cache.entries.insert(
+                i.to_string(),
+                CachedRequest::Completed {
+                    fingerprint: [0; 32],
+                    response,
+                    completed_at: Instant::now(),
+                    claimed: false,
+                },
+            );
+        }
+    }
+    assert_error(open("next"), libc::EAGAIN);
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Abort {
+                    handle: handle.clone()
+                },
+                None
+            )
+            .response,
+        Response::Success
+    );
+    assert_error(open("first"), libc::EBADF);
+    assert!(matches!(open("next"), Response::Open { .. }));
+    assert_eq!(lock(&fixture.broker.handles).len(), 1);
+}
+
+#[test]
 fn expired_unclaimed_open_is_aborted_without_writeback() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("abandoned-open", b"data");
@@ -1289,7 +1707,7 @@ fn final_flush_persists_ranges_registered_by_writable_mappings() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("mapped", b"abcdef");
     let (handle, plaintext) = fixture.open(&path, true);
-    write_all_at(&plaintext, b"mapped", 0).unwrap();
+    plaintext.write_all_at(b"mapped", 0).unwrap();
     assert_eq!(
         fixture
             .broker
@@ -1327,7 +1745,7 @@ fn periodic_mapping_flush_persists_changed_registered_ranges() {
             .response,
         Response::Success
     );
-    write_all_at(&plaintext, b"mapped", 0).unwrap();
+    plaintext.write_all_at(b"mapped", 0).unwrap();
 
     fixture.broker.flush_mapped_changed().unwrap();
 
@@ -1352,8 +1770,8 @@ fn periodic_mapping_flush_combines_ranges_from_shared_plaintext_handles() {
             Response::Success
         );
     }
-    write_all_at(&left_plaintext, b"left", 0).unwrap();
-    write_all_at(&right_plaintext, b"rght", 4).unwrap();
+    left_plaintext.write_all_at(b"left", 0).unwrap();
+    right_plaintext.write_all_at(b"rght", 4).unwrap();
 
     fixture.broker.flush_mapped_changed().unwrap();
 
@@ -1378,7 +1796,7 @@ fn ordinary_writeback_does_not_hide_a_pending_mapping_change() {
             .response,
         Response::Success
     );
-    write_all_at(&plaintext, b"mmap", 0).unwrap();
+    plaintext.write_all_at(b"mmap", 0).unwrap();
     let write_id = "11111111111111111111111111111111";
     assert_eq!(
         fixture
@@ -1394,7 +1812,7 @@ fn ordinary_writeback_does_not_hide_a_pending_mapping_change() {
             .response,
         Response::Success
     );
-    write_all_at(&plaintext, b"writ", 4).unwrap();
+    plaintext.write_all_at(b"writ", 4).unwrap();
     assert_eq!(
         fixture
             .broker
@@ -1439,7 +1857,7 @@ fn closing_a_read_only_peer_flushes_authorized_shared_mapping_changes() {
             .response,
         Response::Success
     );
-    write_all_at(&plaintext, b"mapped", 0).unwrap();
+    plaintext.write_all_at(b"mapped", 0).unwrap();
 
     assert_eq!(
         fixture
@@ -1475,7 +1893,7 @@ fn explicit_sync_persists_changes_from_registered_writable_mappings() {
             .response,
         Response::Success
     );
-    write_all_at(&plaintext, b"mapped", 0).unwrap();
+    plaintext.write_all_at(b"mapped", 0).unwrap();
 
     assert_eq!(
         fixture
@@ -1526,7 +1944,7 @@ fn final_flush_abandons_all_peer_writes_before_synchronizing() {
             .response,
         Response::Success
     );
-    write_all_at(&active_file, b"WXYZ", 2).unwrap();
+    active_file.write_all_at(b"WXYZ", 2).unwrap();
 
     fixture.broker.flush_all().unwrap();
 
@@ -1551,7 +1969,7 @@ fn mapping_registration_survives_an_intermediate_sync_until_close() {
             .response,
         Response::Success
     );
-    write_all_at(&plaintext, b"first!", 0).unwrap();
+    plaintext.write_all_at(b"first!", 0).unwrap();
     assert_eq!(
         fixture
             .broker
@@ -1566,7 +1984,7 @@ fn mapping_registration_survives_an_intermediate_sync_until_close() {
             .response,
         Response::Success
     );
-    write_all_at(&plaintext, b"second", 0).unwrap();
+    plaintext.write_all_at(b"second", 0).unwrap();
 
     fixture.broker.flush_all().unwrap();
 
@@ -1604,7 +2022,7 @@ fn retained_handle_remains_usable_after_one_process_closes_it() {
             .response,
         Response::Success
     );
-    write_all_at(&plaintext, b"after!", 0).unwrap();
+    plaintext.write_all_at(b"after!", 0).unwrap();
     assert_eq!(
         fixture
             .broker
@@ -1869,10 +2287,10 @@ fn read_only_sync_accepts_metadata_changes_but_rejects_restored_mtime_writes() {
     );
     assert_eq!(std::fs::read(&path).unwrap(), original_ciphertext);
     let mut cold = [1_u8; 32];
-    read_exact_at(&plaintext, &mut cold, 1024 * 1024).unwrap();
+    plaintext.read_exact_at(&mut cold, 1024 * 1024).unwrap();
     assert_eq!(cold, [0; 32], "read-only sync must not eagerly decrypt");
 
-    write_all_at(&plaintext, b"changed", 0).unwrap();
+    plaintext.write_all_at(b"changed", 0).unwrap();
     plaintext
         .set_times(std::fs::FileTimes::new().set_modified(modified))
         .unwrap();
@@ -1914,7 +2332,7 @@ fn read_only_handles_reject_dirty_ranges_and_changed_snapshots() {
         libc::EBADF,
     );
 
-    write_all_at(&plaintext, b"after!", 0).unwrap();
+    plaintext.write_all_at(b"after!", 0).unwrap();
     assert_error(
         fixture
             .broker
@@ -1932,6 +2350,44 @@ fn read_only_handles_reject_dirty_ranges_and_changed_snapshots() {
 }
 
 #[test]
+fn unreported_growth_is_still_visible_after_a_second_sync_boundary() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("repeated-growth", b"base");
+    let (handle, plaintext) = fixture.open(&path, true);
+    plaintext.write_all_at(b"11", 4).unwrap();
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle: handle.clone(),
+                    ranges: vec![],
+                    durable: true,
+                },
+                None
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(fixture.decrypt(&path), b"base11");
+    plaintext.write_all_at(b"22", 6).unwrap();
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Close {
+                    handle,
+                    ranges: vec![]
+                },
+                None
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(fixture.decrypt(&path), b"base1122");
+}
+
+#[test]
 fn final_close_detects_unreported_growth_and_shrinkage() {
     let fixture = Fixture::new();
     let original = vec![b'a'; COPY_BUFFER_SIZE + 17];
@@ -1939,7 +2395,7 @@ fn final_close_detects_unreported_growth_and_shrinkage() {
     let (handle, plaintext) = fixture.open(&path, true);
     let grown = original.len() as u64 + 31;
     plaintext.set_len(grown).unwrap();
-    write_all_at(&plaintext, b"tail", grown - 4).unwrap();
+    plaintext.write_all_at(b"tail", grown - 4).unwrap();
 
     assert_eq!(
         fixture
@@ -1995,7 +2451,7 @@ fn dirty_ranges_are_merged_and_closed_handles_are_reclaimed() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("ranges", b"0123456789");
     let (handle, plaintext) = fixture.open(&path, true);
-    write_all_at(&plaintext, b"abcdef", 1).unwrap();
+    plaintext.write_all_at(b"abcdef", 1).unwrap();
     for (start, end) in [(4, 7), (1, 3), (3, 5)] {
         assert_eq!(
             fixture
@@ -2088,7 +2544,7 @@ fn retain_overflow_is_atomic_and_internal_error_helpers_preserve_context() {
 
     let file = tempfile::tempfile().unwrap();
     assert_eq!(
-        read_exact_at(&file, &mut [0_u8; 1], 0).unwrap_err().kind(),
+        file.read_exact_at(&mut [0_u8; 1], 0).unwrap_err().kind(),
         std::io::ErrorKind::UnexpectedEof
     );
 }
@@ -2385,17 +2841,7 @@ fn truncating_a_live_shared_file_updates_every_descriptor_and_ciphertext() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("live-truncate", b"plaintext");
     let (_first, first) = fixture.open(&path, true);
-    let mut reply = fixture.broker.handle(
-        Request::Open {
-            path: BackingPath::from_path(&path),
-            flags: libc::O_RDWR | libc::O_TRUNC,
-        },
-        None,
-    );
-    let Response::Open { handle, .. } = reply.response else {
-        panic!("unexpected truncate response: {:?}", reply.response);
-    };
-    let second = reply.descriptors.remove(0);
+    let (handle, second) = fixture.open_flags(&path, libc::O_RDWR | libc::O_TRUNC);
 
     assert_eq!(first.metadata().unwrap().len(), 0);
     assert_eq!(second.metadata().unwrap().len(), 0);

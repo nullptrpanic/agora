@@ -185,6 +185,11 @@ impl ManagedContent {
         self.backend.materialize(&self.state, runtime, range)
     }
 
+    pub(super) fn prepare_stdio(&self, runtime: &FilesystemHookRuntime) -> Result<()> {
+        let _mutation = self.mutation_guard();
+        self.backend.prepare_stdio(&self.state, runtime)
+    }
+
     pub(super) fn sync(
         &self,
         runtime: &FilesystemHookRuntime,

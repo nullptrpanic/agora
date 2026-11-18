@@ -160,7 +160,7 @@ unsafe fn sandbox_open_with_operation(
                         }
                         Some(descriptor)
                     }
-                    OpenTarget::Descriptor(_) => None,
+                    OpenTarget::Descriptor(_) | OpenTarget::Broker(_) => None,
                 };
                 if let Err(error) = runtime.commit_open(&mut prepared) {
                     if let Some(descriptor) = path_descriptor {
@@ -172,7 +172,7 @@ unsafe fn sandbox_open_with_operation(
                 if !target_is_path {
                     let descriptor = match prepared.prepared.target() {
                         OpenTarget::Descriptor(file) => file.as_raw_fd(),
-                        OpenTarget::Path(_) => unreachable!("open target kind changed"),
+                        _ => unreachable!("managed open did not produce a descriptor"),
                     };
                     let local = prepared.has_encrypted_broker();
                     if let Err(error) =
@@ -190,6 +190,7 @@ unsafe fn sandbox_open_with_operation(
                 let descriptor = match target {
                     OpenTarget::Path(_) => path_descriptor.expect("path target was opened"),
                     OpenTarget::Descriptor(file) => file.into_raw_fd(),
+                    OpenTarget::Broker(_) => unreachable!("Broker open was not committed"),
                 };
                 runtime.register(descriptor, open);
                 descriptor
@@ -335,7 +336,7 @@ unsafe fn sandbox_openat_with_mode(
                         }
                         Some(descriptor)
                     }
-                    OpenTarget::Descriptor(_) => None,
+                    OpenTarget::Descriptor(_) | OpenTarget::Broker(_) => None,
                 };
                 if let Err(error) = runtime.commit_open(&mut prepared) {
                     if let Some(descriptor) = path_descriptor
@@ -349,7 +350,7 @@ unsafe fn sandbox_openat_with_mode(
                 if !target_is_path {
                     let descriptor = match prepared.prepared.target() {
                         OpenTarget::Descriptor(file) => file.as_raw_fd(),
-                        OpenTarget::Path(_) => unreachable!("open target kind changed"),
+                        _ => unreachable!("managed open did not produce a descriptor"),
                     };
                     if let Err(error) =
                         configure_descriptor(descriptor, flags, prepared.has_encrypted_broker())
@@ -364,6 +365,7 @@ unsafe fn sandbox_openat_with_mode(
                 let descriptor = match target {
                     OpenTarget::Path(_) => path_descriptor.expect("path target was opened"),
                     OpenTarget::Descriptor(file) => file.into_raw_fd(),
+                    OpenTarget::Broker(_) => unreachable!("Broker open was not committed"),
                 };
                 runtime.register(descriptor, open);
                 descriptor
@@ -445,7 +447,7 @@ unsafe fn sandbox_fopen(path: *const libc::c_char, mode: *const libc::c_char) ->
                         }
                         Some(stream)
                     }
-                    OpenTarget::Descriptor(_) => None,
+                    OpenTarget::Descriptor(_) | OpenTarget::Broker(_) => None,
                 };
                 if let Err(error) = runtime.commit_open(&mut prepared) {
                     if let Some(stream) = path_stream
@@ -458,13 +460,14 @@ unsafe fn sandbox_fopen(path: *const libc::c_char, mode: *const libc::c_char) ->
                 }
                 let (target, open) = prepared.into_parts();
                 if let OpenTarget::Descriptor(file) = &target
-                    && let Err(error) = open.managed().materialize(runtime, None)
+                    && let Err(error) = open.managed().prepare_stdio(runtime)
                 {
                     let _ = runtime.finish_open_file(file.as_raw_fd(), &open);
                     return unsafe { fail(&error, std::ptr::null_mut()) };
                 }
                 let stream = match target {
                     OpenTarget::Path(_) => path_stream.expect("path target was opened"),
+                    OpenTarget::Broker(_) => unreachable!("Broker open was not committed"),
                     OpenTarget::Descriptor(file) => {
                         let descriptor = file.as_raw_fd();
                         if let Err(error) = configure_descriptor(
@@ -625,7 +628,7 @@ unsafe fn sandbox_posix_spawn_file_actions_addopen(
                 Ok(mapped) => mapped,
                 Err(error) => return error_errno(&error.into()),
             },
-            OpenTarget::Descriptor(_) => return libc::ENOTSUP,
+            OpenTarget::Descriptor(_) | OpenTarget::Broker(_) => return libc::ENOTSUP,
         };
         add_open(mapped.as_ptr())
     })

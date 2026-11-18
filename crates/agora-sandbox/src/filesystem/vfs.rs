@@ -102,6 +102,8 @@ impl MetadataPlan {
 pub(crate) enum OpenTarget {
     Path(PathBuf),
     Descriptor(File),
+    /// No placeholder FD: commit obtains the application descriptor from the Broker.
+    Broker(libc::c_int),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,13 +116,13 @@ pub(crate) struct PreparedFile {
     target: OpenTarget,
     staged: Option<StagedWrite>,
     staging_lease: Option<File>,
+    published_backing: Option<File>,
     writeback: Option<Writeback>,
     publish_on_open: bool,
     overwrite_on_open: bool,
     created_mode: Option<u32>,
     layer: FileLayer,
     encrypted_backing: Option<PathBuf>,
-    broker_flags: Option<libc::c_int>,
 }
 
 pub(crate) struct Writeback {
@@ -157,13 +159,13 @@ impl PreparedFile {
             target: OpenTarget::Path(target),
             staged,
             staging_lease: None,
+            published_backing: None,
             writeback: None,
             publish_on_open: false,
             overwrite_on_open: false,
             created_mode: None,
             layer,
             encrypted_backing: None,
-            broker_flags: None,
         }
     }
 
@@ -179,11 +181,15 @@ impl PreparedFile {
         (self.target, self.writeback, self.layer)
     }
 
-    pub(crate) fn local_broker_request(&self) -> Option<(PathBuf, libc::c_int)> {
-        let Some(backing) = &self.encrypted_backing else {
+    pub(crate) fn local_broker_request(&self) -> Option<(&Path, libc::c_int, Option<&File>)> {
+        let OpenTarget::Broker(flags) = self.target else {
             return None;
         };
-        Some((backing.clone(), self.broker_flags?))
+        Some((
+            self.encrypted_backing.as_deref()?,
+            flags,
+            self.published_backing.as_ref(),
+        ))
     }
 
     pub(crate) fn encrypted_backing_identity(&self) -> Result<Option<(u64, u64)>> {
@@ -551,30 +557,17 @@ impl VirtualFilesystem {
             if !existed && !create {
                 bail!("filesystem path is not visible: {}", logical.display());
             }
-            let plaintext = tempfile::tempfile()?;
-            let target = plaintext.try_clone()?;
-            let baseline = PlaintextIdentity::from_file(&plaintext)?;
             return Ok(PreparedFile {
-                target: OpenTarget::Descriptor(target),
+                target: OpenTarget::Broker(flags),
                 staged,
-                staging_lease: None,
-                writeback: if writes {
-                    Some(Writeback {
-                        plaintext: Mutex::new(plaintext),
-                        lease: Mutex::new(
-                            lease.context("encrypted write open did not acquire a lease")?,
-                        ),
-                        baseline: Mutex::new(baseline),
-                    })
-                } else {
-                    None
-                },
-                publish_on_open: writes && (!existed || flags & libc::O_TRUNC != 0),
-                overwrite_on_open: writes && existed && flags & libc::O_TRUNC != 0,
+                staging_lease: lease,
+                published_backing: None,
+                writeback: None,
+                publish_on_open: false,
+                overwrite_on_open: false,
                 created_mode,
                 layer: FileLayer::Upper,
                 encrypted_backing: Some(mapped),
-                broker_flags: Some(flags),
             });
         }
         let plaintext = tempfile::NamedTempFile::new()?;
@@ -605,6 +598,7 @@ impl VirtualFilesystem {
             target: OpenTarget::Descriptor(exposed),
             staged,
             staging_lease: None,
+            published_backing: None,
             writeback: if writes {
                 Some(Writeback {
                     plaintext: Mutex::new(plaintext),
@@ -621,7 +615,6 @@ impl VirtualFilesystem {
             created_mode,
             layer: FileLayer::Upper,
             encrypted_backing: Some(mapped),
-            broker_flags: None,
         })
     }
 
@@ -630,6 +623,36 @@ impl VirtualFilesystem {
     }
 
     pub(crate) fn commit_open(&self, prepared: &mut PreparedFile) -> Result<()> {
+        if let OpenTarget::Broker(flags) = &mut prepared.target
+            && let Some(mode) = prepared.created_mode.take()
+        {
+            let lease = prepared
+                .staging_lease
+                .as_ref()
+                .context("new encrypted file is missing its staging lease")?;
+            let staged = prepared
+                .staged
+                .take()
+                .context("new encrypted file is not staged")?;
+            let (file, created) =
+                self.overlay
+                    .commit_broker_create(staged, lease, mode, |tx, logical| {
+                        let credentials = Credentials::effective();
+                        Self::require_search_in(tx, logical, &credentials)?;
+                        Self::require_resolved_entry_access_in(
+                            tx,
+                            logical,
+                            AccessRequest::from_open_flags(*flags),
+                            &credentials,
+                        )
+                    })?;
+            prepared.published_backing = Some(file);
+            if created {
+                // Creation already published an empty inode. A second truncation
+                // at Claim would erase a peer's intervening successful write.
+                *flags &= !libc::O_TRUNC;
+            }
+        }
         if let Some(writeback) = &prepared.writeback {
             if prepared.overwrite_on_open {
                 let mut plaintext = writeback
@@ -654,7 +677,11 @@ impl VirtualFilesystem {
                 self.overlay.commit_write(staged)?;
             }
         }
-        prepared.staging_lease.take();
+        // A Broker target is still a pathname here. Keep its namespace lease
+        // until the hook has acquired the FD and consumes the prepared file.
+        if !matches!(prepared.target, OpenTarget::Broker(_)) {
+            prepared.staging_lease.take();
+        }
         Ok(())
     }
 

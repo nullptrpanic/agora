@@ -283,7 +283,7 @@ fn client_open_validates_its_response_and_missing_sockets_keep_errno() {
         .unwrap();
     });
     let client = LocalClient::new(&socket, "token");
-    let error = match client.open(Path::new("/tmp/backing"), libc::O_RDWR) {
+    let error = match client.open(Path::new("/tmp/backing"), libc::O_RDWR, None) {
         Ok(_) => panic!("unexpected valid open response"),
         Err(error) => error,
     };
@@ -355,7 +355,7 @@ fn client_open_retries_and_claims_a_response_lost_after_execution() {
     });
     let client = LocalClient::new(&socket, "token");
     let opened = client
-        .open(Path::new("/tmp/backing"), libc::O_RDWR)
+        .open(Path::new("/tmp/backing"), libc::O_RDWR, None)
         .unwrap();
 
     assert_eq!(opened.handle, "opened-handle");
@@ -450,7 +450,7 @@ fn client_open_aborts_incomplete_invalid_and_unclaimable_replies() {
         });
         let client = LocalClient::new(&socket, "token");
 
-        let error = match client.open(Path::new("/tmp/backing"), libc::O_RDWR) {
+        let error = match client.open(Path::new("/tmp/backing"), libc::O_RDWR, None) {
             Ok(_) => panic!("unexpected valid open response"),
             Err(error) => error,
         };

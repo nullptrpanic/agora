@@ -130,7 +130,11 @@ impl FileCipher {
     }
 
     pub(crate) fn open_file(&self, path: &Path) -> Result<EncryptedFile> {
-        EncryptedFile::open(path, &self.key_material)
+        self.open_descriptor(File::options().read(true).write(true).open(path)?)
+    }
+
+    pub(crate) fn open_descriptor(&self, file: File) -> Result<EncryptedFile> {
+        EncryptedFile::open(file, &self.key_material)
     }
 
     pub(crate) fn create_file(&self, path: &Path) -> Result<EncryptedFile> {

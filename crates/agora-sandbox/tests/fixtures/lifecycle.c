@@ -45,6 +45,20 @@ int main(int argc, char **argv) {
         char bytes[16] = {0};
         assert(fd >= 0 && read(fd, bytes, sizeof(bytes)) == 6);
         assert(!memcmp(bytes, "abcXYZ", 6) && close(fd) == 0);
+    } else if (!strcmp(mode, "mixed-stdio")) {
+        FILE *stream = fopen(path, "w");
+        assert(stream);
+        assert(fwrite("base", 1, 4, stream) == 4 && fflush(stream) == 0);
+        assert(fsync(fileno(stream)) == 0);
+        int other = open(path, O_RDWR);
+        assert(other >= 0);
+        assert(fwrite("tail", 1, 4, stream) == 4 && fflush(stream) == 0);
+        assert(pwrite(other, "B", 1, 0) == 1 && fsync(other) == 0);
+        assert(close(other) == 0 && fclose(stream) == 0);
+        int reader = open(path, O_RDONLY);
+        char bytes[8];
+        assert(reader >= 0 && read(reader, bytes, sizeof(bytes)) == sizeof(bytes));
+        assert(!memcmp(bytes, "Basetail", sizeof(bytes)) && close(reader) == 0);
     } else if (!strcmp(mode, "fifo")) {
         fifo = open(path, O_RDONLY);
         assert(fifo >= 0);

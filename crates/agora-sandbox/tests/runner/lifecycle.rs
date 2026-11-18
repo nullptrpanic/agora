@@ -71,6 +71,11 @@ async fn normal_exit_preserves_both_stdio_flushes() {
 }
 
 #[tokio::test]
+async fn encrypted_stdio_and_peer_pwrite_persist_across_sync_and_reopen() {
+    run_probe("mixed-stdio", false).await;
+}
+
+#[tokio::test]
 async fn tracked_fifo_read_does_not_prevent_another_thread_from_forking() {
     for plain in [true, false] {
         run_probe("fifo", plain).await;

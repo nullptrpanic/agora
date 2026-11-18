@@ -61,6 +61,7 @@ enum CachedRequest {
     Pending {
         fingerprint: [u8; 32],
         completion: Arc<RequestCompletion>,
+        opening: bool,
     },
     Completed {
         fingerprint: [u8; 32],
@@ -80,11 +81,12 @@ enum CacheDecision {
     Execute,
     Wait(Arc<RequestCompletion>),
     Replay(Response),
-    Reject,
+    Reject(BrokerError),
 }
 
 struct LocalHandle {
     writable: bool,
+    truncate_on_claim: bool,
     active_writes: HashMap<String, ActiveWrite>,
     references: usize,
     shared: Arc<SharedPlaintext>,
@@ -270,7 +272,11 @@ impl LocalBroker {
                 );
             }
         };
-        let decision = lock(&self.requests).begin(request_id.clone(), fingerprint);
+        let decision = lock(&self.requests).begin(
+            request_id.clone(),
+            fingerprint,
+            matches!(request, Request::Open { .. }),
+        );
         match decision {
             CacheDecision::Execute => {
                 let response = self.response(request, descriptor);
@@ -287,13 +293,7 @@ impl LocalBroker {
                 drop(descriptor);
                 self.reply(response)
             }
-            CacheDecision::Reject => {
-                drop(descriptor);
-                BrokerReply::error(
-                    libc::EPROTO,
-                    "local request ID was reused for a different operation",
-                )
-            }
+            CacheDecision::Reject(error) => BrokerReply::error(error.errno, error.message),
         }
     }
 
@@ -436,6 +436,8 @@ impl LocalBroker {
     pub(crate) fn expire_requests(&self) {
         let abandoned = lock(&self.requests).prune(Instant::now());
         self.abort_handles(abandoned);
+        lock(&self.open_locks).retain(|_, entry| entry.strong_count() != 0);
+        lock(&self.files).retain(|_, entry| entry.strong_count() != 0);
     }
 
     fn dispatch(
@@ -649,13 +651,12 @@ impl LocalBroker {
             }
             Request::Claim { request_id } => {
                 Self::reject_descriptor(descriptor)?;
-                lock(&self.requests).claim(&request_id).ok_or_else(|| {
-                    BrokerError::protocol("local resource request is not available to claim")
-                })?;
+                self.claim_open(&request_id)?;
                 Ok(Response::Success)
             }
             Request::Abort { handle } => {
                 Self::reject_descriptor(descriptor)?;
+                lock(&self.requests).cancel_unclaimed(&handle);
                 self.abort_handle(&handle);
                 Ok(Response::Success)
             }
@@ -767,12 +768,12 @@ impl LocalBroker {
                 "invalid local filesystem open access mode",
             ));
         }
-        let encrypted = self
-            .cipher
-            .open_file(&canonical)
-            .map_err(|error| BrokerError::anyhow("failed to open encrypted backing file", error))?;
-        let metadata = encrypted
-            .backing_file()
+        let backing = File::options()
+            .read(true)
+            .write(true)
+            .open(&canonical)
+            .map_err(|error| BrokerError::io("failed to open encrypted backing file", error))?;
+        let metadata = backing
             .metadata()
             .map_err(|error| BrokerError::io("failed to inspect encrypted backing file", error))?;
         let identity = FileIdentity {
@@ -781,7 +782,6 @@ impl LocalBroker {
         };
         let open_lock = {
             let mut open_locks = lock(&self.open_locks);
-            open_locks.retain(|_, open_lock| open_lock.strong_count() != 0);
             if let Some(open_lock) = open_locks.get(&identity).and_then(Weak::upgrade) {
                 open_lock
             } else {
@@ -791,51 +791,27 @@ impl LocalBroker {
             }
         };
         let _open = lock(&open_lock);
-        let mut encrypted = Some(encrypted);
         let shared = {
             let mut files = lock(&self.files);
-            files.retain(|_, file| file.strong_count() != 0);
             let reusable = files
                 .get(&identity)
                 .and_then(Weak::upgrade)
                 .filter(|file| file.is_healthy());
+            if reusable.is_none() {
+                files.remove(&identity);
+            }
+            drop(files);
+            // Pin a live vnode before selecting a header. Otherwise the previous
+            // last close can publish a newer length while this open waits, and
+            // a new vnode would be initialized from the stale generation.
+            let encrypted = self.cipher.open_descriptor(backing).map_err(|error| {
+                BrokerError::anyhow("failed to open encrypted backing file", error)
+            })?;
             if let Some(file) = reusable {
-                drop(files);
-                if flags & libc::O_TRUNC != 0 {
-                    file.ensure_healthy()?;
-                    let _exclusive = file.try_begin_exclusive().ok_or_else(BrokerError::busy)?;
-                    let mut shared = lock(&file.inner);
-                    file.ensure_healthy()?;
-                    shared.plaintext.set_len(0).map_err(|error| {
-                        BrokerError::io("failed to truncate shared local plaintext file", error)
-                    })?;
-                    let mut replacement = encrypted.take().expect("encrypted file is available");
-                    replacement.set_len(0).map_err(|error| {
-                        BrokerError::anyhow("failed to truncate encrypted local file", error)
-                    })?;
-                    let metadata = shared.plaintext.metadata().map_err(|error| {
-                        BrokerError::io("failed to inspect shared local plaintext file", error)
-                    })?;
-                    shared.encrypted = replacement;
-                    shared.resident = ByteRangeSet::default();
-                    let baseline = PlaintextIdentity::from_metadata(&metadata);
-                    shared.baseline = baseline;
-                    shared.mapped_baseline = baseline;
-                    shared.needs_durable_sync = true;
-                }
                 file
             } else {
-                files.remove(&identity);
-                drop(files);
-                let mut encrypted = encrypted.take().expect("encrypted file is available");
-                let truncated = flags & libc::O_TRUNC != 0;
-                if truncated {
-                    encrypted.set_len(0).map_err(|error| {
-                        BrokerError::anyhow("failed to truncate encrypted local file", error)
-                    })?;
-                }
                 let length = encrypted.len();
-                let lazy = !truncated && length > LAZY_PLAINTEXT_THRESHOLD;
+                let lazy = flags & libc::O_TRUNC != 0 || length > LAZY_PLAINTEXT_THRESHOLD;
                 let plaintext = tempfile::tempfile().map_err(|error| {
                     BrokerError::io("failed to create shared local plaintext file", error)
                 })?;
@@ -855,7 +831,7 @@ impl LocalBroker {
                     potentially_dirty: ByteRangeSet::default(),
                     pending_writes: ByteRangeSet::default(),
                     pending_since: None,
-                    needs_durable_sync: truncated,
+                    needs_durable_sync: false,
                 };
                 if !lazy {
                     Self::materialize_locked(&mut shared_file, None)?;
@@ -874,10 +850,8 @@ impl LocalBroker {
                 file
             }
         };
-        let lazy = {
-            let shared = lock(&shared.inner);
-            !shared.fully_resident()
-        };
+        // These FDs are usable only after Claim, when O_TRUNC has emptied the vnode.
+        let lazy = flags & libc::O_TRUNC == 0 && !lock(&shared.inner).fully_resident();
         let state = LocalOpenState::create(open_status_flags(flags))
             .map_err(|error| BrokerError::io("failed to create local open state", error))?;
         let id = Uuid::new_v4().simple().to_string();
@@ -885,6 +859,7 @@ impl LocalBroker {
             id.clone(),
             Arc::new(Mutex::new(LocalHandle {
                 writable: access != libc::O_RDONLY,
+                truncate_on_claim: flags & libc::O_TRUNC != 0,
                 active_writes: HashMap::new(),
                 references: 1,
                 shared,
@@ -898,6 +873,63 @@ impl LocalBroker {
             links: metadata.nlink(),
             lazy,
         })
+    }
+
+    fn claim_open(&self, request_id: &str) -> Result<(), BrokerError> {
+        let unavailable =
+            || BrokerError::protocol("local resource request is not available to claim");
+        let (id, already_claimed) = {
+            let mut requests = lock(&self.requests);
+            let (id, claimed) = requests.open_claim(request_id).ok_or_else(unavailable)?;
+            (id.to_owned(), *claimed)
+        };
+        let local = match self.lookup_handle(&id) {
+            Ok(local) => local,
+            Err(_) if already_claimed => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let mark_claimed = || {
+            let mut requests = lock(&self.requests);
+            let (_, claimed) = requests.open_claim(request_id).ok_or_else(unavailable)?;
+            *claimed = true;
+            Ok::<_, BrokerError>(())
+        };
+        let (truncate, shared) = {
+            let handle = lock(&local);
+            (handle.truncate_on_claim, Arc::clone(&handle.shared))
+        };
+        if truncate {
+            let _exclusive = shared.try_begin_exclusive().ok_or_else(BrokerError::busy)?;
+            let mut file = lock(&shared.inner);
+            shared.ensure_healthy()?;
+            let mut handle = lock(&local);
+            // Pin the resource against cache eviction before touching the file;
+            // the handle mutex also serializes a replay with this transition.
+            mark_claimed()?;
+            if handle.truncate_on_claim {
+                // All three FDs have reached the opener. Use the live header, not a
+                // second EncryptedFile with a possibly stale generation/length.
+                file.encrypted.set_len(0).map_err(|error| {
+                    BrokerError::anyhow("failed to truncate encrypted local file", error)
+                })?;
+                file.plaintext.set_len(0).map_err(|error| {
+                    BrokerError::io("failed to truncate shared local plaintext file", error)
+                })?;
+                let metadata = file.plaintext.metadata().map_err(|error| {
+                    BrokerError::io("failed to inspect shared local plaintext file", error)
+                })?;
+                file.resident.clear();
+                file.pending_writes.clear();
+                file.pending_since = None;
+                file.baseline = PlaintextIdentity::from_metadata(&metadata);
+                file.mapped_baseline = file.baseline;
+                file.needs_durable_sync = true;
+                handle.truncate_on_claim = false;
+            }
+        } else if !already_claimed {
+            mark_claimed()?;
+        }
+        Ok(())
     }
 
     fn materialize(&self, id: &str, range: Option<ByteRange>) -> Result<(), BrokerError> {
@@ -962,9 +994,12 @@ impl LocalBroker {
                             "encrypted local file ended before its logical length",
                         ));
                     }
-                    write_all_at(&shared.plaintext, &buffer[..read], offset).map_err(|error| {
-                        BrokerError::io("failed to materialize local plaintext range", error)
-                    })?;
+                    shared
+                        .plaintext
+                        .write_all_at(&buffer[..read], offset)
+                        .map_err(|error| {
+                            BrokerError::io("failed to materialize local plaintext range", error)
+                        })?;
                     offset += read as u64;
                 }
                 shared.resident.insert(range);
@@ -1034,7 +1069,12 @@ impl LocalBroker {
         // Keep an existing handle alive for this sync, but never hide I/O errors.
         let handle = lock(&self.handles).get(id).cloned();
         match handle {
-            Some(handle) => Self::sync_open_handle(&handle, Vec::new(), false, include_potential),
+            Some(handle) => {
+                match Self::sync_open_handle(&handle, Vec::new(), false, include_potential) {
+                    Err(error) if error.errno == libc::EAGAIN => Ok(()), // still pending for the next tick
+                    result => result,
+                }
+            }
             None => Ok(()),
         }
     }
@@ -1056,8 +1096,18 @@ impl LocalBroker {
             .map_err(|error| BrokerError::io("failed to inspect local plaintext file", error))?;
         let current = PlaintextIdentity::from_metadata(&metadata);
         let mapping_changed = current != shared_file.mapped_baseline;
+        let writer_active = {
+            let mutations = lock(&shared.mutations);
+            !mutations.ordinary.is_empty() || mutations.append.is_some()
+        };
+        // A peer can change EOF before FinishWrite. Publishing that length now
+        // could truncate cold ciphertext even if the reservation is abandoned.
+        if writer_active && current.length != shared_file.encrypted.len() {
+            return Err(BrokerError::busy());
+        }
         if include_potential
             && !handle.writable
+            && !writer_active
             && shared_file.pending_writes.is_empty()
             && current != shared_file.baseline
             && (shared_file.potentially_dirty.is_empty() || !mapping_changed)
@@ -1095,11 +1145,16 @@ impl LocalBroker {
             && candidates.is_empty()
             && current != shared_file.baseline
             && current.length > 0
+            // Cold vnode holes are placeholders, never evidence of a zero write.
+            && shared_file.fully_resident()
         {
-            candidates.insert(ByteRange {
+            let range = ByteRange {
                 start: 0,
                 end: current.length,
-            });
+            };
+            // Keep the fallback on a partial I/O failure just like an explicit write.
+            shared_file.pending_writes.insert(range);
+            candidates.insert(range);
         }
         let ranges = candidates.to_vec();
         let length = current.length;
@@ -1111,13 +1166,22 @@ impl LocalBroker {
             if start >= end {
                 continue;
             }
+            // A native stream or fallback can extend the old resident extent.
+            // These known plaintext bytes must never become cold holes on a retry.
+            let published = ByteRange { start, end };
+            if !shared_file.resident.covers(published) {
+                shared_file.resident.insert(published);
+            }
             let mut offset = start;
             while offset < end {
                 let count = usize::try_from((end - offset).min(buffer.len() as u64))
                     .expect("copy chunk length fits usize");
-                read_exact_at(&shared_file.plaintext, &mut buffer[..count], offset).map_err(
-                    |error| BrokerError::io("failed to read local plaintext range", error),
-                )?;
+                shared_file
+                    .plaintext
+                    .read_exact_at(&mut buffer[..count], offset)
+                    .map_err(|error| {
+                        BrokerError::io("failed to read local plaintext range", error)
+                    })?;
                 shared_file
                     .encrypted
                     .write_at(&buffer[..count], offset)
@@ -1329,24 +1393,48 @@ impl RequestCompletion {
 }
 
 impl RequestCache {
-    fn begin(&mut self, request_id: String, fingerprint: [u8; 32]) -> CacheDecision {
+    fn begin(&mut self, request_id: String, fingerprint: [u8; 32], opening: bool) -> CacheDecision {
         match self.entries.get(&request_id) {
             Some(CachedRequest::Pending {
                 fingerprint: cached,
                 completion,
+                ..
             }) if cached == &fingerprint => CacheDecision::Wait(Arc::clone(completion)),
             Some(CachedRequest::Completed {
                 fingerprint: cached,
                 response,
                 ..
             }) if cached == &fingerprint => CacheDecision::Replay(response.clone()),
-            Some(_) => CacheDecision::Reject,
+            Some(_) => CacheDecision::Reject(BrokerError::protocol(
+                "local request ID was reused for a different operation",
+            )),
+            None if opening
+                && self.entries.len() >= REQUEST_CACHE_CAPACITY
+                && self
+                    .entries
+                    .values()
+                    .filter(|entry| {
+                        matches!(
+                            entry,
+                            CachedRequest::Pending { opening: true, .. }
+                                | CachedRequest::Completed { claimed: false, .. }
+                        )
+                    })
+                    .count()
+                    >= REQUEST_CACHE_CAPACITY =>
+            {
+                CacheDecision::Reject(BrokerError::new(
+                    libc::EAGAIN,
+                    "too many unclaimed local opens",
+                ))
+            }
             None => {
                 self.entries.insert(
                     request_id,
                     CachedRequest::Pending {
                         fingerprint,
                         completion: Arc::new(RequestCompletion::default()),
+                        opening,
                     },
                 );
                 CacheDecision::Execute
@@ -1358,6 +1446,7 @@ impl RequestCache {
         let Some(CachedRequest::Pending {
             fingerprint,
             completion,
+            ..
         }) = self.entries.remove(&request_id)
         else {
             return Vec::new();
@@ -1375,71 +1464,80 @@ impl RequestCache {
         self.prune(now)
     }
 
-    fn claim(&mut self, request_id: &str) -> Option<()> {
+    fn open_claim(&mut self, request_id: &str) -> Option<(&str, &mut bool)> {
         let CachedRequest::Completed {
             response, claimed, ..
         } = self.entries.get_mut(request_id)?
         else {
             return None;
         };
-        if !matches!(response, Response::Open { .. }) {
+        let Response::Open { handle, .. } = response else {
             return None;
+        };
+        Some((handle, claimed))
+    }
+
+    fn cancel_unclaimed(&mut self, id: &str) {
+        for entry in self.entries.values_mut() {
+            if let CachedRequest::Completed {
+                response, claimed, ..
+            } = entry
+                && !*claimed
+                && matches!(response, Response::Open { handle, .. } if handle == id)
+            {
+                *claimed = true;
+                *response = Response::Error {
+                    errno: libc::EBADF,
+                    message: "local open was aborted".into(),
+                };
+                return;
+            }
         }
-        *claimed = true;
-        Some(())
     }
 
     fn prune(&mut self, now: Instant) -> Vec<String> {
-        let mut remove = self
-            .entries
-            .iter()
-            .filter_map(|(request_id, entry)| match entry {
-                CachedRequest::Completed { completed_at, .. }
-                    if now.saturating_duration_since(*completed_at) >= REQUEST_CACHE_TTL =>
-                {
-                    Some(request_id.clone())
+        let mut abandoned = Vec::new();
+        let mut completed = 0;
+        self.entries.retain(|_, entry| {
+            let CachedRequest::Completed {
+                response,
+                completed_at,
+                claimed,
+                ..
+            } = entry
+            else {
+                return true;
+            };
+            if now.saturating_duration_since(*completed_at) >= REQUEST_CACHE_TTL {
+                if !*claimed && let Response::Open { handle, .. } = response {
+                    abandoned.push(std::mem::take(handle));
                 }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let completed = self
-            .entries
-            .values()
-            .filter(|entry| matches!(entry, CachedRequest::Completed { .. }))
-            .count()
-            .saturating_sub(remove.len());
+                return false;
+            }
+            // An unclaimed Open still owns FDs. Its admission bound is separate
+            // from the capacity for replaying ordinary, already completed calls.
+            completed += usize::from(*claimed);
+            true
+        });
         if completed > REQUEST_CACHE_CAPACITY {
             let mut oldest = self
                 .entries
                 .iter()
                 .filter_map(|(request_id, entry)| match entry {
-                    CachedRequest::Completed { completed_at, .. }
-                        if !remove.contains(request_id) =>
-                    {
-                        Some((request_id.clone(), *completed_at))
-                    }
+                    CachedRequest::Completed {
+                        completed_at,
+                        claimed: true,
+                        ..
+                    } => Some((request_id.clone(), *completed_at)),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
             oldest.sort_unstable_by_key(|(_, completed_at)| *completed_at);
-            remove.extend(
-                oldest
-                    .into_iter()
-                    .take(completed - REQUEST_CACHE_CAPACITY)
-                    .map(|(request_id, _)| request_id),
-            );
+            for (id, _) in oldest.into_iter().take(completed - REQUEST_CACHE_CAPACITY) {
+                self.entries.remove(&id);
+            }
         }
-        remove
-            .into_iter()
-            .filter_map(|request_id| match self.entries.remove(&request_id) {
-                Some(CachedRequest::Completed {
-                    response: Response::Open { handle, .. },
-                    claimed: false,
-                    ..
-                }) => Some(handle),
-                _ => None,
-            })
-            .collect()
+        abandoned
     }
 }
 
@@ -1481,9 +1579,11 @@ impl SharedFile {
                     .map_err(|error| {
                         BrokerError::anyhow("failed to verify read-only plaintext", error)
                     })?;
-                read_exact_at(&self.plaintext, &mut actual[..count], offset).map_err(|error| {
-                    BrokerError::io("failed to inspect read-only plaintext", error)
-                })?;
+                self.plaintext
+                    .read_exact_at(&mut actual[..count], offset)
+                    .map_err(|error| {
+                        BrokerError::io("failed to inspect read-only plaintext", error)
+                    })?;
                 if read != count || actual[..count] != expected[..count] {
                     return Ok(false);
                 }
@@ -1553,36 +1653,6 @@ impl BrokerError {
     fn into_io(self) -> std::io::Error {
         std::io::Error::other(self.message)
     }
-}
-
-fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> std::io::Result<()> {
-    while !buffer.is_empty() {
-        let read = file.read_at(buffer, offset)?;
-        if read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "local plaintext range is incomplete",
-            ));
-        }
-        offset += read as u64;
-        buffer = &mut buffer[read..];
-    }
-    Ok(())
-}
-
-fn write_all_at(file: &File, mut buffer: &[u8], mut offset: u64) -> std::io::Result<()> {
-    while !buffer.is_empty() {
-        let written = file.write_at(buffer, offset)?;
-        if written == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "failed to update peer plaintext file",
-            ));
-        }
-        offset += written as u64;
-        buffer = &buffer[written..];
-    }
-    Ok(())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

@@ -134,6 +134,10 @@ pub(super) trait ContentBackend: Send + Sync {
         Ok(())
     }
 
+    fn prepare_stdio(&self, state: &ContentState, runtime: &FilesystemHookRuntime) -> Result<()> {
+        self.materialize(state, runtime, None)
+    }
+
     fn sync(
         &self,
         _state: &ContentState,

@@ -72,8 +72,7 @@ impl EncryptedFile {
         Ok(encrypted)
     }
 
-    pub(super) fn open(path: &Path, master_key: &[u8; 32]) -> Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+    pub(super) fn open(file: File, master_key: &[u8; 32]) -> Result<Self> {
         let mut selected: Option<(Header, LessSafeKey)> = None;
         for slot in 0..HEADER_SLOTS as u8 {
             let mut bytes = [0_u8; HEADER_SLOT_SIZE];

@@ -30,9 +30,15 @@ impl LocalOpenState {
             process_lock: Mutex::new(()),
         };
         state.file.set_len(STATE_SIZE)?;
-        write_all_at(&state.file, &STATE_MAGIC.to_ne_bytes(), MAGIC_OFFSET)?;
-        write_all_at(&state.file, &flags.to_ne_bytes(), FLAGS_OFFSET)?;
-        write_all_at(&state.file, &0_i64.to_ne_bytes(), OFFSET_OFFSET)?;
+        state
+            .file
+            .write_all_at(&STATE_MAGIC.to_ne_bytes(), MAGIC_OFFSET)?;
+        state
+            .file
+            .write_all_at(&flags.to_ne_bytes(), FLAGS_OFFSET)?;
+        state
+            .file
+            .write_all_at(&0_i64.to_ne_bytes(), OFFSET_OFFSET)?;
         Ok(state)
     }
 
@@ -48,7 +54,7 @@ impl LocalOpenState {
             ));
         }
         let mut magic = [0_u8; 4];
-        read_exact_at(&state.file, &mut magic, MAGIC_OFFSET)?;
+        state.file.read_exact_at(&mut magic, MAGIC_OFFSET)?;
         if u32::from_ne_bytes(magic) != STATE_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -98,22 +104,26 @@ impl LocalOpenState {
 impl LocalOpenStateGuard<'_> {
     pub(crate) fn offset(&self) -> io::Result<libc::off_t> {
         let mut bytes = [0_u8; 8];
-        read_exact_at(&self.state.file, &mut bytes, OFFSET_OFFSET)?;
+        self.state.file.read_exact_at(&mut bytes, OFFSET_OFFSET)?;
         Ok(i64::from_ne_bytes(bytes))
     }
 
     pub(crate) fn set_offset(&self, offset: libc::off_t) -> io::Result<()> {
-        write_all_at(&self.state.file, &offset.to_ne_bytes(), OFFSET_OFFSET)
+        self.state
+            .file
+            .write_all_at(&offset.to_ne_bytes(), OFFSET_OFFSET)
     }
 
     pub(crate) fn flags(&self) -> io::Result<libc::c_int> {
         let mut bytes = [0_u8; 4];
-        read_exact_at(&self.state.file, &mut bytes, FLAGS_OFFSET)?;
+        self.state.file.read_exact_at(&mut bytes, FLAGS_OFFSET)?;
         Ok(i32::from_ne_bytes(bytes))
     }
 
     pub(crate) fn set_flags(&self, flags: libc::c_int) -> io::Result<()> {
-        write_all_at(&self.state.file, &flags.to_ne_bytes(), FLAGS_OFFSET)
+        self.state
+            .file
+            .write_all_at(&flags.to_ne_bytes(), FLAGS_OFFSET)
     }
 }
 
@@ -140,32 +150,6 @@ fn set_lock(descriptor: RawFd, kind: libc::c_short, command: libc::c_int) -> io:
             return Err(error);
         }
     }
-}
-
-fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
-    while !buffer.is_empty() {
-        match file.read_at(buffer, offset)? {
-            0 => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-            count => {
-                buffer = &mut buffer[count..];
-                offset += count as u64;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn write_all_at(file: &File, mut buffer: &[u8], mut offset: u64) -> io::Result<()> {
-    while !buffer.is_empty() {
-        match file.write_at(buffer, offset)? {
-            0 => return Err(io::Error::from(io::ErrorKind::WriteZero)),
-            count => {
-                buffer = &buffer[count..];
-                offset += count as u64;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -712,10 +712,118 @@ fn brokered_open_and_metadata_do_not_decrypt_an_existing_file_twice() {
         .unwrap();
     assert!(matches!(
         brokered.into_parts().1.target(),
-        OpenTarget::Descriptor(_)
+        OpenTarget::Broker(libc::O_RDONLY)
     ));
     assert!(filesystem.prepare_open(logical, libc::O_RDONLY, 0).is_err());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn broker_open_staging_never_truncates_existing_ciphertext() {
+    let (root, filesystem) = fixture("broker-truncate");
+    let logical = Path::new("/tmp/agora-vfs-broker-truncate");
+    let mut created = filesystem
+        .prepare_open(logical, libc::O_CREAT | libc::O_RDWR, 0o600)
+        .unwrap();
+    let OpenTarget::Descriptor(file) = created.target_mut() else {
+        panic!("expected encrypted FD")
+    };
+    file.write_all(b"keep until broker accepts").unwrap();
+    filesystem.commit_open(&mut created).unwrap();
+    let backing = filesystem.prepare_read(logical).unwrap();
+    let original = std::fs::read(&backing).unwrap();
+    let (_, mut plan) = filesystem
+        .prepare_authorized_broker_open(
+            logical,
+            OpenIntent::new(libc::O_WRONLY | libc::O_TRUNC, 0).unwrap(),
+            &Credentials::effective(),
+        )
+        .unwrap()
+        .into_parts();
+    filesystem.commit_open(&mut plan).unwrap();
+    assert_eq!(std::fs::read(backing).unwrap(), original);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn two_staged_encrypted_creates_do_not_replace_the_first_creators_bytes() {
+    let upper = tempfile::tempdir().unwrap();
+    let lower = tempfile::tempdir().unwrap();
+    let logical = lower.path().join("shared");
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let fs = VirtualFilesystem::encrypted(upper.path(), cipher.clone()).unwrap();
+    let prepare = |flags, mode| {
+        fs.prepare_authorized_broker_open(
+            &logical,
+            OpenIntent::new(libc::O_RDWR | libc::O_CREAT | flags, mode).unwrap(),
+            &Credentials::effective(),
+        )
+        .unwrap()
+        .into_parts()
+        .1
+    };
+    let mut exclusive = prepare(libc::O_EXCL, 0o600);
+    let mut first = prepare(libc::O_TRUNC, 0o600);
+    let mut second = prepare(0, 0o400);
+    fs.commit_open(&mut first).unwrap();
+    let (backing, flags, _) = first.local_broker_request().unwrap();
+    assert_eq!(flags & libc::O_TRUNC, 0);
+    let mut published = cipher.open_file(backing).unwrap();
+    published.write_at(b"first writer", 0).unwrap();
+    published.sync_all().unwrap();
+    fs.commit_open(&mut second).unwrap();
+    assert_eq!(
+        errno(&fs.commit_open(&mut exclusive).unwrap_err()),
+        Some(libc::EEXIST)
+    );
+    let metadata = fs
+        .prepare_authorized_metadata(&logical, true, &Credentials::effective())
+        .unwrap();
+    assert_eq!(metadata.into_parts().3.unwrap().mode & 0o777, 0o600);
+    let file = cipher
+        .open_file(&fs.prepare_read(&logical).unwrap())
+        .unwrap();
+    let mut actual = [0; 12];
+    assert_eq!(file.read_at(&mut actual, 0).unwrap(), actual.len());
+    assert_eq!(&actual, b"first writer");
+}
+
+#[test]
+fn exclusive_create_holds_parent_rename_until_broker_fd_handoff() {
+    use std::os::unix::fs::MetadataExt;
+
+    let upper = tempfile::tempdir().unwrap();
+    let lower = tempfile::tempdir().unwrap();
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let fs = VirtualFilesystem::encrypted(upper.path(), cipher.clone()).unwrap();
+    let before = lower.path().join("before");
+    let after = lower.path().join("after");
+    fs.create_directory(&before, 0o700).unwrap();
+    let (_, mut plan) = fs
+        .prepare_authorized_broker_open(
+            &before.join("entry"),
+            OpenIntent::new(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600).unwrap(),
+            &Credentials::effective(),
+        )
+        .unwrap()
+        .into_parts();
+    fs.commit_open(&mut plan).unwrap();
+    let (backing, _, _) = plan.local_broker_request().unwrap();
+    assert_eq!(
+        errno(&fs.rename(&before, &after).unwrap_err()),
+        Some(libc::EBUSY)
+    );
+    let opened = cipher.open_file(backing).unwrap();
+    drop(plan);
+    fs.rename(&before, &after).unwrap();
+    assert_eq!(
+        opened.backing_file().metadata().unwrap().ino(),
+        fs.prepare_read(&after.join("entry"))
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .ino()
+    );
 }
 
 #[test]

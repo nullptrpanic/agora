@@ -247,6 +247,20 @@ impl ContentBackend for EncryptedContent {
         Ok(())
     }
 
+    fn prepare_stdio(&self, state: &ContentState, runtime: &FilesystemHookRuntime) -> Result<()> {
+        self.materialize(state, runtime, None)?;
+        // libc may flush a FILE without calling interposed write. Retain a
+        // candidate across peer flushes, including any future EOF extension.
+        self.potentially_dirty(
+            state,
+            runtime,
+            LocalByteRange {
+                start: 0,
+                end: u64::MAX,
+            },
+        )
+    }
+
     fn sync(
         &self,
         state: &ContentState,

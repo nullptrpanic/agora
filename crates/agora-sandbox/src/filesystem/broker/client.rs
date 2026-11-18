@@ -9,6 +9,7 @@ use std::fs::File;
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 use std::os::fd::{OwnedFd, RawFd};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
@@ -113,7 +114,11 @@ impl LocalClient {
         &self,
         path: &Path,
         flags: libc::c_int,
+        published: Option<&File>,
     ) -> Result<LocalOpen, LocalClientError> {
+        let expected = published.map(File::metadata).transpose().map_err(|error| {
+            LocalClientError::io("cannot inspect published inode", error, false)
+        })?;
         let (
             request_id,
             LocalReply {
@@ -140,13 +145,24 @@ impl LocalClient {
                 "local filesystem open returned an unexpected response",
             ));
         };
-        if descriptors.len() != 3 {
+        let abort = || {
             let _ = self.success(
                 Request::Abort {
                     handle: handle.clone(),
                 },
                 IDEMPOTENT_ATTEMPTS,
             );
+        };
+        if expected.is_some_and(|metadata| (metadata.dev(), metadata.ino()) != (device, inode)) {
+            abort();
+            return Err(LocalClientError::io(
+                "published inode changed before open",
+                std::io::Error::from_raw_os_error(libc::ESTALE),
+                false,
+            ));
+        }
+        if descriptors.len() != 3 {
+            abort();
             return Err(LocalClientError::protocol(
                 "local filesystem open did not return content, state, and lock descriptors",
             ));
@@ -155,12 +171,7 @@ impl LocalClient {
         let state = match super::LocalOpenState::from_descriptor(descriptors.pop().unwrap()) {
             Ok(state) => state,
             Err(error) => {
-                let _ = self.success(
-                    Request::Abort {
-                        handle: handle.clone(),
-                    },
-                    IDEMPOTENT_ATTEMPTS,
-                );
+                abort();
                 return Err(LocalClientError::io(
                     "invalid local open state",
                     error,
@@ -169,13 +180,10 @@ impl LocalClient {
             }
         };
         let descriptor = File::from(descriptors.pop().unwrap());
-        if let Err(error) = self.success(Request::Claim { request_id }, IDEMPOTENT_ATTEMPTS) {
-            let _ = self.success(
-                Request::Abort {
-                    handle: handle.clone(),
-                },
-                IDEMPOTENT_ATTEMPTS,
-            );
+        if let Err(error) =
+            self.success_until_ready(Request::Claim { request_id }, IDEMPOTENT_ATTEMPTS)
+        {
+            abort();
             return Err(error);
         }
         Ok(LocalOpen {

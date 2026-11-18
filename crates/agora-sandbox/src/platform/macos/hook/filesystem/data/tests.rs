@@ -435,6 +435,59 @@ fn nocancel_hooks_delegate_to_matching_native_symbols_during_recursion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broker_open_uses_the_replacement_inode_for_descriptor_metadata() {
+    use super::super::{
+        agora_sandbox_close, agora_sandbox_fchmod, agora_sandbox_open_with_mode, agora_sandbox_stat,
+    };
+
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let (mut runtime, controller) = broker_runtime(directory.path()).await;
+    let logical = directory.path().join("document");
+    let path = c_path(&logical);
+    with_test_runtime(&runtime, || unsafe {
+        let fd = agora_sandbox_open_with_mode(path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600);
+        assert!(fd >= 0);
+        assert_eq!(agora_sandbox_close(fd), 0);
+    });
+    let backing = runtime.filesystem.prepare_read(&logical).unwrap();
+    let replacement = directory.path().join("replacement");
+    std::fs::copy(&backing, &replacement).unwrap();
+
+    // Intercept the first connection after path preparation. The retry reaches the
+    // real Broker only after the same name points at a different ciphertext inode.
+    let gate_path = directory.path().join("open.sock");
+    let gate = tokio::net::UnixListener::bind(&gate_path).unwrap();
+    let real_socket = controller.runtime().socket().to_owned();
+    runtime.local = Some(LocalClient::new(&gate_path, controller.runtime().token()));
+    let swap = tokio::spawn(async move {
+        let (first, _) = tokio::time::timeout(Duration::from_secs(30), gate.accept())
+            .await
+            .expect("the Hook must connect to open the ciphertext")
+            .unwrap();
+        std::fs::rename(replacement, backing).unwrap();
+        std::fs::remove_file(&gate_path).unwrap();
+        std::os::unix::fs::symlink(real_socket, gate_path).unwrap();
+        drop(first);
+    });
+
+    let mode = with_test_runtime(&runtime, || unsafe {
+        let fd = agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(agora_sandbox_fchmod(fd, 0o640), 0);
+        let mut status = std::mem::zeroed();
+        assert_eq!(agora_sandbox_stat(path.as_ptr(), &mut status), 0);
+        assert_eq!(agora_sandbox_close(fd), 0);
+        status.st_mode & 0o777
+    });
+    swap.await.unwrap();
+    controller.shutdown().await.unwrap();
+    assert_eq!(
+        mode, 0o640,
+        "fchmod must update the inode the Broker opened"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_managed_descriptors_preserve_complete_posix_io_semantics() {
     let directory = tempfile::tempdir().unwrap();
     let (runtime, controller) = broker_runtime(directory.path()).await;
@@ -1199,6 +1252,69 @@ async fn native_io_adapters_enforce_encrypted_descriptor_access_modes() {
     for (operation, result, errno) in results {
         assert_eq!((result, errno), (-1, libc::EBADF), "{operation}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exclusive_create_never_claims_a_leaf_replaced_during_fd_handoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    let source = dir.path().join("source");
+    let (runtime, controller) = broker_runtime(dir.path()).await;
+    with_test_runtime(&runtime, || unsafe {
+        write_managed_file(&c_path(&source), b"keep")
+    });
+    let (_, mut plan) = runtime
+        .filesystem
+        .prepare_authorized_broker_open(
+            &target,
+            OpenIntent::new(
+                libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC | libc::O_RDWR,
+                0o600,
+            )
+            .unwrap(),
+            &Credentials::effective(),
+        )
+        .unwrap()
+        .into_parts();
+    runtime.filesystem.commit_open(&mut plan).unwrap();
+    runtime.filesystem.rename(&source, &target).unwrap();
+    let (backing, flags, published) = plan.local_broker_request().unwrap();
+    let result = runtime
+        .local
+        .as_ref()
+        .unwrap()
+        .open(backing, flags, published);
+    let actual = with_test_runtime(&runtime, || unsafe { read_managed_file(&c_path(&target)) });
+    controller.shutdown().await.unwrap();
+    assert_eq!(actual, b"keep");
+    assert!(matches!(result, Err(error) if error.errno() == libc::ESTALE));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn libc_stream_flush_and_peer_range_write_are_both_durable() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = c_path(&directory.path().join("mixed-writers"));
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    with_test_runtime(&runtime, || unsafe {
+        write_managed_file(&path, b"abcdef");
+        let stream = super::super::agora_sandbox_fopen(path.as_ptr(), c"r+".as_ptr());
+        assert!(!stream.is_null());
+        let peer = super::super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
+        assert!(peer >= 0);
+        // libc owns FILE buffering; the Hook cannot require its internal flush
+        // to issue a public write() and report a dirty range.
+        assert_eq!(libc::fwrite(b"XY".as_ptr().cast(), 1, 2, stream), 2);
+        assert_eq!(libc::fflush(stream), 0);
+        assert_eq!(agora_sandbox_pwrite(peer, b"Z".as_ptr().cast(), 1, 5), 1);
+        assert_eq!(super::super::agora_sandbox_fsync(peer), 0);
+        assert_eq!(super::super::agora_sandbox_close(peer), 0);
+        assert_eq!(super::super::agora_sandbox_fclose(stream), 0);
+    });
+    controller.shutdown().await.unwrap();
+    let (reader, controller) = broker_runtime(directory.path()).await;
+    let actual = with_test_runtime(&reader, || unsafe { read_managed_file(&path) });
+    controller.shutdown().await.unwrap();
+    assert_eq!(actual, b"XYcdeZ");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

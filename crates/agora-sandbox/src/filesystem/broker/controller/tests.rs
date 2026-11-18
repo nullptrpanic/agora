@@ -46,7 +46,7 @@ async fn controller_serves_the_complete_local_client_lifecycle() {
     assert_eq!(controller.runtime().token().len(), 32);
     let client = LocalClient::new(controller.runtime().socket(), controller.runtime().token());
     let handle = tokio::task::spawn_blocking(move || {
-        let opened = client.open(&backing, libc::O_RDWR).unwrap();
+        let opened = client.open(&backing, libc::O_RDWR, None).unwrap();
         client
             .materialize(&opened.handle, Some(ByteRange::new(0, 3).unwrap()))
             .unwrap();
@@ -103,7 +103,7 @@ async fn dropped_write_connection_releases_its_reservation() {
         .await
         .unwrap();
     let client = LocalClient::new(controller.runtime().socket(), controller.runtime().token());
-    let opened = client.open(&backing, libc::O_RDWR).unwrap();
+    let opened = client.open(&backing, libc::O_RDWR, None).unwrap();
 
     let write = client
         .begin_write(&opened.handle, ByteRange::new(0, 1).unwrap())
@@ -166,7 +166,7 @@ async fn write_lease_begin_cannot_be_replayed_onto_a_second_connection() {
         .await
         .unwrap();
     let client = LocalClient::new(controller.runtime().socket(), controller.runtime().token());
-    let opened = client.open(&backing, libc::O_RDWR).unwrap();
+    let opened = client.open(&backing, libc::O_RDWR, None).unwrap();
     let request_id = "11111111111111111111111111111111";
     let write_id = "22222222222222222222222222222222";
     let begin = RequestEnvelope {
@@ -246,7 +246,7 @@ async fn abandoned_resident_write_recovers_the_current_vnode() {
         .await
         .unwrap();
     let client = LocalClient::new(controller.runtime().socket(), controller.runtime().token());
-    let opened = client.open(&backing, libc::O_RDWR).unwrap();
+    let opened = client.open(&backing, libc::O_RDWR, None).unwrap();
     assert!(!opened.lazy);
 
     let write = client
@@ -319,7 +319,7 @@ async fn abandoned_lazy_write_preserves_the_last_valid_ciphertext() {
         .await
         .unwrap();
     let client = LocalClient::new(controller.runtime().socket(), controller.runtime().token());
-    let opened = client.open(&backing, libc::O_RDWR).unwrap();
+    let opened = client.open(&backing, libc::O_RDWR, None).unwrap();
     assert!(opened.lazy);
 
     let range = ByteRange::new(4096, 8192).unwrap();
@@ -350,7 +350,7 @@ async fn abandoned_lazy_write_preserves_the_last_valid_ciphertext() {
         }
     }
 
-    let reopened = client.open(&backing, libc::O_RDONLY).unwrap();
+    let reopened = client.open(&backing, libc::O_RDONLY, None).unwrap();
     client.materialize(&reopened.handle, Some(range)).unwrap();
     let mut restored = vec![0_u8; (range.end - range.start) as usize];
     reopened
@@ -397,7 +397,7 @@ async fn authenticated_local_control_stream_survives_new_connection_denial() {
         InheritedControlStream::new(stream, InheritedControlLock::anonymous().unwrap(), 0).unwrap();
     let client = LocalClient::with_shared(&socket, controller.runtime().token(), shared);
 
-    let opened = client.open(&backing, libc::O_RDWR).unwrap();
+    let opened = client.open(&backing, libc::O_RDWR, None).unwrap();
     client.ping_shared().unwrap();
     std::fs::remove_file(&socket).unwrap();
     let write = client

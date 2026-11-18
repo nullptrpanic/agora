@@ -4006,7 +4006,7 @@ fn filesystem_errors_preserve_errno_and_default_to_io_error() {
     }
     let missing_socket = PathBuf::from(format!("/tmp/agora-missing-{}.sock", uuid::Uuid::new_v4()));
     let local_error = match crate::filesystem::broker::LocalClient::new(missing_socket, "token")
-        .open(Path::new("/tmp"), libc::O_RDONLY)
+        .open(Path::new("/tmp"), libc::O_RDONLY, None)
     {
         Ok(_) => panic!("missing local broker should reject open"),
         Err(error) => error,
