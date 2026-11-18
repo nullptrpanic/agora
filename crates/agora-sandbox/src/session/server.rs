@@ -252,23 +252,10 @@ where
     drop(prepare_sender);
     drop(prepare_receiver);
     drop(event_sender);
+    // No owner remains to answer queued decisions once the select loop ends.
+    drop(event_receiver);
     if runtime_failure.is_some() {
-        let deadline = tokio::time::sleep(Duration::from_secs(2));
-        tokio::pin!(deadline);
-        loop {
-            tokio::select! {
-                _ = &mut deadline => {
-                    connections.abort_all();
-                    break;
-                }
-                result = connections.join_next(), if !connections.is_empty() => {
-                    if result.is_none() || connections.is_empty() {
-                        break;
-                    }
-                }
-                else => break,
-            }
-        }
+        drain_connections(&mut connections).await;
     }
     // A started spawn_blocking preparation cannot be aborted. Drain it before
     // releasing the workspace and controller-owned descriptors it depends on.
@@ -285,18 +272,24 @@ where
         };
         let _ = response.send(result);
     }
-    if runtime_failure.is_none() {
-        while connections.join_next().await.is_some() {}
-    } else {
-        connections.abort_all();
-        while connections.join_next().await.is_some() {}
-    }
+    drain_connections(&mut connections).await;
     match runtime_failure {
         Some(error) => {
             let _ = shutdown;
             Err(error)
         }
         None => shutdown,
+    }
+}
+
+async fn drain_connections(connections: &mut JoinSet<Result<()>>) {
+    if tokio::time::timeout(Duration::from_secs(2), async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        connections.shutdown().await;
     }
 }
 
@@ -357,11 +350,14 @@ async fn handle_connection(mut stream: UnixStream, context: ConnectionContext) -
             },
         )
         .await?;
-        handle_joined_connection(&mut stream, &prepare, &events, &mut failure).await
+        handle_joined_connection(&mut stream, &prepare, &mut failure).await
     }
     .await;
     match result {
-        Ok(ConnectionCompletion::Released | ConnectionCompletion::RuntimeFailed) => Ok(()),
+        // This is the only release path after Finished/Cancel; delivery failure
+        // cannot fall through to the abandoned-connection path below.
+        Ok(ConnectionCompletion::Release) => release(&events, &mut stream).await,
+        Ok(ConnectionCompletion::RuntimeFailed) => Ok(()),
         Ok(ConnectionCompletion::Abandoned) => {
             abandon(&events).await?;
             Ok(())
@@ -374,7 +370,7 @@ async fn handle_connection(mut stream: UnixStream, context: ConnectionContext) -
 }
 
 enum ConnectionCompletion {
-    Released,
+    Release,
     Abandoned,
     RuntimeFailed,
 }
@@ -382,7 +378,6 @@ enum ConnectionCompletion {
 async fn handle_joined_connection(
     stream: &mut UnixStream,
     prepare: &mpsc::Sender<PrepareRequest>,
-    events: &mpsc::Sender<SessionEvent>,
     failure: &mut watch::Receiver<Option<String>>,
 ) -> Result<ConnectionCompletion> {
     let message = read_launch_state(stream, "prepare").await?;
@@ -441,17 +436,10 @@ async fn handle_joined_connection(
             }
             message = read_frame::<_, ClientMessage>(stream) => {
                 match message {
-                    Ok(ClientMessage::Finished { launch_id: finished, .. })
-                        if finished == launch_id =>
+                    Ok(ClientMessage::Finished { launch_id: id } | ClientMessage::Cancel { launch_id: id })
+                        if id == launch_id =>
                     {
-                        release(events, stream).await?;
-                        return Ok(ConnectionCompletion::Released);
-                    }
-                    Ok(ClientMessage::Cancel { launch_id: cancelled })
-                        if cancelled == launch_id =>
-                    {
-                        release(events, stream).await?;
-                        return Ok(ConnectionCompletion::Released);
+                        return Ok(ConnectionCompletion::Release);
                     }
                     Ok(_) => {
                         reject(stream, "invalid sandbox session finish state").await?;
@@ -554,10 +542,9 @@ mod tests {
         for disconnect in [false, true] {
             let (mut client, mut server) = UnixStream::pair().unwrap();
             let (prepare, mut requests) = mpsc::channel(MAX_CONNECTIONS);
-            let (events, _event_receiver) = mpsc::channel(MAX_CONNECTIONS);
             let (failed, mut failure) = watch::channel(None);
             let handler = tokio::spawn(async move {
-                handle_joined_connection(&mut server, &prepare, &events, &mut failure).await
+                handle_joined_connection(&mut server, &prepare, &mut failure).await
             });
             write_frame(
                 &mut client,
@@ -599,15 +586,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn slow_executable_prepare_does_not_block_a_second_join() {
-        use super::super::protocol::{DaemonReadiness, WireOsString};
+    async fn start_test_server(
+        workdir: &std::path::Path,
+    ) -> (
+        SessionPaths,
+        ClientMessage,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        use super::super::protocol::DaemonReadiness;
         use std::os::fd::IntoRawFd;
-        let root = tempfile::tempdir().unwrap();
-        let workdir = root.path().join("workspace");
-        let hook = crate::hook_library::materialize(&workdir).unwrap();
-        let config = SandboxConfig::new(hook).with_workdir(&workdir);
-        let paths = SessionPaths::resolve(&workdir).unwrap();
+        let hook = crate::hook_library::materialize(workdir).unwrap();
+        let config = SandboxConfig::new(hook).with_workdir(workdir);
+        let paths = SessionPaths::resolve(workdir).unwrap();
         let build = build_identity().unwrap();
         let (ready, server_ready) = std::os::unix::net::UnixStream::pair().unwrap();
         ready.set_nonblocking(true).unwrap();
@@ -641,6 +631,116 @@ mod tests {
             build,
             config: "test-config".to_owned(),
         };
+        (paths, join, server)
+    }
+
+    #[tokio::test]
+    async fn draining_releases_an_already_accepted_build_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let (paths, join, server) = start_test_server(&root.path().join("workspace")).await;
+        let mut late = UnixStream::connect(paths.socket()).await.unwrap();
+        let mut first = UnixStream::connect(paths.socket()).await.unwrap();
+        write_frame(&mut first, &join).await.unwrap();
+        assert!(matches!(
+            read_frame::<_, ServerMessage>(&mut first).await.unwrap(),
+            ServerMessage::Joined { .. }
+        ));
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while paths.socket().exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut stale = join;
+        if let ClientMessage::Join { build, .. } = &mut stale {
+            *build = "obsolete".into();
+        }
+        let _ = write_frame(&mut late, &stale).await;
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("owner still waiting for the mismatched handler")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_release_reply_does_not_release_a_second_lease() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (prepare, mut requests) = mpsc::channel(MAX_CONNECTIONS);
+        let (events, mut received) = mpsc::channel(MAX_CONNECTIONS);
+        let (_failure_sender, failure) = watch::channel(None);
+        let context = ConnectionContext {
+            build_identity: "build".into(),
+            config_identity: "config".into(),
+            sandbox_id: "sandbox".into(),
+            run_id: "test".into(),
+            prepare,
+            events,
+            failure,
+        };
+        let handler = tokio::spawn(handle_connection(server, context));
+        write_frame(
+            &mut client,
+            &ClientMessage::Join {
+                protocol: PROTOCOL_VERSION,
+                build: "build".into(),
+                config: "config".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let _: ServerMessage = read_frame(&mut client).await.unwrap();
+        assert!(matches!(received.recv().await, Some(SessionEvent::Joined)));
+        write_frame(
+            &mut client,
+            &ClientMessage::Prepare {
+                executable: std::ffi::OsStr::new("/bin/sh").into(),
+            },
+        )
+        .await
+        .unwrap();
+        let launch: WirePreparedLaunch = serde_json::from_value(serde_json::json!({
+            "launch_id":"one", "program":super::super::protocol::WireOsString::from(std::ffi::OsStr::new("/bin/sh")), "argument_prefix":[], "additions":[], "removals":[]
+        })).unwrap();
+        requests
+            .recv()
+            .await
+            .unwrap()
+            .response
+            .send(Ok(launch))
+            .unwrap();
+        let _: ServerMessage = read_frame(&mut client).await.unwrap();
+        write_frame(
+            &mut client,
+            &ClientMessage::Finished {
+                launch_id: "one".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let Some(SessionEvent::Releasing {
+            response: Some(ack),
+        }) = received.recv().await
+        else {
+            panic!("expected release")
+        };
+        drop(client);
+        ack.send(Ok(())).unwrap();
+        assert!(handler.await.unwrap().is_err());
+        assert!(
+            received.recv().await.is_none(),
+            "same lease was released twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_executable_prepare_does_not_block_a_second_join() {
+        use super::super::protocol::WireOsString;
+        let root = tempfile::tempdir().unwrap();
+        let workdir = root.path().join("workspace");
+        let (paths, join, server) = start_test_server(&workdir).await;
         let mut first = UnixStream::connect(paths.socket()).await.unwrap();
         write_frame(&mut first, &join).await.unwrap();
         let _: ServerMessage = read_frame(&mut first).await.unwrap();

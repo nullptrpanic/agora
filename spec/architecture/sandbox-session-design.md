@@ -212,7 +212,8 @@ and it does not change encrypted storage formats.
 
 An accepted launch owns a session lease. Its control connection stays open
 while the command runs. `Finished`, cancellation after a local spawn failure,
-or connection loss releases that launch's lease. Normal client shutdown first
+or connection loss releases that launch's lease exactly once, even if the
+client disconnects before receiving the release acknowledgement. Normal client shutdown first
 terminates the launch process group as the current runner does, then releases
 the lease.
 
@@ -231,7 +232,10 @@ lease transitions the daemon to draining:
 4. Shut down NFS, network, execution, and audit controllers. NFS shutdown first
    closes every accepted UDS endpoint so a persistent receive running on the
    blocking pool cannot outlive its cancelled connection task.
-5. Remove the session socket and release `.fs.lock`.
+5. Deliver the final release result after runtime shutdown. Calls already queued
+   for a session decision are no longer accepted; remaining connection tasks get
+   a bounded grace period to finish, then are cancelled. An idle or incompatible
+   client cannot retain `.fs.lock`.
 
 A client whose connection races final shutdown retries the ordinary startup
 election. The inherited startup lock prevents a replacement daemon from
