@@ -4,7 +4,8 @@ use super::{
 };
 use crate::config::AgentSandbox;
 use crate::task::{
-    OutputEvent, ProgressStatus, TaskAttachment, TaskAttachmentKind, TokenUsage, WebAction,
+    ConversationContext, OutputEvent, ProgressStatus, TaskAttachment, TaskAttachmentKind,
+    TokenUsage, WebAction,
 };
 use agora_core::logger;
 use anyhow::{Context, Result, bail};
@@ -50,8 +51,22 @@ impl CodexAgent {
     }
 
     fn command(&self, request: AgentRequest) -> Result<PreparedCommand> {
-        let (workdir, content, session_id) = request.into_parts();
-        let (input, attachments) = content.into_parts();
+        #[derive(serde::Serialize)]
+        struct ChannelInput<'a> {
+            user_request: &'a str,
+            context: &'a ConversationContext,
+        }
+
+        let (text, attachments) = request.content.into_parts();
+        let input = match request.conversation.as_deref() {
+            Some(context) => serde_json::to_string(&ChannelInput {
+                user_request: &text,
+                context,
+            })?,
+            None => text,
+        };
+        let workdir = request.workdir;
+        let session_id = request.session_id;
         let (attachment_dir, image_paths) = Self::materialize_images(&workdir, &attachments)?;
         let resume_requested = session_id.is_some();
         let mut args = match &session_id {

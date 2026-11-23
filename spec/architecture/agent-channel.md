@@ -147,6 +147,18 @@ Telegram retains the latest 64 process entries and up to 256 KiB of answer text.
 
 All fixed node-authored user-facing copy is centralized under `agora-node/src/i18n/`, with the current catalog in `zh_cn.rs`. Channel renderers own only channel-specific Markdown, card JSON, colors, icons, and layout. Protocol field names, internal validation errors, logs, and agent-authored prose are not localized or rewritten. Lark formats structured web-action metadata and its generated attachment placeholder using the scoped display policy above; other channels retain their own rendering.
 
+## Group conversation context
+
+Both messaging channels use the same permission gate and Codex input protocol for authorized group and direct-chat messages. An unmentioned message in a denied group is consumed silently. An explicit mention in that group produces only permission guidance. Native reply targets and group mentions of the human sender belong to the originating channel. Private replies omit the mention. A manual stop keeps its status-only presentation.
+
+For an admitted Feishu or Telegram message, Node writes one JSON object to Codex stdin. The two top-level fields are `user_request` (the message text, or the parsed question for a targeted `/ask`) and `context`. The channel takes `channel`, `chat_type`, `chat_id` and `message_id` from the inbound event. It includes `thread_id`, `reply_to_message_id` and structured member `mentions` when available. IDs are strings. Images on the request still use Codex's `--image` argument. Custom executables keep their existing stdin contract.
+
+```json
+{"user_request":"看下这个问题","context":{"channel":"lark","chat_type":"group","chat_id":"oc_demo","message_id":"om_question","reply_to_message_id":"om_parent"}}
+```
+
+External skills available to the Codex process can use these identifiers to read the chat or the referenced message. Their configured identities determine access. A skill lookup takes place in the current Codex run and follows its session isolation. Node supplies no instruction prefix or message history, maintains no Telegram transcript, and treats the model's final text as an answer, including JSON.
+
 ## HTTP Channel Shape
 
 HTTP task intake should use polling because it works from local nodes behind NAT and firewalls.

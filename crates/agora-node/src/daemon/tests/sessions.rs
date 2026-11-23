@@ -585,3 +585,164 @@ async fn rejects_a_successful_fresh_codex_run_without_a_session_id() {
     assert!(error.to_string().contains("without a session id"));
     assert_eq!(store.get(&store_key).unwrap(), None);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn telegram_codex_stdin_is_one_json_object_and_json_answers_are_delivered_verbatim() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(temp.path().join("store.db")).unwrap();
+    let dispatcher = AgentDispatcher::new(store.clone());
+    let mut config = agent("codex", "telegram");
+    let script = temp.path().join("codex");
+    std::fs::write(&script, r#"#!/bin/sh
+[ ! -e input ] || exit 2
+cat > input
+printf '%s\n' '{"type":"thread.started","thread_id":"ordinary"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"read_chat_history\":{}}"}}' '{"type":"turn.completed"}'
+"#).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    config.path = script.to_string_lossy().into_owned();
+    config.workspace = temp.path().to_string_lossy().into_owned();
+    let agent = ConfiguredAgent::from_config(config).unwrap();
+    let key = agent.store_session_key(&ChannelIdentity::new("telegram", "telegram", "app"), "chat");
+    let question = "看看这条引用\n里面的\"原因\"";
+    let mut task = AgentTask::new(question);
+    task.conversation = Some(Arc::new(crate::task::ConversationContext {
+        channel: "telegram",
+        chat_type: "private",
+        chat_id: "123".into(),
+        message_id: "9".into(),
+        thread_id: None,
+        reply_to_message_id: Some("8".into()),
+        mentions: vec![],
+    }));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut output = AgentRunOutput::new(RecordingRun {
+        events: Arc::clone(&events),
+    });
+    let outcome = dispatcher
+        .execute_agent(&key, &agent, task, AgentRunControl::new(), &mut output)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, AgentRunOutcome::Completed(ref result) if result.exit_code() == 0));
+    let events = events.lock().unwrap();
+    let answers: Vec<_> = events
+        .iter()
+        .filter_map(|e| {
+            if let RunEvent::Output(OutputEvent::Answer { text }) = e {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(answers, [r#"{"read_chat_history":{}}"#]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RunEvent::Output(OutputEvent::ToolCall { .. })))
+    );
+    let input = std::fs::read_to_string(temp.path().join("input")).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&input).unwrap(),
+        serde_json::json!({
+            "user_request": question,
+            "context": { "channel": "telegram", "chat_type": "private", "chat_id": "123",
+                         "message_id": "9", "reply_to_message_id": "8" }
+        })
+    );
+    assert_eq!(store.get(&key).unwrap().as_deref(), Some("ordinary"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lark_ask_and_regular_messages_resume_codex_with_only_json_on_stdin() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+printf '%s\n' "$@" > args
+printf 'run\n' >> launches
+cat > input
+printf '%s\n' '{"type":"thread.started","thread_id":"shared-id"}' '{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}'
+printf '%s\n' '{"type":"turn.completed"}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = agent("codex", "reply");
+    config.workspace = temp.path().to_string_lossy().into_owned();
+    config.path = script.to_string_lossy().into_owned();
+    let agent = ConfiguredAgent::from_config(config).unwrap();
+    let channel = ReplyChannel {
+        replies: Default::default(),
+    };
+    let store = SessionStore::open(temp.path().join("store.db")).unwrap();
+    let key = agent.store_session_key(&channel.identity(), "reply-session");
+    store.observe(&key, None, "shared-id").unwrap();
+    let dispatcher = AgentDispatcher::new(store.clone());
+    let commands = CommandRuntime::new(store.clone(), dispatcher.scheduler.clone()).unwrap();
+    let mut runs = JoinSet::new();
+    let task = ReplyTask {
+        input: ChannelTaskInput::Message("/ask codex 分析下这个群的内容".into()),
+    };
+    Daemon::route_channel_task(
+        &channel,
+        std::slice::from_ref(&agent),
+        &dispatcher,
+        &commands,
+        task,
+        &mut runs,
+    )
+    .await
+    .unwrap();
+    while let Some(run) = runs.join_next().await {
+        run.unwrap().unwrap();
+    }
+    let args = std::fs::read_to_string(temp.path().join("args")).unwrap();
+    assert!(args.contains("resume") && args.contains("shared-id"));
+    let input = std::fs::read_to_string(temp.path().join("input")).unwrap();
+    let envelope: serde_json::Value =
+        serde_json::from_str(&input).expect("Codex stdin must contain a single JSON object");
+    assert_eq!(
+        envelope,
+        serde_json::json!({
+            "user_request":"分析下这个群的内容",
+            "context":{"channel":"lark","chat_type":"group","chat_id":"test-chat","message_id":"reply-task"}
+        })
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("launches")).unwrap(),
+        "run\n"
+    );
+    assert_eq!(store.get(&key).unwrap().as_deref(), Some("shared-id"));
+    let ordinary = ReplyTask {
+        input: ChannelTaskInput::Message("检查构建".into()),
+    };
+    Daemon::route_channel_task(
+        &channel,
+        &[agent],
+        &dispatcher,
+        &commands,
+        ordinary,
+        &mut runs,
+    )
+    .await
+    .unwrap();
+    while let Some(run) = runs.join_next().await {
+        run.unwrap().unwrap();
+    }
+    let args = std::fs::read_to_string(temp.path().join("args")).unwrap();
+    assert!(args.contains("resume") && args.contains("shared-id") && !args.contains("--ephemeral"));
+    let input = std::fs::read_to_string(temp.path().join("input")).unwrap();
+    let envelope: serde_json::Value =
+        serde_json::from_str(&input).expect("Codex stdin must contain a single JSON object");
+    assert_eq!(envelope["user_request"], "检查构建");
+    assert_eq!(envelope["context"]["message_id"], "reply-task");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("launches")).unwrap(),
+        "run\nrun\n"
+    );
+}

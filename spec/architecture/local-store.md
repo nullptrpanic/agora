@@ -57,7 +57,7 @@ rewritten.
 
 ## Session operations
 
-The daemon and Store apply compare-and-set semantics:
+Ordinary resumable runs use the following compare-and-set operations.
 
 1. Read the optional mapping after the run reaches the front of its process-local FIFO.
 2. Invoke the Agent fresh or with that exact opaque ID without holding the Store lock.
@@ -71,13 +71,15 @@ Timeout, cancellation, or a non-zero process exit therefore retain an already ob
 for the next resume or reset. Empty or changing IDs are rejected; session observations are not
 UI output events and the Channel never owns their persistence.
 
-A successful fresh Codex run must report a nonempty thread ID. A resumed run may omit the ID, but
+A successful fresh resumable Codex run must report a nonempty thread ID. A resumed run may omit the ID, but
 if it reports one, it must equal the attempted ID. If the Agent classifies the attempted backend
 session as missing before task execution, the daemon conditionally removes only that mapping and
 retries the same task once without a session. The Agent must not request this destructive fallback
 after observing execution or on ambiguous diagnostics. Codex requires a non-zero resumed command,
 no observed stdout, untruncated stderr, and its explicit pre-execution rollout-not-found error; successful commands
 or unrelated missing-session text retain their original mapping and are never automatically replayed.
+
+Feishu and Telegram messages use the configured Codex session mapping, including early observation and stale-session recovery. Tool calls made by external skills belong to that same session. See [conversation context](agent-channel.md#group-conversation-context).
 
 `/reset` uses the scheduler barrier before reading the mapping. It asks the Agent to delete the
 opaque backend session and then removes only the row that still contains the attempted ID. Backend

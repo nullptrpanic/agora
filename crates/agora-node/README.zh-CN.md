@@ -112,6 +112,8 @@ target/release/agora-node daemon --config node.json
 
 可以使用 `<命令> help` 查看具体帮助，例如 `/ask help` 或 `/stop help`。
 
+在飞书和 Telegram 中，Node 将你的问题、聊天 ID、消息 ID 和可选的引用或话题 ID 放在一个 JSON 对象中交给 Codex。问「这里讨论了什么」时，Codex 可以通过运行环境中配置的外部 skill，按 ID 查询该账号有权读取的记录。群里引用原消息并 @ 提问者，单聊直接引用回复。
+
 ## 配置模型
 
 一个配置文件包含可复用的 Channel 与本地 Agent，Agent 通过名称订阅 Channel：

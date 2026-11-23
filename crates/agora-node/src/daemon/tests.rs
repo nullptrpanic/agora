@@ -182,6 +182,18 @@ impl crate::channel::ChannelSender for ReplyChannel {
         ChannelIdentity::new(self.name(), "test", self.name())
     }
 
+    fn conversation_context(&self, task: &Self::Task) -> Option<crate::task::ConversationContext> {
+        Some(crate::task::ConversationContext {
+            channel: "lark",
+            chat_type: "group",
+            chat_id: "test-chat".into(),
+            message_id: task.task_id().into(),
+            thread_id: None,
+            reply_to_message_id: None,
+            mentions: vec![],
+        })
+    }
+
     async fn open_run(&self, _task: &Self::Task, _context: ChannelRunContext) -> Result<Self::Run> {
         Ok(RecordingRun {
             events: Arc::new(Mutex::new(Vec::new())),

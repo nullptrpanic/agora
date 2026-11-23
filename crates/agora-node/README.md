@@ -112,6 +112,8 @@ An ordinary authorized message is sent to every enabled agent subscribed to that
 
 Use `<command> help`, such as `/ask help` or `/stop help`, for command-specific guidance.
 
+For Feishu and Telegram, Codex receives one JSON object containing your question and the IDs of the chat, message, and any quoted message or topic. When you ask “What did we discuss here?”, an external skill configured for that Codex process can use those IDs to look up messages its account can access. Group replies quote your message and mention you. Direct replies quote the message.
+
 ## Configuration Model
 
 One configuration contains reusable channels and local agents. An agent subscribes to channels by name:

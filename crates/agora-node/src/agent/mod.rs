@@ -1,10 +1,11 @@
 use crate::config::{AgentConfig, AgentType, HttpProxy, IsolationScope};
 use crate::store::{AgentIdentity, ChannelIdentity, StoreSessionKey};
-use crate::task::{OutputEvent, TaskContent};
+use crate::task::{ConversationContext, OutputEvent, TaskContent};
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub mod command;
 
@@ -29,12 +30,14 @@ pub trait AgentOutput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentTask {
     content: TaskContent,
+    pub(crate) conversation: Option<Arc<ConversationContext>>,
 }
 
 impl AgentTask {
     pub fn new(content: impl Into<TaskContent>) -> Self {
         Self {
             content: content.into(),
+            conversation: None,
         }
     }
 
@@ -48,6 +51,7 @@ impl AgentTask {
         Ok(AgentRequest {
             workdir,
             content: self.content,
+            conversation: self.conversation,
             session_id: agent_session_id,
         })
     }
@@ -56,6 +60,7 @@ impl AgentTask {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentRequest {
     workdir: PathBuf,
+    conversation: Option<Arc<ConversationContext>>,
     content: TaskContent,
     session_id: Option<String>,
 }
@@ -225,6 +230,10 @@ impl ConfiguredAgent {
 
     pub fn identity(&self) -> &AgentIdentity {
         &self.identity
+    }
+
+    pub(crate) fn supports_conversation_context(&self) -> bool {
+        matches!(self.backend, AgentBackend::Codex(_))
     }
 
     pub(crate) fn requires_session_id(&self) -> bool {

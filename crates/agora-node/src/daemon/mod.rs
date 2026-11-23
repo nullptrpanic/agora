@@ -140,12 +140,12 @@ impl AgentDispatcher {
                 let isolation_scope = agent.isolation_scope(channel.name(), task.session_id());
                 let key = SessionKey::new(agent.name(), isolation_scope);
                 let store_key = agent.store_session_key(&channel_identity, task.session_id());
-                (agent, key, store_key, AgentTask::new(content.clone()))
+                (agent, key, store_key)
             })
             .collect::<Vec<_>>();
         let scopes = planned
             .iter()
-            .map(|(agent, key, _, _)| {
+            .map(|(agent, key, _)| {
                 ExecutionScope::new(
                     channel.name(),
                     task.session_id(),
@@ -179,7 +179,19 @@ impl AgentDispatcher {
         admission.complete();
         let mut prepared = Vec::with_capacity(admitted.len());
 
-        for ((agent, _key, store_key, agent_task), admitted) in planned.into_iter().zip(admitted) {
+        let conversation = if planned
+            .iter()
+            .any(|(agent, _, _)| agent.supports_conversation_context())
+        {
+            channel.conversation_context(&task).map(Arc::new)
+        } else {
+            None
+        };
+        for ((agent, _key, store_key), admitted) in planned.into_iter().zip(admitted) {
+            let mut agent_task = AgentTask::new(content.clone());
+            if agent.supports_conversation_context() {
+                agent_task.conversation.clone_from(&conversation);
+            }
             let (execution, completion) = admitted.into_parts();
             let control = execution.control();
             let interrupt_control = control.clone();

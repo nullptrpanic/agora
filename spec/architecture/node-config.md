@@ -182,6 +182,8 @@ Daemon private-chat runs carry an interrupt callback, so they use persistent Ric
 
 An agent can subscribe to multiple channel names. A channel implementation should stay reusable and should not embed agent-specific backend execution settings.
 
+Feishu and Telegram apply the user/group allowlists and per-group mention policy before dispatch. Group replies address the inbound sender. For each admitted message, Codex receives one JSON object containing the question and native conversation identifiers. History access uses the external skills and credentials available to the configured agent process. Tool results use that agent’s configured session isolation. See [conversation context](agent-channel.md#group-conversation-context).
+
 ## CLI Entry
 
 The node CLI separates daemon execution from configuration management. The
