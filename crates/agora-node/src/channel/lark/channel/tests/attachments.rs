@@ -131,7 +131,7 @@ async fn resolves_lark_post_images_into_task_attachments() {
     .unwrap();
     let channel = LarkChannel::with_api(api);
 
-    let task = channel.task_from_event(event).await.unwrap();
+    let task = channel.ingress.task_from_event(event).await.unwrap();
 
     let content = task.input().message().unwrap();
     assert_eq!(content.text(), "analyze this image");
@@ -190,6 +190,7 @@ async fn rejects_lark_post_images_above_the_cumulative_attachment_limit() {
     let channel = LarkChannel::with_api(api);
 
     let error = channel
+        .ingress
         .task_from_event_with_attachment_limit(event, 10)
         .await
         .unwrap_err();
@@ -234,7 +235,7 @@ async fn rejects_excessive_lark_image_counts_before_downloading() {
     .unwrap();
     let channel = LarkChannel::with_api(api);
 
-    let error = channel.task_from_event(event).await.unwrap_err();
+    let error = channel.ingress.task_from_event(event).await.unwrap_err();
 
     assert!(error.to_string().contains("at most 16 images"));
     assert!(
@@ -242,4 +243,45 @@ async fn rejects_excessive_lark_image_counts_before_downloading() {
             .downcast_ref::<LarkImageDownloadError>()
             .is_some_and(LarkImageDownloadError::is_permanent)
     );
+}
+
+#[tokio::test]
+async fn incoming_image_refreshes_a_rejected_cached_token_once() {
+    let attempts = std::sync::atomic::AtomicUsize::new(0);
+    let server = HttpMockServer::start(move |request| {
+        if request.endpoint() == "internal" {
+            MockResponse::json(
+                r#"{"code":0,"msg":"ok","tenant_access_token":"token","expire":7200}"#,
+            )
+        } else if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            MockResponse::json(r#"{"code":99991663,"msg":"expired"}"#)
+        } else {
+            MockResponse::bytes(b"image".to_vec(), "image/png")
+        }
+    })
+    .await;
+    let channel = LarkChannel::with_api(
+        LarkApi::with_base_url(
+            LarkChannelConfig {
+                name: "test".into(),
+                app_id: "app".into(),
+                secret: "secret".into(),
+                permission: Default::default(),
+                proxy: None,
+            },
+            server.base_url(),
+        )
+        .unwrap(),
+    );
+    let mut event = super::channel::message("image");
+    event.image_keys.push("image-key".into());
+    for _ in 0..2 {
+        let task = channel
+            .ingress
+            .task_from_event(event.clone())
+            .await
+            .unwrap();
+        assert_eq!(task.input().message().unwrap().attachments().len(), 1);
+    }
+    assert_eq!(server.endpoint_count("internal").await, 2);
 }

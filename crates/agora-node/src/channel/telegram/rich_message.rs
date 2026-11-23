@@ -2,16 +2,18 @@ use super::channel::{TelegramInterruptRegistration, TelegramReplyTarget};
 use super::telegram_api::TelegramApi;
 use crate::channel::{
     ChannelRun, IMAGE_DELIVERY_TIMEOUT, ImageDeliveries, RunEvent, append_bounded_tail,
-    bounded_tail,
+    bounded_tail, command_output_preview,
 };
 use crate::i18n::{self, RunStatus};
-use crate::task::{OutputEvent, OutputImage, ProgressStatus, TokenUsage};
+use crate::task::{OutputEvent, OutputImage, ProgressStatus};
 use agora_core::logger;
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+mod action_title;
 
 const TELEGRAM_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 const TELEGRAM_DRAFT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
@@ -22,8 +24,7 @@ const TELEGRAM_RICH_MESSAGE_MAX_STRUCTURE_POINTS: usize = 400;
 const TELEGRAM_PROCESS_MAX_CHARS: usize = 20_000;
 const TELEGRAM_PROCESS_MAX_STRUCTURE_POINTS: usize = 240;
 const TELEGRAM_RETAINED_ANSWER_MAX_BYTES: usize = 256 * 1024;
-const TELEGRAM_RETAINED_PROCESS_PHASES: usize = 64;
-const TELEGRAM_RETAINED_PROGRESS_PER_PHASE: usize = 64;
+const TELEGRAM_RETAINED_PROCESS_ENTRIES: usize = 64;
 const TELEGRAM_RETAINED_PROCESS_TEXT_MAX_BYTES: usize = 8 * 1024;
 
 #[derive(Clone)]
@@ -45,6 +46,7 @@ struct TelegramRichMessageState {
     content: TelegramRichContent,
     draft_id: i64,
     message_ids: Vec<i64>,
+    unconfirmed_part: Option<usize>,
     version: u64,
     sent_version: u64,
     last_update: Option<Instant>,
@@ -118,6 +120,7 @@ impl TelegramRichMessage {
                     content: TelegramRichContent::new(agent_name),
                     draft_id,
                     message_ids: Vec::new(),
+                    unconfirmed_part: None,
                     version: 0,
                     sent_version: 0,
                     last_update: None,
@@ -199,7 +202,9 @@ impl TelegramRichMessage {
                 true
             } else {
                 let flush_now = !matches!(event, RunEvent::Output(_));
-                state.content.apply(event);
+                if !state.content.apply(event) {
+                    return Ok(());
+                }
                 state.version = state.version.saturating_add(1);
                 if !flush_now && !state.flush_scheduled {
                     state.flush_scheduled = true;
@@ -333,7 +338,9 @@ impl TelegramRichMessage {
             let draft = matches!(action, TelegramFlushAction::Draft { .. });
             TelegramPendingFlush {
                 version: state.version,
-                messages: state.content.render_messages(draft),
+                messages: state
+                    .content
+                    .render_messages(draft, self.inner.target.mention.as_deref()),
                 action,
                 terminal,
                 callback_data,
@@ -352,12 +359,7 @@ impl TelegramRichMessage {
                     .await?;
             }
             TelegramFlushAction::Send => {
-                let message_id = self
-                    .inner
-                    .api
-                    .send_rich_message(&self.inner.target, primary, callback_data.as_deref())
-                    .await?;
-                self.remember_message_id(0, message_id).await;
+                self.send_part(0, primary, callback_data.as_deref()).await?;
             }
             TelegramFlushAction::Edit { message_id } => {
                 self.inner
@@ -383,12 +385,7 @@ impl TelegramRichMessage {
                     .edit_rich_message(self.inner.target.chat_id, message_id, markdown, None)
                     .await?;
             } else {
-                let message_id = self
-                    .inner
-                    .api
-                    .send_rich_message(&self.inner.target, markdown, None)
-                    .await?;
-                self.remember_message_id(index, message_id).await;
+                self.send_part(index, markdown, None).await?;
             }
         }
 
@@ -415,13 +412,37 @@ impl TelegramRichMessage {
         Ok(())
     }
 
-    async fn remember_message_id(&self, index: usize, message_id: i64) {
+    // The delivery lock serializes parts. Reserve this index before network I/O
+    // so cancellation or loss of a successful response cannot resend it.
+    async fn send_part(&self, index: usize, markdown: &str, callback: Option<&str>) -> Result<()> {
+        {
+            let mut state = self.inner.state.lock().await;
+            anyhow::ensure!(
+                state.unconfirmed_part.is_none(),
+                "telegram delivery of part {} is unconfirmed",
+                index + 1
+            );
+            state.unconfirmed_part = Some(index);
+        }
+        let result = self
+            .inner
+            .api
+            .send_rich_message(&self.inner.target, markdown, callback)
+            .await;
         let mut state = self.inner.state.lock().await;
-        if let Some(existing) = state.message_ids.get_mut(index) {
-            *existing = message_id;
-        } else {
-            debug_assert_eq!(state.message_ids.len(), index);
-            state.message_ids.push(message_id);
+        match result {
+            Ok(message_id) => {
+                debug_assert_eq!(state.message_ids.len(), index);
+                state.message_ids.push(message_id);
+                state.unconfirmed_part = None;
+                Ok(())
+            }
+            Err(error) => {
+                if TelegramApi::send_was_rejected(&error) {
+                    state.unconfirmed_part = None;
+                }
+                Err(error)
+            }
         }
     }
 
@@ -436,7 +457,7 @@ impl TelegramRichMessage {
             };
             let retryable = !state.message_ids.is_empty()
                 || (!terminal && self.inner.target.is_private && self.inner.interrupt.is_none());
-            if !pending || !retryable {
+            if !pending || !retryable || state.unconfirmed_part.is_some() {
                 None
             } else if !state.retry_scheduled {
                 state.delivery_failures = state.delivery_failures.saturating_add(1);
@@ -509,10 +530,9 @@ impl ChannelRun for TelegramRichMessage {
 
 pub(super) struct TelegramRichContent {
     agent_name: String,
-    process: VecDeque<TelegramProcessPhase>,
+    process: VecDeque<TelegramProgressEntry>,
     process_truncated: bool,
     answer: String,
-    usage: Option<TokenUsage>,
     state: TelegramRunState,
 }
 
@@ -531,50 +551,59 @@ struct TelegramProgressEntry {
     status: ProgressStatus,
     kind: TelegramProgressKind,
     exit_code: Option<i32>,
+    output: Option<(String, Option<u64>)>,
 }
 
-struct TelegramProcessPhase {
-    thinking: Option<String>,
-    progress: VecDeque<TelegramProgressEntry>,
+impl TelegramProgressEntry {
+    fn title(&self) -> String {
+        let title = if self.kind == TelegramProgressKind::Command {
+            action_title::shell_action_title(&self.text)
+        } else {
+            i18n::tool_title(&self.text)
+        };
+        TelegramRichContent::escape_structural_text(&title)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TelegramProgressKind {
-    Message,
+    Commentary,
+    Progress,
+    Tool,
     Command,
+}
+
+impl TelegramProgressKind {
+    fn is_tool(self) -> bool {
+        matches!(self, Self::Tool | Self::Command)
+    }
 }
 
 impl TelegramRichContent {
     pub(super) fn new(agent_name: String) -> Self {
         Self {
-            agent_name,
+            agent_name: bounded_tail(agent_name, 128, "…").0,
             process: VecDeque::new(),
             process_truncated: false,
             answer: String::new(),
-            usage: None,
             state: TelegramRunState::Running,
         }
     }
 
-    pub(super) fn apply(&mut self, event: RunEvent) {
+    pub(super) fn apply(&mut self, event: RunEvent) -> bool {
         if self.is_terminal() {
-            return;
+            return false;
         }
         match event {
             RunEvent::Queued { ahead } => self.state = TelegramRunState::Queued { ahead },
             RunEvent::Started { .. } => self.state = TelegramRunState::Running,
-            RunEvent::Output(output) => self.apply_output(output),
+            RunEvent::Output(output) => return self.apply_output(output),
             RunEvent::Completed { .. } => self.state = TelegramRunState::Completed,
             RunEvent::Failed { message } => self.state = TelegramRunState::Failed(message),
-            RunEvent::Stopped => {
-                self.stop_running_progress();
-                self.state = TelegramRunState::Stopped;
-            }
-            RunEvent::Interrupted => {
-                self.stop_running_progress();
-                self.state = TelegramRunState::Interrupted;
-            }
+            RunEvent::Stopped => self.state = TelegramRunState::Stopped,
+            RunEvent::Interrupted => self.state = TelegramRunState::Interrupted,
         }
+        true
     }
 
     #[cfg(test)]
@@ -587,8 +616,14 @@ impl TelegramRichContent {
         }
     }
 
-    pub(super) fn render_messages(&self, draft: bool) -> Vec<String> {
-        let sections = self.render_sections(draft);
+    pub(super) fn render_messages(&self, draft: bool, mention: Option<&str>) -> Vec<String> {
+        let mut sections = self.render_sections(draft);
+        if self.is_terminal()
+            && !matches!(self.state, TelegramRunState::Stopped)
+            && let Some(mention) = mention
+        {
+            sections.insert(0, mention.to_owned());
+        }
         let rendered = sections.join("\n\n");
         if Self::within_limits(&rendered) {
             vec![rendered]
@@ -605,94 +640,54 @@ impl TelegramRichContent {
     }
 
     fn render_sections(&self, draft: bool) -> Vec<String> {
-        let mut sections = Vec::new();
-        if !draft || self.is_terminal() {
-            sections.push(self.header_section());
+        if matches!(self.state, TelegramRunState::Stopped) {
+            return vec![i18n::run_status(RunStatus::Stopped).into()];
         }
-        if let Some(section) = self.terminal_state_section() {
-            sections.push(section);
+        let mut sections: Vec<_> = self.terminal_notice().into_iter().collect();
+        if !self.answer.is_empty() {
+            if sections.is_empty() {
+                sections.push(self.answer.clone());
+            } else {
+                sections.push(format!(
+                    "**{}**\n\n{}",
+                    i18n::PARTIAL_ANSWER_TITLE,
+                    self.answer
+                ));
+            }
         }
-        if let Some(section) = self.active_state_section(draft) {
-            sections.push(section);
-        }
-
-        if let Some(section) = self.answer_section() {
-            sections.push(section);
-        }
-        if (!draft || self.is_terminal())
-            && let Some(section) = self.process_section()
-        {
-            sections.push(section);
-        }
-        if self.is_terminal()
-            && let Some(usage) = self.usage
-        {
-            sections.push(Self::usage_section(usage));
-        }
+        sections.push(self.status_section(draft, &sections.join("\n\n")));
         sections
     }
 
-    fn header_section(&self) -> String {
-        let status = match self.state {
+    fn terminal_notice(&self) -> Option<String> {
+        match &self.state {
+            TelegramRunState::Failed(message) => Some(Self::failure_section(message)),
+            TelegramRunState::Interrupted => Some(format!(
+                "**{}**\n\n{}",
+                i18n::RUN_INTERRUPTED_TITLE,
+                i18n::RUN_INTERRUPTED_BODY
+            )),
+            _ => None,
+        }
+    }
+
+    fn status_section(&self, draft: bool, prefix: &str) -> String {
+        if draft && !self.is_terminal() {
+            format!("<tg-thinking>{}</tg-thinking>", self.draft_activity())
+        } else {
+            self.process_section(prefix)
+        }
+    }
+
+    fn status(&self) -> RunStatus {
+        match self.state {
             TelegramRunState::Queued { .. } => RunStatus::Queued,
             TelegramRunState::Running => RunStatus::Running,
             TelegramRunState::Completed => RunStatus::Completed,
             TelegramRunState::Failed(_) => RunStatus::Failed,
             TelegramRunState::Stopped => RunStatus::Stopped,
             TelegramRunState::Interrupted => RunStatus::Interrupted,
-        };
-        format!(
-            "**{}** · {} {}",
-            Self::escape_structural_text(&self.agent_name),
-            Self::run_status_marker(status),
-            i18n::run_status(status)
-        )
-    }
-
-    fn run_status_marker(status: RunStatus) -> &'static str {
-        match status {
-            RunStatus::Queued => "○",
-            RunStatus::Running => "●",
-            RunStatus::Completed => "✓",
-            RunStatus::Failed => "×",
-            RunStatus::Stopped => "■",
-            RunStatus::Interrupted => "!",
         }
-    }
-
-    fn answer_section(&self) -> Option<String> {
-        if self.answer.is_empty() {
-            return None;
-        }
-        let title = if self.has_partial_answer() {
-            Some(i18n::PARTIAL_ANSWER_TITLE)
-        } else if matches!(self.state, TelegramRunState::Completed) {
-            Some(i18n::FINAL_ANSWER_TITLE)
-        } else {
-            None
-        };
-        let Some(title) = title else {
-            return Some(self.answer.clone());
-        };
-        let details = format!(
-            "<details open><summary>{title}</summary>\n\n{}\n\n</details>",
-            self.answer
-        );
-        if !Self::contains_details_markup(&self.answer) && Self::within_limits(&details) {
-            Some(details)
-        } else {
-            Some(format!("### {title}\n\n{}", self.answer))
-        }
-    }
-
-    fn contains_details_markup(text: &str) -> bool {
-        const MARKERS: [&str; 4] = ["<details", "</details", "<summary", "</summary"];
-        let bytes = text.as_bytes();
-        MARKERS.iter().any(|marker| {
-            bytes
-                .windows(marker.len())
-                .any(|window| window.eq_ignore_ascii_case(marker.as_bytes()))
-        })
     }
 
     fn split_sections(sections: Vec<String>) -> Vec<String> {
@@ -701,7 +696,9 @@ impl TelegramRichContent {
         for section in sections {
             if !Self::within_limits(&section) {
                 let prefix = (!current.is_empty()).then(|| std::mem::take(&mut current));
-                messages.extend(Self::safe_section_chunks(&section, prefix));
+                let mut chunks = Self::safe_section_chunks(&section, prefix);
+                current = chunks.pop().unwrap_or_default();
+                messages.extend(chunks);
                 continue;
             }
 
@@ -799,114 +796,26 @@ impl TelegramRichContent {
         // Each Markdown line or HTML tag can introduce a rich block. Staying below
         // this conservative combined budget leaves room under Telegram's block cap.
         rendered.chars().count() <= TELEGRAM_RICH_MESSAGE_MAX_CHARS
-            && rendered
-                .lines()
-                .count()
-                .saturating_add(rendered.matches('<').count())
-                <= TELEGRAM_RICH_MESSAGE_MAX_STRUCTURE_POINTS
+            && Self::structure_points(rendered) <= TELEGRAM_RICH_MESSAGE_MAX_STRUCTURE_POINTS
     }
 
     fn render_truncated(&self, draft: bool) -> String {
-        let mut sections = Vec::new();
-        if !draft || self.is_terminal() {
-            sections.push(self.header_section());
+        if matches!(self.state, TelegramRunState::Stopped) {
+            return i18n::TOOL_STOPPED.into();
         }
-        if let Some(section) = self.active_state_section(draft) {
-            sections.push(section);
-        }
-        if let Some(section) = self.terminal_state_section() {
-            sections.push(section);
-        }
-        sections.push(format!("> {}", i18n::OUTPUT_TRUNCATED.trim()));
-        let usage = if self.is_terminal() {
-            self.usage.map(Self::usage_section)
-        } else {
-            None
-        };
-
-        if self.answer.is_empty() {
-            if let Some(usage) = usage {
-                sections.push(usage);
-            }
-            return sections.join("\n\n");
-        }
-
-        let answer_title = if self.has_partial_answer() {
-            Some(i18n::PARTIAL_ANSWER_TITLE)
-        } else if matches!(self.state, TelegramRunState::Completed) {
-            Some(i18n::FINAL_ANSWER_TITLE)
-        } else {
-            None
-        };
-        let answer_opening = answer_title.map_or_else(
-            || "<pre>".to_string(),
-            |title| format!("<details open><summary>{title}</summary>\n\n<pre>"),
-        );
-        let answer_closing = if answer_title.is_some() {
-            "</pre>\n\n</details>"
-        } else {
-            "</pre>"
-        };
-        let prefix = format!("{}\n\n{answer_opening}", sections.join("\n\n"));
-        let closing = usage
-            .map(|usage| format!("{answer_closing}\n\n{usage}"))
-            .unwrap_or_else(|| answer_closing.to_string());
-        let answer_budget = TELEGRAM_RICH_MESSAGE_MAX_CHARS
-            .saturating_sub(prefix.chars().count())
-            .saturating_sub(closing.chars().count());
-        let answer = Self::escape_tail(&self.answer, answer_budget);
-        format!("{prefix}{answer}{closing}")
-    }
-
-    fn active_state_section(&self, draft: bool) -> Option<String> {
-        match &self.state {
-            TelegramRunState::Queued { ahead } => {
-                Some(format!("> {}", i18n::queued_message(*ahead)))
-            }
-            TelegramRunState::Running => {
-                if draft {
-                    let activity = self.draft_activity();
-                    Some(format!("<tg-thinking>{activity}</tg-thinking>"))
-                } else if !self.process.is_empty() {
-                    None
-                } else {
-                    Some(format!(
-                        "> {}",
-                        Self::escape_structural_text(i18n::WAITING_FOR_AGENT)
-                    ))
-                }
-            }
-            TelegramRunState::Completed
-            | TelegramRunState::Failed(_)
-            | TelegramRunState::Stopped
-            | TelegramRunState::Interrupted => None,
-        }
-    }
-
-    fn terminal_state_section(&self) -> Option<String> {
-        match &self.state {
-            TelegramRunState::Failed(message) => Some(Self::failure_section(message)),
-            TelegramRunState::Stopped => Some(format!(
-                "**{}**\n\n{}",
-                i18n::RUN_STOPPED_TITLE,
-                i18n::RUN_STOPPED_BODY
-            )),
-            TelegramRunState::Interrupted => Some(format!(
-                "**{}**\n\n{}",
-                i18n::RUN_INTERRUPTED_TITLE,
-                i18n::RUN_INTERRUPTED_BODY
-            )),
-            TelegramRunState::Queued { .. }
-            | TelegramRunState::Running
-            | TelegramRunState::Completed => None,
-        }
-    }
-
-    fn has_partial_answer(&self) -> bool {
-        matches!(
-            self.state,
-            TelegramRunState::Failed(_) | TelegramRunState::Stopped | TelegramRunState::Interrupted
-        )
+        let mut prefix = self.terminal_notice().map_or_else(String::new, |notice| {
+            format!("{notice}\n\n**{}**\n\n", i18n::PARTIAL_ANSWER_TITLE)
+        });
+        prefix.push_str(i18n::OUTPUT_TRUNCATED);
+        let status = self.status_section(draft, "");
+        // An active update has a single provider message. Keep complete tags
+        // and the newest answer text within both Telegram size budgets.
+        let wrapper = format!("{prefix}<pre></pre>\n\n{status}");
+        let char_budget = TELEGRAM_RICH_MESSAGE_MAX_CHARS.saturating_sub(wrapper.chars().count());
+        let line_budget = TELEGRAM_RICH_MESSAGE_MAX_STRUCTURE_POINTS
+            .saturating_sub(Self::structure_points(&wrapper) + 1);
+        let tail = Self::escape_tail(&self.answer, char_budget, line_budget);
+        format!("{prefix}<pre>{tail}</pre>\n\n{status}")
     }
 
     pub(super) fn is_terminal(&self) -> bool {
@@ -919,42 +828,72 @@ impl TelegramRichContent {
         )
     }
 
-    fn apply_output(&mut self, output: OutputEvent) {
+    fn apply_output(&mut self, output: OutputEvent) -> bool {
         match output {
-            OutputEvent::Thinking { text } => {
-                if !text.trim().is_empty() {
-                    let (text, truncated) = bounded_tail(
-                        text,
-                        TELEGRAM_RETAINED_PROCESS_TEXT_MAX_BYTES,
-                        i18n::OUTPUT_TRUNCATED,
-                    );
-                    self.process_truncated |= truncated;
-                    if self.process.len() >= TELEGRAM_RETAINED_PROCESS_PHASES {
-                        self.process.pop_back();
-                        self.process_truncated = true;
-                    }
-                    self.process.push_front(TelegramProcessPhase {
-                        thinking: Some(text),
-                        progress: VecDeque::new(),
-                    });
-                }
-            }
+            OutputEvent::Thinking { .. }
+            | OutputEvent::Diagnostic { .. }
+            | OutputEvent::Usage(_) => false,
+            OutputEvent::Commentary { id, text } => self.apply_progress(
+                id,
+                text,
+                ProgressStatus::Completed,
+                TelegramProgressKind::Commentary,
+                None,
+            ),
             OutputEvent::Progress { id, text, status } => {
-                self.apply_progress(id, text, status, TelegramProgressKind::Message, None);
+                self.apply_progress(id, text, status, TelegramProgressKind::Progress, None)
+            }
+            OutputEvent::ToolCall {
+                id,
+                text,
+                status,
+                web_action,
+            } => {
+                let title = web_action
+                    .as_ref()
+                    .map(i18n::web_tool_title)
+                    .unwrap_or(text);
+                self.apply_progress(id, title, status, TelegramProgressKind::Tool, None)
             }
             OutputEvent::CommandExecution {
                 id,
                 command,
                 status,
                 exit_code,
+            } => self.apply_progress(
+                id,
+                command,
+                status,
+                TelegramProgressKind::Command,
+                exit_code,
+            ),
+            OutputEvent::ToolOutput {
+                id,
+                text,
+                elapsed_ms,
             } => {
-                self.apply_progress(
-                    id,
-                    command,
-                    status,
-                    TelegramProgressKind::Command,
-                    exit_code,
-                );
+                let Some(entry) = self
+                    .process
+                    .iter_mut()
+                    .find(|e| e.id == id && e.kind.is_tool())
+                else {
+                    return false;
+                };
+                let text = if entry.kind == TelegramProgressKind::Command {
+                    command_output_preview(text)
+                } else {
+                    text
+                };
+                let (text, clipped) = Self::retain_process_text(text);
+                self.process_truncated |= clipped;
+                let elapsed_ms =
+                    elapsed_ms.or_else(|| entry.output.as_ref().and_then(|(_, ms)| *ms));
+                let result = (text, elapsed_ms);
+                if entry.output.as_ref() == Some(&result) {
+                    return false;
+                }
+                entry.output = Some(result);
+                true
             }
             OutputEvent::Answer { text } => {
                 append_bounded_tail(
@@ -963,13 +902,13 @@ impl TelegramRichContent {
                     TELEGRAM_RETAINED_ANSWER_MAX_BYTES,
                     i18n::OUTPUT_TRUNCATED,
                 );
+                !text.is_empty()
             }
-            OutputEvent::Usage(usage) => self.usage = Some(usage),
             OutputEvent::Image { id, .. } => self.apply_progress(
                 id,
-                i18n::IMAGE_SENDING.to_string(),
+                i18n::IMAGE_SENDING.into(),
                 ProgressStatus::Running,
-                TelegramProgressKind::Message,
+                TelegramProgressKind::Progress,
                 None,
             ),
         }
@@ -982,266 +921,293 @@ impl TelegramRichContent {
         status: ProgressStatus,
         kind: TelegramProgressKind,
         exit_code: Option<i32>,
-    ) {
-        let (text, truncated) = bounded_tail(
-            text,
-            TELEGRAM_RETAINED_PROCESS_TEXT_MAX_BYTES,
-            i18n::OUTPUT_TRUNCATED,
-        );
-        self.process_truncated |= truncated;
-        for phase in &mut self.process {
-            if let Some(entry) = phase.progress.iter_mut().find(|entry| entry.id == id) {
-                entry.text = text;
-                entry.status = status;
-                entry.kind = kind;
-                entry.exit_code = exit_code;
-                return;
+    ) -> bool {
+        if id.len() > 512 {
+            self.process_truncated = true;
+            return true;
+        }
+        if text.trim().is_empty() && !kind.is_tool() {
+            return false;
+        }
+        let (text, clipped) = if kind == TelegramProgressKind::Command {
+            Self::retain_command(text)
+        } else {
+            Self::retain_process_text(text)
+        };
+        self.process_truncated |= clipped;
+        if let Some(entry) = self.process.iter_mut().find(|entry| {
+            entry.id == id
+                && entry.kind == kind
+                && (kind != TelegramProgressKind::Commentary || entry.text == text)
+        }) {
+            // A replayed start may arrive after the final status for this tool ID.
+            if kind.is_tool()
+                && status == ProgressStatus::Running
+                && entry.status != ProgressStatus::Running
+            {
+                return false;
             }
+            let exit_code = exit_code.or(entry.exit_code);
+            if entry.text == text && entry.status == status && entry.exit_code == exit_code {
+                return false;
+            }
+            entry.text = text;
+            entry.status = status;
+            entry.exit_code = exit_code;
+            return true;
         }
-        if self.process.is_empty() {
-            self.process.push_front(TelegramProcessPhase {
-                thinking: None,
-                progress: VecDeque::new(),
-            });
-        }
-        let phase = self.process.front_mut().expect("process phase must exist");
-        if phase.progress.len() >= TELEGRAM_RETAINED_PROGRESS_PER_PHASE {
-            phase.progress.pop_front();
+        if self.process.len() == TELEGRAM_RETAINED_PROCESS_ENTRIES {
+            self.process.pop_front();
             self.process_truncated = true;
         }
-        phase.progress.push_back(TelegramProgressEntry {
+        self.process.push_back(TelegramProgressEntry {
             id,
             text,
             status,
             kind,
             exit_code,
+            output: None,
         });
+        true
     }
 
-    fn stop_running_progress(&mut self) {
-        for entry in self
-            .process
-            .iter_mut()
-            .flat_map(|phase| phase.progress.iter_mut())
-        {
-            if entry.status == ProgressStatus::Running {
-                entry.status = ProgressStatus::Stopped;
+    fn retain_command(command: String) -> (String, bool) {
+        // Leave room in one process block for the escaped output, title and footer.
+        const MAX_ESCAPED_CHARS: usize = 16 * 1024;
+        const MAX_NEWLINES: usize = 128;
+        let mut chars = 0;
+        let mut newlines = 0;
+        for (index, ch) in command.char_indices() {
+            chars += Self::escaped_width(ch);
+            newlines += usize::from(ch == '\n');
+            if chars > MAX_ESCAPED_CHARS || newlines > MAX_NEWLINES {
+                return (
+                    format!("{}{}", &command[..index], i18n::COMMAND_TRUNCATED),
+                    true,
+                );
             }
         }
+        (command, false)
     }
 
-    fn progress_marker(status: ProgressStatus) -> &'static str {
-        match status {
-            ProgressStatus::Running => "●",
-            ProgressStatus::Completed => "✓",
-            ProgressStatus::Failed => "×",
-            ProgressStatus::Stopped => "■",
+    fn retain_process_text(text: String) -> (String, bool) {
+        const MAX_NEWLINES: usize = 64;
+        let limit = TELEGRAM_RETAINED_PROCESS_TEXT_MAX_BYTES;
+        if text.len() <= limit && Self::tail_start(&text, limit, MAX_NEWLINES) == 0 {
+            return (text, false);
         }
+
+        let marker = i18n::OUTPUT_TRUNCATED;
+        let text = text.strip_prefix(marker).unwrap_or(&text);
+        let byte_start = text.ceil_char_boundary(text.len().saturating_sub(limit - marker.len()));
+        let tail = &text[byte_start..];
+        let start = Self::tail_start(
+            tail,
+            limit - marker.chars().count(),
+            MAX_NEWLINES - marker.matches('\n').count(),
+        );
+        (format!("{marker}{}", &tail[start..]), true)
     }
 
     fn draft_activity(&self) -> String {
-        let Some(phase) = self.process.front() else {
-            return Self::escape_structural_text(i18n::WAITING_FOR_AGENT);
-        };
-        let mut activity = phase
-            .thinking
-            .as_deref()
-            .map(Self::escape_structural_text)
-            .into_iter()
-            .collect::<Vec<_>>();
-        if let Some(progress) = phase.progress.back() {
-            let prefix = if progress.kind == TelegramProgressKind::Command {
-                "$ "
-            } else {
-                ""
-            };
-            activity.push(format!(
-                "{} {prefix}{}",
-                Self::progress_marker(progress.status),
-                Self::escape_structural_text(&progress.text)
-            ));
+        if let TelegramRunState::Queued { ahead } = self.state {
+            return i18n::queued_message(ahead);
         }
-        if activity.is_empty() {
-            Self::escape_structural_text(i18n::WAITING_FOR_AGENT)
-        } else {
-            activity.join("\n\n")
-        }
-    }
-
-    fn process_section(&self) -> Option<String> {
-        if self.process.is_empty() {
-            return None;
-        }
-        let mut phases = self
-            .process
-            .iter()
-            .rev()
-            .enumerate()
-            .map(|(index, phase)| Self::phase_section(phase, index + 1))
-            .collect::<VecDeque<_>>();
-        let mut omitted = 0;
-        loop {
-            let section = self.render_process_section(&phases, omitted);
-            if Self::within_process_limits(&section) || phases.len() <= 1 {
-                return Some(section);
+        match self.process.back() {
+            Some(entry) if entry.kind.is_tool() && entry.status != ProgressStatus::Running => {
+                i18n::run_status(self.status()).into()
             }
-            phases.pop_front();
-            omitted += 1;
+            Some(entry) => entry.title(),
+            None => i18n::WAITING_FOR_AGENT.into(),
         }
     }
 
-    fn render_process_section(&self, phases: &VecDeque<String>, omitted: usize) -> String {
-        let opening = if self.is_terminal() || !self.answer.is_empty() {
-            "<details>"
-        } else {
-            "<details open>"
+    fn process_section(&self, prefix: &str) -> String {
+        let open = !self.is_terminal() && self.answer.is_empty();
+        let opening = if open { "<details open>" } else { "<details>" };
+        let label = match self.process.back() {
+            Some(entry)
+                if open
+                    && matches!(self.state, TelegramRunState::Running)
+                    && entry.kind.is_tool()
+                    && entry.status == ProgressStatus::Running =>
+            {
+                entry.title()
+            }
+            _ => i18n::run_status(self.status()).into(),
         };
-        let mut summary = format!(
-            "{} · {}",
-            i18n::PROCESS_TITLE,
-            i18n::phase_count(self.process.len())
+        let mut header = format!("{opening}<summary>{label}</summary>");
+        let name = self.agent_name.trim();
+        let agent = (!name.is_empty() && !name.eq_ignore_ascii_case("agent"))
+            .then(|| Self::escape_structural_text(name));
+        let mut closing = "</details>".to_owned();
+        if self.process.is_empty() {
+            let note = match self.state {
+                TelegramRunState::Queued { ahead } => Some(i18n::queued_message(ahead)),
+                TelegramRunState::Running => Some(i18n::WAITING_FOR_AGENT.into()),
+                _ => None,
+            };
+            let text = match (agent, note) {
+                (Some(agent), Some(note)) => format!("{agent}：{note}"),
+                (Some(text), None) | (None, Some(text)) => text,
+                (None, None) => i18n::NO_PUBLIC_STEPS.into(),
+            };
+            header.push_str("\n\n");
+            header.push_str(&text);
+        } else if let Some(agent) = agent {
+            closing = format!("<footer>{agent}</footer>\n\n</details>");
+        }
+        // Give the answer priority. When even the process header cannot fit
+        // beside it, the existing multipart sender will carry the remainder.
+        let mut rows = VecDeque::new();
+        let min = Self::render_process_rows(
+            &header,
+            &rows,
+            self.process_truncated || !self.process.is_empty(),
+            opening,
+            &closing,
         );
-        let progress = self.progress_summary();
-        if !progress.is_empty() {
-            summary.push_str(" · ");
-            summary.push_str(&progress);
+        let available_chars =
+            TELEGRAM_RICH_MESSAGE_MAX_CHARS.saturating_sub(prefix.chars().count() + 2);
+        let available_points = TELEGRAM_RICH_MESSAGE_MAX_STRUCTURE_POINTS
+            .saturating_sub(Self::structure_points(prefix) + 2);
+        let (chars, points) = if min.chars().count() <= available_chars
+            && Self::structure_points(&min) <= available_points
+        {
+            (
+                available_chars.min(TELEGRAM_PROCESS_MAX_CHARS),
+                available_points.min(TELEGRAM_PROCESS_MAX_STRUCTURE_POINTS),
+            )
+        } else {
+            (
+                TELEGRAM_PROCESS_MAX_CHARS,
+                TELEGRAM_PROCESS_MAX_STRUCTURE_POINTS,
+            )
+        };
+        let mut used_chars = header.chars().count();
+        let mut used_points = Self::structure_points(&header);
+        let mut omitted = self.process_truncated;
+        for entry in self.process.iter().rev() {
+            let row = self.render_entry(entry);
+            used_chars += row.chars().count();
+            used_points += Self::structure_points(&row);
+            if used_chars > chars || used_points > points {
+                omitted = true;
+                break;
+            }
+            rows.push_front((entry.kind.is_tool(), row));
         }
-
-        let mut body = Vec::new();
-        if self.process_truncated {
-            body.push(format!("> {}", i18n::OUTPUT_TRUNCATED.trim()));
+        loop {
+            let section = Self::render_process_rows(&header, &rows, omitted, opening, &closing);
+            if rows.is_empty()
+                || (section.chars().count() <= chars && Self::structure_points(&section) <= points)
+            {
+                return section;
+            }
+            rows.pop_front();
+            omitted = true;
         }
-        if omitted > 0 {
-            body.push(format!("> {}", i18n::truncated_phase_count(omitted)));
-        }
-        body.extend(phases.iter().cloned());
-        format!(
-            "{opening}<summary>{summary}</summary>\n\n{}\n\n</details>",
-            body.join("\n\n---\n\n")
-        )
     }
 
-    fn within_process_limits(rendered: &str) -> bool {
-        rendered.chars().count() <= TELEGRAM_PROCESS_MAX_CHARS
-            && rendered
-                .lines()
-                .count()
-                .saturating_add(rendered.matches('<').count())
-                <= TELEGRAM_PROCESS_MAX_STRUCTURE_POINTS
-    }
-
-    fn phase_section(phase: &TelegramProcessPhase, phase_number: usize) -> String {
-        let mut sections = Vec::new();
-        if let Some(thinking) = phase.thinking.as_deref() {
-            let thinking = Self::escape_structural_text(thinking)
-                .lines()
-                .enumerate()
-                .map(|(index, line)| {
-                    if index == 0 {
-                        format!("> ✦ {line}")
-                    } else {
-                        format!("> {line}")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            sections.push(format!(
-                "**{phase_number:02} · {}**\n\n{thinking}",
-                i18n::THINKING_TITLE
+    fn render_process_rows(
+        header: &str,
+        rows: &VecDeque<(bool, String)>,
+        omitted: bool,
+        opening: &str,
+        closing: &str,
+    ) -> String {
+        let mut body = vec![header.to_owned()];
+        if omitted {
+            body.push(i18n::PROCESS_TRUNCATED.into());
+        }
+        let mut rows = rows.iter().peekable();
+        while let Some((is_tool, row)) = rows.next() {
+            if !is_tool || !rows.peek().is_some_and(|(next_tool, _)| *next_tool) {
+                body.push(row.clone());
+                continue;
+            }
+            let mut tools = vec![row.as_str()];
+            while let Some((_, row)) = rows.next_if(|(tool, _)| *tool) {
+                tools.push(row);
+            }
+            body.push(format!(
+                "{opening}<summary>{}</summary>\n\n{}\n\n</details>",
+                i18n::tool_call_count(tools.len()),
+                tools.join("\n\n")
             ));
         }
+        body.push(closing.into());
+        body.join("\n\n")
+    }
 
-        sections.extend(
-            phase
-                .progress
-                .iter()
-                .filter(|entry| entry.kind == TelegramProgressKind::Command)
-                .map(Self::terminal_section),
-        );
-
-        let progress = phase
-            .progress
-            .iter()
-            .filter(|entry| entry.kind == TelegramProgressKind::Message)
-            .map(|entry| {
-                format!(
-                    "- {} {}",
-                    Self::progress_marker(entry.status),
-                    Self::escape_structural_text(&entry.text)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !progress.is_empty() {
-            sections.push(progress);
+    fn render_entry(&self, entry: &TelegramProgressEntry) -> String {
+        let text = &entry.text;
+        match entry.kind {
+            TelegramProgressKind::Commentary => return Self::escape_structural_text(text),
+            TelegramProgressKind::Progress => {
+                let marker = match entry.status {
+                    ProgressStatus::Running
+                        if matches!(self.state, TelegramRunState::Interrupted) =>
+                    {
+                        "■"
+                    }
+                    ProgressStatus::Running => "●",
+                    ProgressStatus::Completed => "✓",
+                    ProgressStatus::Failed => "×",
+                    ProgressStatus::Stopped => "■",
+                };
+                return format!("{marker} {}", Self::escape_structural_text(text));
+            }
+            _ => {}
         }
-        sections.join("\n\n")
-    }
-
-    fn terminal_section(entry: &TelegramProgressEntry) -> String {
-        let status = entry.exit_code.map_or_else(
-            || Self::progress_status_label(entry.status).to_string(),
-            |exit_code| format!("exit {exit_code}"),
-        );
-        format!(
-            "<pre><code class=\"language-bash\"># {} · {} {status}\n$ {}</code></pre>",
-            i18n::SHELL_TITLE,
-            Self::progress_marker(entry.status),
-            Self::escape_structural_text(&entry.text)
-        )
-    }
-
-    fn progress_status_label(status: ProgressStatus) -> &'static str {
-        match status {
-            ProgressStatus::Running => i18n::SHELL_RUNNING,
-            ProgressStatus::Completed => i18n::SHELL_COMPLETED,
-            ProgressStatus::Failed => i18n::SHELL_FAILED,
-            ProgressStatus::Stopped => i18n::SHELL_STOPPED,
-        }
-    }
-
-    fn progress_summary(&self) -> String {
-        let mut counts = [0_usize; 4];
-        for entry in self.progress_entries() {
-            let index = match entry.status {
-                ProgressStatus::Running => 0,
-                ProgressStatus::Completed => 1,
-                ProgressStatus::Failed => 2,
-                ProgressStatus::Stopped => 3,
+        let pending = entry.status == ProgressStatus::Running && self.is_terminal();
+        let status = if pending {
+            if matches!(self.state, TelegramRunState::Interrupted) {
+                i18n::TOOL_STOPPED
+            } else {
+                i18n::TOOL_UNCONFIRMED
+            }
+        } else {
+            match entry.status {
+                ProgressStatus::Running => i18n::run_status(RunStatus::Running),
+                ProgressStatus::Completed => i18n::TOOL_COMPLETED,
+                ProgressStatus::Failed => i18n::TOOL_FAILED,
+                ProgressStatus::Stopped => i18n::TOOL_STOPPED,
+            }
+        };
+        let elapsed = entry.output.as_ref().and_then(|(_, ms)| *ms);
+        let output = entry.output.as_ref().map_or("", |(text, _)| {
+            if text.is_empty() {
+                i18n::TOOL_NO_OUTPUT
+            } else {
+                text
+            }
+        });
+        let detail = if entry.kind == TelegramProgressKind::Command {
+            let status = if pending {
+                status.to_string()
+            } else {
+                i18n::shell_status(entry.status, entry.exit_code)
             };
-            counts[index] += 1;
-        }
-        [
-            (ProgressStatus::Completed, "✓", counts[1]),
-            (ProgressStatus::Running, "●", counts[0]),
-            (ProgressStatus::Failed, "×", counts[2]),
-            (ProgressStatus::Stopped, "■", counts[3]),
-        ]
-        .into_iter()
-        .filter(|(_, _, count)| *count > 0)
-        .map(|(status, marker, count)| format!("{marker} {}", i18n::progress_count(status, count)))
-        .collect::<Vec<_>>()
-        .join(" · ")
-    }
-
-    fn progress_entries(&self) -> impl Iterator<Item = &TelegramProgressEntry> {
-        self.process.iter().flat_map(|phase| phase.progress.iter())
-    }
-
-    fn usage_section(usage: TokenUsage) -> String {
-        let total = usage.input_tokens.saturating_add(usage.output_tokens);
+            let shell = i18n::shell_output(text, output, &status, elapsed);
+            format!(
+                "<pre><code class=\"language-bash\">{}</code></pre>",
+                Self::escape_structural_text(&shell)
+            )
+        } else if entry.output.is_some() {
+            let result = format!("{}{output}", i18n::tool_output_header(status, elapsed));
+            format!("<pre>{}</pre>", Self::escape_structural_text(&result))
+        } else {
+            status.into()
+        };
         format!(
-            "<footer>{} {} · {} {} · {}\n{} {} · {} {}</footer>",
-            i18n::format_tokens(total),
-            i18n::TOKENS,
-            i18n::INPUT,
-            i18n::format_tokens(usage.input_tokens),
-            i18n::cached_tokens(i18n::format_tokens(usage.cached_input_tokens)),
-            i18n::OUTPUT,
-            i18n::format_tokens(usage.output_tokens),
-            i18n::REASONING,
-            i18n::format_tokens(usage.reasoning_output_tokens)
+            "<details><summary>{}</summary>\n\n{detail}\n\n</details>",
+            entry.title()
         )
+    }
+
+    fn structure_points(text: &str) -> usize {
+        text.lines().count() + text.matches('<').count()
     }
 
     fn failure_section(message: &str) -> String {
@@ -1250,7 +1216,7 @@ impl TelegramRichContent {
             "**{}**\n\n{}\n\n{}",
             i18n::RUN_FAILED_TITLE,
             copy.summary,
-            i18n::RETRY_ADVICE
+            i18n::NATIVE_RETRY_ADVICE
         )
     }
 
@@ -1260,23 +1226,30 @@ impl TelegramRichContent {
             .replace('>', "&gt;")
     }
 
-    fn escape_tail(text: &str, budget: usize) -> String {
+    fn escape_tail(text: &str, chars: usize, newlines: usize) -> String {
+        Self::escape_structural_text(&text[Self::tail_start(text, chars, newlines)..])
+    }
+
+    fn escaped_width(ch: char) -> usize {
+        match ch {
+            '&' => 5,
+            '<' | '>' => 4,
+            _ => 1,
+        }
+    }
+
+    fn tail_start(text: &str, mut chars: usize, mut newlines: usize) -> usize {
         let mut start = text.len();
-        let mut escaped_chars = 0_usize;
         for (index, character) in text.char_indices().rev() {
-            let width = match character {
-                '&' => "&amp;".chars().count(),
-                '<' => "&lt;".chars().count(),
-                '>' => "&gt;".chars().count(),
-                _ => 1,
-            };
-            if escaped_chars.saturating_add(width) > budget {
+            let width = Self::escaped_width(character);
+            if width > chars || (character == '\n' && newlines == 0) {
                 break;
             }
-            escaped_chars += width;
+            chars -= width;
+            newlines -= usize::from(character == '\n');
             start = index;
         }
-        Self::escape_structural_text(&text[start..])
+        start
     }
 }
 

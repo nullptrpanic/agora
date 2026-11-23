@@ -118,3 +118,50 @@ fn configured_channels_reject_unimplemented_types_and_keep_configured_names() {
     .unwrap();
     assert_eq!(telegram.name(), "telegram");
 }
+
+#[test]
+fn truncated_output_keeps_only_a_bounded_allocation_and_utf8_tail() {
+    let input = "界".repeat(700_000);
+    let (mut tail, truncated) = bounded_tail(input, 8192, "…");
+    assert!(truncated);
+    assert!(tail.len() <= 8192 && tail.capacity() <= 8192);
+    assert!(tail.starts_with('…') && tail.ends_with('界'));
+    assert!(append_bounded_tail(&mut tail, "后缀", 8192, "…"));
+    assert!(tail.ends_with("界后缀"));
+}
+
+#[test]
+fn interrupt_callbacks_are_one_shot_and_removed_with_their_registration() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let callbacks = InterruptCallbacks::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls = Arc::clone(&calls);
+    let registration = callbacks.register(InterruptCallback::new(move || {
+        callback_calls.fetch_add(1, Ordering::Relaxed);
+        true
+    }));
+    let callback_id = registration.id().to_string();
+
+    assert!(callbacks.trigger(&callback_id));
+    assert!(!callbacks.trigger(&callback_id));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    let registration = callbacks.register(InterruptCallback::new(|| true));
+    let callback_id = registration.id().to_string();
+    drop(registration);
+    assert!(!callbacks.trigger(&callback_id));
+}
+
+#[test]
+fn interrupt_callback_ids_do_not_repeat_after_restart() {
+    let first = InterruptCallbacks::default()
+        .register(InterruptCallback::new(|| true))
+        .id()
+        .to_string();
+    let second = InterruptCallbacks::default()
+        .register(InterruptCallback::new(|| true))
+        .id()
+        .to_string();
+
+    assert_ne!(first, second);
+}

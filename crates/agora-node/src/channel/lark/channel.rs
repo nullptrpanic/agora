@@ -1,16 +1,20 @@
 use super::LarkReplyTarget;
-use super::card::{LarkAgentCard, LarkReplyCard};
+use super::card::LarkReplyCard;
+use super::context::MessageReferences;
 use super::lark_api::{LarkApi, LarkImageDownloadError};
+use super::reply::LarkAgentReply;
 use crate::channel::permission::{AccessContext, PermissionGate};
 use crate::channel::{
     Channel, ChannelDelivery, ChannelReply, ChannelRun, ChannelRunContext, ChannelSender,
-    ChannelTask, DeliveryDisposition, InterruptCallbacks, RunEvent,
+    ChannelTask, DeliveryDisposition, RunEvent,
 };
 #[cfg(test)]
 use crate::config::ChannelPermissionConfig;
 use crate::config::LarkChannelConfig;
 use crate::store::ChannelIdentity;
-use crate::task::{ChannelTaskInput, CommandRequest, TaskAttachment, TaskContent};
+use crate::task::{
+    ChannelTaskInput, CommandRequest, ConversationContext, TaskAttachment, TaskContent,
+};
 use agora_core::logger;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -18,8 +22,8 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::sync::{OnceCell, mpsc, oneshot};
+use tokio::task::{JoinHandle, JoinSet};
 
 const GROUP_SESSION_CAPACITY: usize = 4096;
 const LARK_MAX_IMAGES_PER_MESSAGE: usize = 16;
@@ -69,6 +73,8 @@ pub(super) struct LarkMessageEvent {
     pub(super) mention_ids: Vec<String>,
     #[serde(default)]
     pub(super) mention_keys: HashMap<String, String>,
+    #[serde(skip)]
+    pub(super) references: Box<MessageReferences>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,7 +141,7 @@ pub(super) enum LarkConversation {
 }
 
 impl LarkConversation {
-    fn from_chat_type(chat_type: &str) -> Self {
+    pub(super) fn from_chat_type(chat_type: &str) -> Self {
         if chat_type == "p2p" {
             Self::Private
         } else {
@@ -163,6 +169,20 @@ impl LarkConversation {
 }
 
 impl LarkEvent {
+    pub(super) fn uses_control_slot(&self) -> bool {
+        match self {
+            Self::Interrupt(_) => true,
+            Self::Message(event) if event.image_keys.is_empty() => {
+                event
+                    .content
+                    .split_whitespace()
+                    .find(|word| !event.mention_keys.contains_key(*word))
+                    == Some("/stop")
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn id(&self) -> Option<&str> {
         match self {
             Self::Message(event) => Some(&event.id),
@@ -303,16 +323,18 @@ impl LarkMessageEvent {
                 ))
             })
             .collect();
+        let chat_type = Self::required_str(message, "chat_type")?;
         Ok(Self {
             id,
             message_id: Self::required_str(message, "message_id")?.to_string(),
             chat_id: Self::required_str(message, "chat_id")?.to_string(),
-            chat_type: Self::required_str(message, "chat_type")?.to_string(),
+            chat_type: chat_type.to_string(),
             sender_id,
             content,
             image_keys,
             mention_ids,
             mention_keys,
+            references: Box::new(MessageReferences::from_message(message)),
             message_type,
         })
     }
@@ -366,6 +388,7 @@ impl LarkMessageEvent {
     pub(super) fn reply_target(&self) -> LarkReplyTarget {
         LarkReplyTarget {
             message_id: self.message_id.clone(),
+            mention_user_id: (self.chat_type != "p2p").then(|| self.sender_id.clone()),
         }
     }
 
@@ -415,7 +438,7 @@ impl LarkMessageEvent {
         }
     }
 
-    fn flatten_post_content(value: &Value) -> (String, Vec<String>) {
+    pub(super) fn flatten_post_content(value: &Value) -> (String, Vec<String>) {
         let lines = value
             .get("content")
             .and_then(Value::as_array)
@@ -510,45 +533,65 @@ impl ChannelTask for LarkTask {
 
 #[derive(Clone)]
 pub struct LarkRun {
-    card: LarkAgentCard,
+    reply: LarkAgentReply,
 }
 
 impl ChannelRun for LarkRun {
+    async fn admission_deferred(&self) -> Result<()> {
+        // The provider may redeliver this message. Preserve its queued presentation.
+        Ok(())
+    }
+
     async fn publish(&self, event: RunEvent) -> Result<()> {
-        self.card.publish(event).await
+        self.reply.publish(event).await
     }
 }
 
+type PendingRuns =
+    Arc<StdMutex<HashMap<String, (tokio::time::Instant, HashMap<String, LarkAgentReply>)>>>;
+
 pub struct LarkChannel {
-    api: LarkApi,
+    ingress: Arc<LarkIngress>,
     identity: ChannelIdentity,
-    permission: PermissionGate,
-    bot_open_id: Option<String>,
-    group_sessions: Arc<StdMutex<GroupSessions>>,
-    interrupts: InterruptCallbacks,
+    preparing: JoinSet<(String, Result<Option<ChannelDelivery<LarkTask>>>)>,
+    waiting: HashMap<String, VecDeque<LarkDelivery>>,
     receiver: Option<LarkWebSocketReceiver>,
+    pending_runs: PendingRuns,
 }
 
 #[derive(Clone)]
 pub struct LarkSender {
+    pending_runs: PendingRuns,
     api: LarkApi,
     identity: ChannelIdentity,
-    interrupts: InterruptCallbacks,
 }
 
 impl LarkChannel {
     pub fn new(config: LarkChannelConfig) -> Result<Self> {
         let identity = ChannelIdentity::new(config.name.clone(), "lark", config.app_id.clone());
         let permission = PermissionGate::new(config.permission.clone());
-        Ok(Self {
-            api: LarkApi::new(config)?,
+        Ok(Self::from_parts(
+            LarkApi::new(config)?,
             identity,
             permission,
-            bot_open_id: None,
-            group_sessions: Default::default(),
-            interrupts: InterruptCallbacks::default(),
+        ))
+    }
+
+    fn from_parts(api: LarkApi, identity: ChannelIdentity, permission: PermissionGate) -> Self {
+        Self {
+            identity,
+            ingress: Arc::new(LarkIngress {
+                api,
+                permission,
+                bot_open_id: Default::default(),
+                image_download: Default::default(),
+                group_sessions: Default::default(),
+            }),
+            preparing: JoinSet::new(),
+            waiting: HashMap::new(),
             receiver: None,
-        })
+            pending_runs: Default::default(),
+        }
     }
 
     #[cfg(test)]
@@ -573,48 +616,36 @@ impl LarkChannel {
         permission: ChannelPermissionConfig,
     ) -> Self {
         let identity = ChannelIdentity::new(api.name(), "lark", "test");
-        Self {
-            api,
-            identity,
-            permission: PermissionGate::new(permission),
-            bot_open_id: None,
-            group_sessions: Default::default(),
-            interrupts: InterruptCallbacks::default(),
-            receiver: None,
-        }
+        Self::from_parts(api, identity, PermissionGate::new(permission))
     }
 
     fn receiver(&mut self) -> &mut LarkWebSocketReceiver {
         if self.receiver.is_none() {
-            self.receiver = Some(LarkWebSocketReceiver::spawn(self.action_handler()));
+            self.receiver = Some(LarkWebSocketReceiver::spawn(self.ingress.clone()));
         }
         self.receiver.as_mut().expect("receiver initialized above")
     }
 
-    fn action_handler(&self) -> LarkActionHandler {
-        LarkActionHandler {
-            api: self.api.clone(),
-            permission: self.permission.clone(),
-            group_sessions: self.group_sessions.clone(),
-            interrupts: self.interrupts.clone(),
-        }
+    fn prepare(&mut self, chat: String, delivery: LarkDelivery) {
+        let ingress = self.ingress.clone();
+        let pending = self.pending_runs.clone();
+        self.preparing.spawn(async move {
+            let result = ingress.prepare_delivery(delivery, pending).await;
+            (chat, result)
+        });
     }
+}
 
-    async fn message_mentions_bot(&mut self, event: &LarkMessageEvent) -> Result<bool> {
+impl LarkIngress {
+    async fn message_mentions_bot(&self, event: &LarkMessageEvent) -> Result<bool> {
         if event.chat_type == "p2p" || event.mention_ids().is_empty() {
             return Ok(false);
         }
-        let mentioned = {
-            let bot_open_id = match self.bot_open_id.as_deref() {
-                Some(open_id) => open_id,
-                None => {
-                    self.bot_open_id = Some(self.api.bot_open_id().await?);
-                    self.bot_open_id.as_deref().unwrap_or_default()
-                }
-            };
-            event.mention_ids().iter().any(|id| id == bot_open_id)
-        };
-        Ok(mentioned)
+        let bot = self
+            .bot_open_id
+            .get_or_try_init(|| self.api.bot_open_id())
+            .await?;
+        Ok(event.mention_ids().iter().any(|id| id == bot))
     }
 
     pub(super) async fn task_from_event(&self, event: LarkMessageEvent) -> Result<LarkTask> {
@@ -624,11 +655,18 @@ impl LarkChannel {
 
     async fn task_from_event_with_attachment_limit(
         &self,
-        event: LarkMessageEvent,
+        mut event: LarkMessageEvent,
         maximum_bytes: usize,
     ) -> Result<LarkTask> {
-        let mut content =
-            TaskContent::new(event.input_without_bot_prefix(self.bot_open_id.as_deref()));
+        let mut content = TaskContent::new(
+            event.input_without_bot_prefix(self.bot_open_id.get().map(String::as_str)),
+        );
+        if let Some(bot) = self.bot_open_id.get() {
+            event
+                .references
+                .mentions
+                .retain(|mention| &mention.id != bot);
+        }
         let mut remaining_bytes = maximum_bytes;
         if event.image_keys().len() > LARK_MAX_IMAGES_PER_MESSAGE {
             return Err(anyhow::Error::new(LarkImageDownloadError::permanent(
@@ -636,19 +674,21 @@ impl LarkChannel {
             )));
         }
         if !event.image_keys().is_empty() {
-            let token = self
-                .api
-                .tenant_access_token()
-                .await
-                .context("get lark token for message images failed")?;
+            // Preserve the per-channel attachment memory budget while other chats remain responsive.
+            let _download = self.image_download.lock().await;
             for (index, image_key) in event.image_keys().iter().enumerate() {
+                let message_id = &event.message_id;
                 let image = self
                     .api
-                    .download_message_image(&token, &event.message_id, image_key, remaining_bytes)
+                    .with_token(|token| async move {
+                        self.api
+                            .download_message_image(&token, message_id, image_key, remaining_bytes)
+                            .await
+                    })
                     .await
                     .map_err(|error| {
                         let message = error.to_string();
-                        anyhow::Error::new(error).context(format!(
+                        error.context(format!(
                             "download lark message image failed: {image_key}: {message}"
                         ))
                     })?;
@@ -681,7 +721,7 @@ impl LarkChannel {
         }
     }
 
-    async fn handle_event(&mut self, event: LarkEvent) -> Result<Option<LarkTask>> {
+    async fn handle_event(&self, event: LarkEvent) -> Result<Option<LarkTask>> {
         match event {
             LarkEvent::Message(event) if event.is_supported_message() => {
                 let mentioned = self.message_mentions_bot(&event).await?;
@@ -694,10 +734,13 @@ impl LarkChannel {
                 let api = self.api.clone();
                 if !self
                     .permission
-                    .admit(self.name(), &context, move |denial| async move {
-                        let token = api.tenant_access_token().await?;
-                        api.reply_card(&token, &target, &LarkReplyCard::permission_denied(&denial))
-                            .await
+                    .admit(self.api.name(), &context, move |denial| async move {
+                        api.reply_post(
+                            &target,
+                            &denial.markdown(),
+                            &uuid::Uuid::new_v4().to_string(),
+                        )
+                        .await
                     })
                     .await
                 {
@@ -714,7 +757,7 @@ impl LarkChannel {
                 let (input, input_bytes, attachments) = task.input.receipt_log_fields();
                 logger::info!(
                     "lark message received channel={} session={} sender={} message_id={} input={} input_bytes={} attachments={}",
-                    self.name(),
+                    self.api.name(),
                     session_id,
                     sender_id,
                     message_id,
@@ -725,9 +768,8 @@ impl LarkChannel {
                 Ok(Some(task))
             }
             LarkEvent::CardAction(mut event) => {
-                let actions = self.action_handler();
-                let conversation = actions.conversation(&event.session_id, event.conversation);
-                if !actions
+                let conversation = self.conversation(&event.session_id, event.conversation);
+                if !self
                     .admit_action(
                         &event.user_id,
                         &event.session_id,
@@ -741,14 +783,14 @@ impl LarkChannel {
                 event.conversation = conversation;
                 logger::info!(
                     "lark card action received channel={} session={} event_id={}",
-                    self.name(),
+                    self.api.name(),
                     event.session_id,
                     event.id
                 );
                 Ok(Some(LarkTask::from_card_action(event)))
             }
             LarkEvent::Interrupt(event) => {
-                self.action_handler().interrupt(event).await;
+                self.interrupt(event).await;
                 Ok(None)
             }
             LarkEvent::Message(_) | LarkEvent::Ignore { .. } => Ok(None),
@@ -768,63 +810,82 @@ impl ChannelSender for LarkSender {
         self.identity.clone()
     }
 
+    fn conversation_context(&self, task: &Self::Task) -> Option<ConversationContext> {
+        let LarkTaskSource::Message(event) = &task.source else {
+            return None;
+        };
+        Some(event.conversation_context())
+    }
+
     async fn open_run(&self, task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
         let target = task
             .reply_target()
             .ok_or_else(|| anyhow!("lark card action cannot open an agent run"))?;
-        let interrupt = context
-            .interrupt
-            .map(|callback| self.interrupts.register(callback));
-        let conversation = task
-            .conversation()
-            .context("lark message conversation is unavailable")?;
-        Ok(LarkRun {
-            card: LarkAgentCard::new(
-                target,
-                context.agent.name,
-                interrupt,
-                conversation,
-                self.api.clone(),
-            ),
-        })
+        let mut pending = self.pending_runs.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|_, (seen, _)| seen.elapsed() < Duration::from_secs(600));
+        anyhow::ensure!(
+            pending.len() < 4096 || pending.contains_key(task.task_id()),
+            "too many pending lark admissions"
+        );
+        let (seen, agents) = pending
+            .entry(task.task_id().to_owned())
+            .or_insert_with(|| (tokio::time::Instant::now(), HashMap::new()));
+        *seen = tokio::time::Instant::now();
+        let reply = agents
+            .entry(context.agent.name.clone())
+            .or_insert_with(|| {
+                LarkAgentReply::new(
+                    target,
+                    task.session_id().to_owned(),
+                    context.agent.name,
+                    self.api.clone(),
+                )
+            })
+            .clone();
+        Ok(LarkRun { reply })
     }
 
     async fn reply(&self, task: &Self::Task, reply: ChannelReply) -> Result<()> {
-        let token = self.api.tenant_access_token().await?;
-        match &task.source {
-            LarkTaskSource::Message(event) => match reply.as_text() {
-                Some(text) => {
-                    self.api
-                        .reply_text(&token, &event.reply_target(), text)
-                        .await
-                }
-                None => {
-                    self.api
-                        .reply_card(
-                            &token,
-                            &event.reply_target(),
-                            &LarkReplyCard::build(
-                                &reply,
-                                LarkConversation::from_chat_type(&event.chat_type),
-                            ),
-                        )
-                        .await?;
-                    Ok(())
-                }
-            },
-            LarkTaskSource::CardAction(event) => {
-                let conversation = event
-                    .conversation
-                    .context("lark card action conversation is unresolved")?;
-                self.api
-                    .patch_card(
-                        &token,
-                        &event.message_id,
-                        &LarkReplyCard::build(&reply, conversation),
-                    )
-                    .await
-            }
+        // The existing native process is the stop acknowledgement in Lark.
+        if matches!(reply, ChannelReply::StopAccepted(_)) {
+            return Ok(());
         }
+        let conversation = task
+            .conversation()
+            .context("lark card action conversation is unresolved")?;
+        let reply = &reply;
+        self.api
+            .with_token(|token| async move {
+                match &task.source {
+                    LarkTaskSource::Message(event) => match reply.as_text() {
+                        Some(text) => {
+                            self.api
+                                .reply_text(&token, &event.reply_target(), text)
+                                .await
+                        }
+                        None => {
+                            self.api
+                                .reply_card(
+                                    &token,
+                                    &event.reply_target(),
+                                    &LarkReplyCard::build(reply, conversation),
+                                )
+                                .await?;
+                            Ok(())
+                        }
+                    },
+                    LarkTaskSource::CardAction(event) => {
+                        self.api
+                            .patch_card(
+                                &token,
+                                &event.message_id,
+                                &LarkReplyCard::build(reply, conversation),
+                            )
+                            .await
+                    }
+                }
+            })
+            .await
     }
 }
 
@@ -832,11 +893,15 @@ impl ChannelSender for LarkChannel {
     type Task = LarkTask;
     type Run = LarkRun;
     fn name(&self) -> &str {
-        self.api.name()
+        self.ingress.api.name()
     }
     fn identity(&self) -> ChannelIdentity {
         self.identity.clone()
     }
+    fn conversation_context(&self, task: &Self::Task) -> Option<ConversationContext> {
+        self.sender().conversation_context(task)
+    }
+
     async fn open_run(&self, task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
         self.sender().open_run(task, context).await
     }
@@ -848,57 +913,116 @@ impl Channel for LarkChannel {
     type Sender = LarkSender;
     fn sender(&self) -> Self::Sender {
         LarkSender {
-            api: self.api.clone(),
+            pending_runs: self.pending_runs.clone(),
+            api: self.ingress.api.clone(),
             identity: self.identity.clone(),
-            interrupts: self.interrupts.clone(),
         }
     }
     async fn recv(&mut self) -> Result<Option<ChannelDelivery<Self::Task>>> {
+        if self.receiver.is_none() {
+            self.receiver();
+        }
         loop {
-            let delivery = match self.receiver().next_delivery().await {
-                Ok(Some(delivery)) => delivery,
-                result => {
-                    // Rebuild on the supervisor's next attempt, including a panicked
-                    // worker; retrying a permanently closed queue cannot recover.
-                    self.receiver = None;
-                    return result.map(|_| None);
+            let receiver = self.receiver.as_mut().expect("receiver initialized");
+            let closed = receiver.events.is_closed() && receiver.events.is_empty();
+            if closed && self.preparing.is_empty() {
+                let end = receiver.next_delivery().await;
+                self.receiver = None;
+                return end.map(|_| None);
+            }
+            let buffered =
+                self.preparing.len() + self.waiting.values().map(VecDeque::len).sum::<usize>();
+            tokio::select! {
+                biased;
+                Some(finished) = self.preparing.join_next(), if !self.preparing.is_empty() => {
+                    let (chat, result) = match finished {
+                        Ok(finished) => finished,
+                        Err(error) => {
+                            self.preparing.abort_all();
+                            self.preparing = JoinSet::new();
+                            self.waiting.clear();
+                            return Err(error.into());
+                        }
+                    };
+                    if let Some(next) = self.waiting.get_mut(&chat).and_then(VecDeque::pop_front) {
+                        self.prepare(chat, next);
+                    } else {
+                        self.waiting.remove(&chat);
+                    }
+                    if let Some(task) = result? {
+                        return Ok(Some(task));
+                    }
                 }
-            };
-            let deadline = delivery.deadline();
-            let (event, acknowledgement) = delivery.into_parts();
-            let admitted = tokio::time::timeout_at(deadline, self.handle_event(event)).await;
-            match admitted {
-                Err(_) => {
-                    let _ = acknowledgement.send(500);
-                    return Err(anyhow!("lark event admission timed out"));
-                }
-                Ok(Ok(Some(task))) => {
-                    return Ok(Some(ChannelDelivery::new(
-                        task,
-                        deadline,
-                        move |disposition| {
-                            let status = match disposition {
-                                DeliveryDisposition::Accepted => 200,
-                                DeliveryDisposition::Retry => 500,
-                            };
-                            let _ = acknowledgement.send(status);
-                        },
-                    )));
-                }
-                Ok(Ok(None)) => {
-                    let _ = acknowledgement.send(200);
-                }
-                Ok(Err(error)) => {
-                    let permanent = error
-                        .downcast_ref::<LarkImageDownloadError>()
-                        .is_some_and(LarkImageDownloadError::is_permanent);
-                    let _ = acknowledgement.send(if permanent { 200 } else { 500 });
-                    return Err(error);
+                received = receiver.events.recv(), if !closed && buffered < super::lark_api::LARK_ADMISSION_CAPACITY => {
+                    let Some(delivery) = received else { continue; };
+                            let chat = match &delivery.event {
+                                LarkEvent::Message(event) => &event.chat_id,
+                                LarkEvent::CardAction(event) => &event.session_id,
+                                LarkEvent::Interrupt(event) => &event.session_id,
+                                LarkEvent::Ignore {..} => "",
+                            }.to_owned();
+                            if let Some(queue) = self.waiting.get_mut(&chat) {
+                                queue.push_back(delivery);
+                            } else {
+                                self.waiting.insert(chat.clone(), VecDeque::new());
+                                self.prepare(chat, delivery);
+                            }
+
                 }
             }
         }
     }
 }
+
+impl LarkIngress {
+    async fn prepare_delivery(
+        &self,
+        delivery: LarkDelivery,
+        pending_runs: PendingRuns,
+    ) -> Result<Option<ChannelDelivery<LarkTask>>> {
+        let deadline = delivery.deadline();
+        let (event, acknowledgement) = delivery.into_parts();
+        let admitted = tokio::time::timeout_at(deadline, self.handle_event(event)).await;
+        match admitted {
+            Err(_) => {
+                let _ = acknowledgement.send(500);
+                Err(anyhow!("lark event admission timed out"))
+            }
+            Ok(Ok(Some(task))) => {
+                let source = task.task_id().to_owned();
+                Ok(Some(ChannelDelivery::new(
+                    task,
+                    deadline,
+                    move |disposition| {
+                        let status = match disposition {
+                            DeliveryDisposition::Accepted => {
+                                pending_runs
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .remove(&source);
+                                200
+                            }
+                            DeliveryDisposition::Retry => 500,
+                        };
+                        let _ = acknowledgement.send(status);
+                    },
+                )))
+            }
+            Ok(Ok(None)) => {
+                let _ = acknowledgement.send(200);
+                Ok(None)
+            }
+            Ok(Err(error)) => {
+                let permanent = error
+                    .downcast_ref::<LarkImageDownloadError>()
+                    .is_some_and(LarkImageDownloadError::is_permanent);
+                let _ = acknowledgement.send(if permanent { 200 } else { 500 });
+                Err(error)
+            }
+        }
+    }
+}
+
 struct LarkWebSocketReceiver {
     events: mpsc::Receiver<LarkDelivery>,
     task: Option<JoinHandle<Result<()>>>,
@@ -913,12 +1037,12 @@ impl Drop for LarkWebSocketReceiver {
 }
 
 impl LarkWebSocketReceiver {
-    fn spawn(actions: LarkActionHandler) -> Self {
+    fn spawn(actions: Arc<LarkIngress>) -> Self {
         let (sender, events) = mpsc::channel(1);
         let api = actions.api.clone();
         let sender = LarkEventSender {
             messages: sender,
-            actions: Some(Arc::new(actions)),
+            actions: Some(actions),
         };
         let task = tokio::spawn(async move { api.run_websocket_loop(sender).await });
         Self {
@@ -943,18 +1067,16 @@ impl LarkWebSocketReceiver {
     }
 }
 
-// Permission checks and run-scoped cancellation stay channel-owned. This small
-// shared handler can run in a bounded transport admission job while recv is
-// normalizing another message; it never enters the ordinary message queue.
-#[derive(Clone)]
-struct LarkActionHandler {
+// Shared normalization state. Only the receiver owns and orders pending deliveries.
+struct LarkIngress {
     api: LarkApi,
     permission: PermissionGate,
-    group_sessions: Arc<StdMutex<GroupSessions>>,
-    interrupts: InterruptCallbacks,
+    group_sessions: StdMutex<GroupSessions>,
+    bot_open_id: OnceCell<String>,
+    image_download: tokio::sync::Mutex<()>,
 }
 
-impl LarkActionHandler {
+impl LarkIngress {
     fn conversation(
         &self,
         session_id: &str,
@@ -982,21 +1104,23 @@ impl LarkActionHandler {
         message_id: &str,
         conversation: Option<LarkConversation>,
     ) -> bool {
-        let context = match self.conversation(session_id, conversation) {
+        let conversation = self.conversation(session_id, conversation);
+        let context = match conversation {
             Some(LarkConversation::Private) => AccessContext::private(user_id),
             Some(LarkConversation::Group) => AccessContext::group_action(user_id, session_id),
             None => AccessContext::unresolved_group(user_id, session_id),
         };
         self.permission
             .admit(self.api.name(), &context, |denial| async move {
-                let token = self.api.tenant_access_token().await?;
                 self.api
-                    .reply_card(
-                        &token,
+                    .reply_post(
                         &LarkReplyTarget {
-                            message_id: message_id.into(),
+                            message_id: message_id.to_owned(),
+                            mention_user_id: (conversation == Some(LarkConversation::Group))
+                                .then(|| user_id.to_owned()),
                         },
-                        &LarkReplyCard::permission_denied(&denial),
+                        &denial.markdown(),
+                        &uuid::Uuid::new_v4().to_string(),
                     )
                     .await
             })
@@ -1015,31 +1139,21 @@ impl LarkActionHandler {
         {
             return;
         }
-        let triggered = self.interrupts.trigger(&event.callback_id);
-        logger::info!(
-            "lark interrupt action received channel={} event_id={} triggered={}",
-            self.api.name(),
-            event.id,
-            triggered
-        );
-        // Signal first; a feedback delivery failure must never undo cancellation.
-        let feedback = async {
-            let token = self.api.tenant_access_token().await?;
-            self.api
-                .reply_text(
-                    &token,
-                    &LarkReplyTarget {
-                        message_id: event.message_id,
-                    },
-                    if triggered {
-                        crate::i18n::STOP_REQUEST_ACCEPTED
-                    } else {
-                        crate::i18n::STOP_BUTTON_EXPIRED
-                    },
-                )
-                .await
-        }
-        .await;
+        let target = LarkReplyTarget {
+            message_id: event.message_id,
+            mention_user_id: (self.conversation(&event.session_id, event.conversation)
+                == Some(LarkConversation::Group))
+            .then_some(event.user_id),
+        };
+        let target = &target;
+        let feedback = self
+            .api
+            .with_token(|token| async move {
+                self.api
+                    .reply_text(&token, target, crate::i18n::STOP_BUTTON_EXPIRED)
+                    .await
+            })
+            .await;
         if let Err(error) = feedback {
             logger::error!(
                 "lark interrupt feedback failed channel={} event_id={} error={}",
@@ -1054,7 +1168,7 @@ impl LarkActionHandler {
 #[derive(Clone)]
 pub(super) struct LarkEventSender {
     messages: mpsc::Sender<LarkDelivery>,
-    actions: Option<Arc<LarkActionHandler>>,
+    actions: Option<Arc<LarkIngress>>,
 }
 
 impl LarkEventSender {

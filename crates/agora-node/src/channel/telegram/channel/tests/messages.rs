@@ -1,4 +1,29 @@
 use super::*;
+use serde_json::json;
+
+#[tokio::test]
+async fn telegram_acknowledges_an_accepted_stop_only_on_the_original_run() {
+    let server =
+        HttpMockServer::start(|_| MockResponse::json(r#"{"ok":true,"result":{"message_id":2}}"#))
+            .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+    let channel = TelegramChannel::with_api(api);
+    let task = TelegramUpdate::from_json(r#"{"update_id":1,"message":{"message_id":7,"from":{"id":42},"chat":{"id":42,"type":"private"},"text":"/stop"}}"#)
+        .unwrap().into_task("agora").unwrap();
+    channel
+        .reply(
+            &task,
+            ChannelReply::StopAccepted("已停止 1 个 Agent".into()),
+        )
+        .await
+        .unwrap();
+    assert!(server.requests().await.is_empty());
+    channel
+        .reply(&task, ChannelReply::Text("当前没有运行中的任务".into()))
+        .await
+        .unwrap();
+    assert_eq!(server.endpoint_count("sendRichMessage").await, 1);
+}
 
 #[test]
 fn telegram_permission_denial_owns_its_rich_markdown_layout() {
@@ -261,4 +286,65 @@ fn configured_task_forwards_telegram_task_fields() {
     assert_eq!(task.task_id(), "108");
     assert_eq!(task.session_id(), "chat:7");
     assert_eq!(task.input().message().unwrap().text(), "hello");
+}
+
+#[tokio::test]
+async fn telegram_conversation_context_uses_native_mentions_and_same_topic_quote_id() {
+    let server = HttpMockServer::start_json_queue([] as [&str; 0]).await;
+    let channel = TelegramChannel::with_api(
+        TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap(),
+    );
+    let quote = json!({"message_id":8,"date":100,"message_thread_id":4,"chat":{"id":-5,"type":"supergroup"},
+        "from":{"id":2,"first_name":"小李","username":"li"},"text":"镜像拉取超时"});
+    let source = json!({"message_id":10,"date":110,"message_thread_id":4,"chat":{"id":-5,"type":"supergroup"},
+        "from":{"id":9},"text":"😀 小李 和 @a_user 的问题是什么原因","entities":[
+            {"type":"text_mention","offset":3,"length":2,"user":{"id":2,"first_name":"小李"}},
+            {"type":"mention","offset":8,"length":7}
+        ],"reply_to_message":quote});
+    for same_topic in [true, false] {
+        let mut message = source.clone();
+        if !same_topic {
+            message["reply_to_message"]["message_thread_id"] = json!(99);
+        }
+        let task = TelegramUpdate::from_value(json!({"update_id":20,"message":message}))
+            .unwrap()
+            .into_task("agora_bot")
+            .unwrap();
+        let context = channel.sender().conversation_context(&task).unwrap();
+        let mut expected = json!({"channel":"telegram", "chat_type":"group", "chat_id":"-5",
+            "message_id":"10", "thread_id":"4",
+            "mentions":[{"text":"小李","id":"2"},{"text":"@a_user","id":"@a_user"}]
+        });
+        if same_topic {
+            expected["reply_to_message_id"] = json!("8");
+        }
+        assert_eq!(serde_json::to_value(context).unwrap(), expected);
+    }
+    assert!(server.requests().await.is_empty());
+}
+
+#[tokio::test]
+async fn telegram_private_and_group_use_the_same_metadata_and_quote_only_the_actual_sender() {
+    let server = HttpMockServer::start_json_queue([] as [&str; 0]).await;
+    let channel = TelegramChannel::with_api(
+        TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap(),
+    );
+    for (chat, kind) in [(9, "private"), (-99, "group")] {
+        let event = json!({"update_id":19,"message":{"message_id":79,"chat":{"id":chat,"type":kind},
+            "from":{"id":9,"first_name":"小]王"},"date":123,"text":"检查构建"}});
+        let task = TelegramUpdate::from_value(event)
+            .unwrap()
+            .into_task("agora_bot")
+            .unwrap();
+        let context = channel.conversation_context(&task).unwrap();
+        assert_eq!(
+            serde_json::to_value(&context).unwrap(),
+            json!({"channel":"telegram","chat_type":kind,"chat_id":chat.to_string(),"message_id":"79"})
+        );
+        assert_eq!(
+            task.reply_target.mention.as_deref(),
+            (kind == "group").then_some(r"[@小\]王](tg://user?id=9)")
+        );
+    }
+    assert!(server.requests().await.is_empty());
 }

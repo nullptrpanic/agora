@@ -3,12 +3,15 @@ use super::{
     Agent, AgentOutcome, AgentOutput, AgentRequest, AgentSessionUpdate, DeleteSessionOutcome,
 };
 use crate::config::AgentSandbox;
-use crate::task::{OutputEvent, ProgressStatus, TaskAttachment, TaskAttachmentKind, TokenUsage};
+use crate::task::{
+    OutputEvent, ProgressStatus, TaskAttachment, TaskAttachmentKind, TokenUsage, WebAction,
+};
 use agora_core::logger;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tempfile::TempDir;
 
 mod images;
@@ -155,23 +158,18 @@ impl Agent for CodexAgent {
             &self.env,
         )
         .await;
-        let PreparedCommand {
-            command,
-            resume_requested,
-            _attachment_dir,
-        } = self.command(request)?;
-        let mut command_output =
-            CodexCommandOutput::new(&self.name, output, resume_requested, images);
-        let outcome = command.run(&mut command_output).await?;
-        let session_update = if command_output.session_not_found(outcome.exit_code()) {
+        let prepared = self.command(request)?;
+        let mut stream =
+            CodexCommandOutput::new(&self.name, output, prepared.resume_requested, images);
+        let outcome = prepared.command.run(&mut stream).await?;
+        let session = if stream.session_not_found(outcome.exit_code()) {
             AgentSessionUpdate::NotFound
-        } else if let Some(next_session_id) = command_output.take_session_id() {
-            logger::info!("agent session observed agent={}", self.name);
-            AgentSessionUpdate::Set(next_session_id)
+        } else if let Some(id) = stream.take_session_id() {
+            AgentSessionUpdate::Set(id)
         } else {
             AgentSessionUpdate::Unchanged
         };
-        Ok(AgentOutcome::new(outcome.exit_code(), session_update))
+        Ok(AgentOutcome::new(outcome.exit_code(), session))
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<DeleteSessionOutcome> {
@@ -235,6 +233,8 @@ struct CodexCommandOutput<'a, O> {
     resume_requested: bool,
     stdout_observed: bool,
     images: CodexImages,
+    tool_started: HashMap<String, Instant>,
+    diagnostics: VecDeque<String>,
 }
 
 impl<'a, O> CodexCommandOutput<'a, O>
@@ -258,6 +258,8 @@ where
             resume_requested,
             stdout_observed: false,
             images,
+            tool_started: HashMap::new(),
+            diagnostics: VecDeque::new(),
         }
     }
 
@@ -277,15 +279,16 @@ where
 
     async fn push_stdout(&mut self, chunk: &[u8]) -> Result<()> {
         self.stdout_observed |= !chunk.is_empty();
-        self.stdout_buffer.extend_from_slice(chunk);
-        while let Some(newline) = self.stdout_buffer.iter().position(|byte| *byte == b'\n') {
-            let mut line = self.stdout_buffer.drain(..=newline).collect::<Vec<_>>();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            self.handle_line(&String::from_utf8_lossy(&line)).await?;
+        // Only search the newly read bytes. A single MCP result can span many reads.
+        let mut remaining = chunk;
+        while let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') {
+            self.stdout_buffer.extend_from_slice(&remaining[..newline]);
+            let line = std::mem::take(&mut self.stdout_buffer);
+            let line = line.strip_suffix(b"\r").unwrap_or(&line);
+            self.handle_line(&String::from_utf8_lossy(line)).await?;
+            remaining = &remaining[newline + 1..];
         }
+        self.stdout_buffer.extend_from_slice(remaining);
         Ok(())
     }
 
@@ -310,10 +313,9 @@ where
             Ok(())
         } else {
             self.output
-                .write(OutputEvent::Progress {
+                .write(OutputEvent::Commentary {
                     id: message.id,
                     text: Self::concise(&message.text, 240),
-                    status: ProgressStatus::Completed,
                 })
                 .await
         }
@@ -321,6 +323,30 @@ where
 
     async fn handle_item(&mut self, event_type: &str, item: &Value) -> Result<()> {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        // Codex emits configuration/deprecation warnings as error *items*.
+        // Fatal errors are top-level error/turn.failed events. A diagnostic is
+        // not further agent work and must not displace a pending final answer.
+        if item_type == "error" {
+            let message = item
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("codex item failed");
+            let logged = Self::concise(message, 2048);
+            if !self.diagnostics.contains(&logged) {
+                logger::log::warn!("codex diagnostic agent={}: {}", self.agent_name, logged);
+                if self.diagnostics.len() == 64 {
+                    self.diagnostics.pop_front();
+                }
+                self.diagnostics.push_back(logged);
+            }
+            return self
+                .output
+                .write(OutputEvent::Diagnostic {
+                    id: Self::progress_id(item),
+                    text: message.to_owned(),
+                })
+                .await;
+        }
         if item_type == "agent_message" && event_type == "item.completed" {
             self.publish_pending_message(false).await?;
             if let Some(text) = item.get("text").and_then(Value::as_str) {
@@ -336,7 +362,12 @@ where
             return Ok(());
         }
 
-        self.publish_pending_message(false).await?;
+        let elapsed_ms = self.observe_tool_time(event_type, item);
+        // Codex closes its plan and reconciles already-started items immediately
+        // before turn.completed, even after it has emitted the final message.
+        if !(event_type == "item.completed" && (item_type == "todo_list" || elapsed_ms.is_some())) {
+            self.publish_pending_message(false).await?;
+        }
         match item_type {
             "reasoning" if event_type == "item.completed" => {
                 if let Some(text) = item.get("text").and_then(Value::as_str) {
@@ -362,6 +393,19 @@ where
                             .and_then(|code| i32::try_from(code).ok()),
                     })
                     .await?;
+                if event_type == "item.completed" {
+                    self.output
+                        .write(OutputEvent::ToolOutput {
+                            id: Self::progress_id(item),
+                            text: item
+                                .get("aggregated_output")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            elapsed_ms,
+                        })
+                        .await?;
+                }
             }
             "file_change" => {
                 let count = item
@@ -406,6 +450,32 @@ where
                 )
                 .await?;
                 if event_type == "item.completed" {
+                    let text = item
+                        .pointer("/result/content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                        .filter_map(|block| block.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let text = if text.is_empty() {
+                        item.pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned()
+                    } else {
+                        text
+                    };
+                    if !text.is_empty() || elapsed_ms.is_some() {
+                        self.output
+                            .write(OutputEvent::ToolOutput {
+                                id: Self::progress_id(item),
+                                text,
+                                elapsed_ms,
+                            })
+                            .await?;
+                    }
                     for image in self.images.mcp_images(item) {
                         self.output.write(image).await?;
                     }
@@ -423,17 +493,37 @@ where
                 )
                 .await?;
             }
-            "error" => {
-                let message = item
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("codex item failed");
-                self.publish_progress(item, message.to_string(), ProgressStatus::Failed)
-                    .await?;
-            }
             _ => {}
         }
         Ok(())
+    }
+
+    fn observe_tool_time(&mut self, event_type: &str, item: &Value) -> Option<u64> {
+        if !matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("command_execution" | "mcp_tool_call" | "file_change" | "web_search")
+        ) {
+            return None;
+        }
+        let id = item.get("id").and_then(Value::as_str)?;
+        if id.is_empty() || id.len() > 512 {
+            return None;
+        }
+        if event_type == "item.started"
+            && self.tool_started.len() < 64
+            && Self::progress_status(event_type, item) == ProgressStatus::Running
+        {
+            self.tool_started
+                .entry(id.to_owned())
+                .or_insert_with(Instant::now);
+        }
+        if event_type != "item.completed" {
+            return None;
+        }
+        // This is the adapter's observed interval, not backend-reported CPU time.
+        self.tool_started
+            .remove(id)
+            .and_then(|started| u64::try_from(started.elapsed().as_millis()).ok())
     }
 
     async fn publish_progress(
@@ -442,13 +532,50 @@ where
         text: String,
         status: ProgressStatus,
     ) -> Result<()> {
-        self.output
-            .write(OutputEvent::Progress {
-                id: Self::progress_id(item),
+        let id = Self::progress_id(item);
+        let event = match item.get("type").and_then(Value::as_str) {
+            Some("file_change" | "mcp_tool_call" | "web_search") => OutputEvent::ToolCall {
+                id,
                 text,
                 status,
-            })
-            .await
+                web_action: (item.get("type").and_then(Value::as_str) == Some("web_search"))
+                    .then(|| Self::web_action(item)),
+            },
+            _ => OutputEvent::Progress { id, text, status },
+        };
+        self.output.write(event).await
+    }
+
+    fn web_action(item: &Value) -> WebAction {
+        let nonempty = |value: &Value| {
+            value
+                .as_str()
+                .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|text| !text.is_empty())
+        };
+        let action = &item["action"];
+        match action.get("type").and_then(Value::as_str) {
+            Some("open_page") => WebAction::OpenPage {
+                url: nonempty(&action["url"]),
+            },
+            Some("find_in_page") => WebAction::FindInPage {
+                url: nonempty(&action["url"]),
+                pattern: nonempty(&action["pattern"]),
+            },
+            _ => {
+                let mut queries: Vec<_> = action
+                    .get("queries")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(nonempty)
+                    .collect();
+                if queries.is_empty() {
+                    queries.extend(nonempty(&action["query"]).or_else(|| nonempty(&item["query"])));
+                }
+                WebAction::Search { queries }
+            }
+        }
     }
 
     fn progress_id(item: &Value) -> String {

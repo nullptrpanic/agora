@@ -1,24 +1,92 @@
 use super::{FailureCopy, RunStatus};
 use crate::task::ProgressStatus;
 
-pub(crate) const THINKING_TITLE: &str = "思考过程";
-pub(crate) const PROCESS_TITLE: &str = "任务过程";
-pub(crate) const SHELL_TITLE: &str = "SHELL";
-pub(crate) const SHELL_RUNNING: &str = "Running";
-pub(crate) const SHELL_COMPLETED: &str = "Completed";
-pub(crate) const SHELL_FAILED: &str = "Failed";
-pub(crate) const SHELL_STOPPED: &str = "Stopped";
-pub(crate) const FINAL_ANSWER_TITLE: &str = "最终回答";
+pub(crate) const THINKING_STATUS: &str = "思考中";
+pub(crate) const TASK_COMPLETED: &str = "任务已完成。";
+pub(crate) const PROCESS_TRUNCATED: &str = "部分运行过程已省略，最终回答不受过程上限影响。";
+pub(crate) const TOOL_COMPLETED: &str = "完成";
+pub(crate) const TOOL_FAILED: &str = "失败";
+pub(crate) const TOOL_STOPPED: &str = "已停止";
+pub(crate) const TOOL_UNCONFIRMED: &str = "未确认完成";
+pub(crate) const TOOL_COMMAND: &str = "执行命令";
+pub(crate) const RUN_PROGRAM: &str = "运行";
+pub(crate) const REQUEST_HOST: &str = "请求";
+pub(crate) const NO_PUBLIC_STEPS: &str = "没有可展示的运行步骤。";
+pub(crate) const TOOL_NO_OUTPUT: &str = "（无文本输出）";
+pub(crate) const LARK_COMPLETED: &str = "任务已完成";
+pub(crate) const LARK_IMAGE_REFERENCE: &str = "（图片见本对话的附件；发送状态见任务过程）";
+pub(crate) const COMMAND_TRUNCATED: &str = "… [命令已截断]";
+
+pub(crate) fn shell_status(status: ProgressStatus, exit: Option<i32>) -> String {
+    let label = match status {
+        ProgressStatus::Completed if exit.is_none_or(|code| code == 0) => "✓ Success",
+        ProgressStatus::Completed | ProgressStatus::Failed => "✗ Failed",
+        ProgressStatus::Running => "● Running",
+        ProgressStatus::Stopped => "■ Stopped",
+    };
+    match exit {
+        Some(code) if code != 0 => format!("{label} · exit {code}"),
+        _ => label.into(),
+    }
+}
+
+pub(crate) fn shell_output(
+    command: &str,
+    output: &str,
+    status: &str,
+    elapsed_ms: Option<u64>,
+) -> String {
+    let mut text = format!("$ {command}\n\n");
+    if !output.is_empty() {
+        text.push_str(output);
+        text.push_str("\n\n");
+    }
+    text.push_str(status);
+    if let Some(ms) = elapsed_ms {
+        text.push_str(&format!(" · 约 {}.{:03} 秒", ms / 1000, ms % 1000));
+    }
+    text
+}
+
+pub(crate) fn tool_title(text: &str) -> String {
+    let mut chars = text
+        .split_whitespace()
+        .flat_map(|word| word.chars().chain(std::iter::once(' ')));
+    let mut title: String = chars.by_ref().take(96).collect();
+    if chars.next().is_some() {
+        title.pop();
+        title.push('…');
+    }
+    title.trim_end().to_owned()
+}
+
+pub(crate) fn web_tool_title(action: &crate::task::WebAction) -> String {
+    use crate::task::WebAction;
+    match action {
+        WebAction::Search { queries } if queries.is_empty() => "搜索资料".into(),
+        WebAction::Search { queries } => format!("搜索 · {}", queries.join("；")),
+        WebAction::OpenPage { url } => url
+            .as_ref()
+            .map_or_else(|| "打开网页".into(), |url| format!("打开网页 · {url}")),
+        WebAction::FindInPage { url, pattern } => std::iter::once("页内查找")
+            .chain(pattern.as_deref())
+            .chain(url.as_deref())
+            .collect::<Vec<_>>()
+            .join(" · "),
+    }
+}
+
+pub(crate) fn tool_output_header(status: &str, elapsed_ms: Option<u64>) -> String {
+    let elapsed = elapsed_ms.map_or_else(String::new, |ms| {
+        format!("\n耗时：约 {}.{:03} 秒", ms / 1000, ms % 1000)
+    });
+    format!("{status}{elapsed}\n\n输出：\n")
+}
 pub(crate) const PARTIAL_ANSWER_TITLE: &str = "部分回答";
 pub(crate) const RUN_FAILED_TITLE: &str = "任务失败";
-pub(crate) const RUN_STOPPED_TITLE: &str = "任务已停止";
 pub(crate) const RUN_INTERRUPTED_TITLE: &str = "任务已中断";
-pub(crate) const TECHNICAL_DETAILS_TITLE: &str = "技术详情";
 pub(crate) const WAITING_FOR_AGENT: &str = "正在等待 Agent 输出...";
-pub(crate) const AGENT_RUN_FAILED: &str = "Agent 未能完成本次任务。";
-pub(crate) const RETRY_ADVICE: &str = "建议：请重试；如果仍然失败，请查看技术详情和 daemon 日志。";
-pub(crate) const ERROR_WRITTEN_TO_LOG: &str = "完整错误已写入 daemon 日志。";
-pub(crate) const RUN_STOPPED_BODY: &str = "已按请求停止任务，已有输出已保留。";
+pub(crate) const NATIVE_RETRY_ADVICE: &str = "建议：请重试；如果仍然失败，请查看 daemon 日志。";
 pub(crate) const RUN_INTERRUPTED_BODY: &str =
     "Agora Node 即将退出，本次任务已中断，当前输出已保留。\nNode 恢复后，请重新发送消息继续。";
 pub(crate) const STOP_TASK: &str = "结束任务";
@@ -29,19 +97,10 @@ pub(crate) const IMAGE_UNAVAILABLE: &str =
     "图片无法发送：文件不可读、超出允许范围，或格式/大小/数量不受支持。";
 pub(crate) const IMAGE_REFERENCE: &str = "（图片见本话题的附件；发送状态见任务过程）";
 pub(crate) const IMAGE_REFERENCE_FAILED: &str = "（图片无法发送，详见任务过程）";
-pub(crate) const STOP_REQUEST_ACCEPTED: &str = "停止请求已受理，正在结束任务。";
 pub(crate) const STOP_BUTTON_EXPIRED: &str =
     "任务已结束或按钮已失效；如需停止当前对话的任务，请发送 /stop。";
-pub(crate) const TOTAL: &str = "Total";
-pub(crate) const INPUT: &str = "Input";
-pub(crate) const OUTPUT: &str = "Output";
-pub(crate) const REASONING: &str = "Reasoning";
-pub(crate) const TOKENS: &str = "tokens";
-pub(crate) const REASONING_DETAIL: &str = "of output";
 pub(crate) const OUTPUT_TRUNCATED: &str = "[输出已截断]\n\n";
 pub(crate) const PERMISSION_DENIED_TITLE: &str = "无权访问此 Channel";
-pub(crate) const PERMISSION_DENIED_HEADER_TITLE: &str = "访问受限";
-pub(crate) const PERMISSION_DENIED_SUBTITLE: &str = "请更新 Channel 权限配置";
 pub(crate) const PERMISSION_IDENTIFIERS_TITLE: &str = "访问标识";
 pub(crate) const PERMISSION_CONFIG_EXAMPLE_TITLE: &str = "配置示例";
 pub(crate) const PERMISSION_USER_NOT_ALLOWED: &str = "当前用户未在允许列表中。";
@@ -95,25 +154,8 @@ pub(crate) fn run_status(status: RunStatus) -> &'static str {
     }
 }
 
-pub(crate) fn phase_count(count: usize) -> String {
-    format!("{count} 个阶段")
-}
-
-pub(crate) fn truncated_phase_count(count: usize) -> String {
-    if count == 0 {
-        "已省略当前阶段中的较早过程".to_string()
-    } else {
-        format!("已省略 {count} 个较早阶段")
-    }
-}
-
-pub(crate) fn progress_count(status: ProgressStatus, count: usize) -> String {
-    match status {
-        ProgressStatus::Running => format!("{count} 项进行中"),
-        ProgressStatus::Completed => format!("{count} 项已完成"),
-        ProgressStatus::Failed => format!("{count} 项失败"),
-        ProgressStatus::Stopped => format!("{count} 项已停止"),
-    }
+pub(crate) fn tool_call_count(count: usize) -> String {
+    format!("已调用 {count} 次工具")
 }
 
 pub(crate) fn queued_message(ahead: usize) -> String {
@@ -122,10 +164,6 @@ pub(crate) fn queued_message(ahead: usize) -> String {
     } else {
         format!("正在排队，前面还有 {ahead} 个任务...")
     }
-}
-
-pub(crate) fn cached_tokens(tokens: impl std::fmt::Display) -> String {
-    format!("{tokens} cached")
 }
 
 pub(crate) fn failure_copy(message: &str) -> FailureCopy {

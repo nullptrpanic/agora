@@ -3,15 +3,14 @@ use super::super::channel::{
     LarkCardActionEvent, LarkChannel, LarkConversation, LarkMessageEvent, LarkTask,
 };
 use super::super::lark_api::LarkApi;
-use super::{LarkAgentCard, LarkCardContent, LarkReplyCard};
-use crate::channel::permission::PermissionDenial;
+use super::LarkReplyCard;
 use crate::channel::test_http::{HttpMockServer, MockResponse};
 use crate::channel::{
-    ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun, ChannelSender,
-    ConfiguredChannel, ConfiguredTask, RunEvent,
+    ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelSender,
+    ConfiguredChannel, ConfiguredTask,
 };
 use crate::config::LarkChannelConfig;
-use crate::task::{CommandRequest, OutputEvent, ProgressStatus, TokenUsage};
+use crate::task::CommandRequest;
 
 fn agent_status_with_button(name: &str, enabled: bool) -> ChannelAgentStatus {
     let (text, style, command) = if enabled {
@@ -28,7 +27,6 @@ fn agent_status_with_button(name: &str, enabled: bool) -> ChannelAgentStatus {
 
 mod api;
 mod content;
-mod images;
 
 async fn lark_http_server() -> HttpMockServer {
     HttpMockServer::start(|request| {

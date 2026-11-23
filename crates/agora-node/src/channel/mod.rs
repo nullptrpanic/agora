@@ -3,8 +3,8 @@ use crate::channel::telegram::{TelegramChannel, TelegramChannelSender, TelegramR
 use crate::config::ChannelConfig;
 use crate::store::ChannelIdentity;
 use crate::task::{
-    ChannelTaskInput, CommandRequest, MAX_OUTPUT_IMAGE_TOTAL_BYTES, MAX_OUTPUT_IMAGES, OutputEvent,
-    OutputImage,
+    ChannelTaskInput, CommandRequest, ConversationContext, MAX_OUTPUT_IMAGE_TOTAL_BYTES,
+    MAX_OUTPUT_IMAGES, OutputEvent, OutputImage,
 };
 use anyhow::{Result, bail, ensure};
 use std::collections::{HashMap, HashSet};
@@ -23,6 +23,19 @@ pub(crate) mod test_http;
 
 pub(crate) const CHANNEL_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
 const IMAGE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const COMMAND_OUTPUT_PREVIEW_CHARS: usize = 500;
+
+fn command_output_preview(text: String) -> String {
+    let start = text
+        .char_indices()
+        .rev()
+        .nth(COMMAND_OUTPUT_PREVIEW_CHARS - 1)
+        .map_or(0, |(index, _)| index);
+    if start == 0 {
+        return text;
+    }
+    format!("{}{}", crate::i18n::OUTPUT_TRUNCATED, &text[start..])
+}
 
 #[derive(Default)]
 struct ImageDeliveries {
@@ -54,20 +67,22 @@ pub(crate) fn append_bounded_tail(
     truncation_marker: &str,
 ) -> bool {
     debug_assert!(maximum_bytes >= truncation_marker.len());
-    target.push_str(value);
-    if target.len() <= maximum_bytes {
+    let total = target.len().saturating_add(value.len());
+    if total <= maximum_bytes {
+        target.push_str(value);
         return false;
     }
 
-    let tail_bytes = maximum_bytes.saturating_sub(truncation_marker.len());
-    let mut start = target.len().saturating_sub(tail_bytes);
-    while !target.is_char_boundary(start) {
-        start += 1;
+    let skip = total - (maximum_bytes - truncation_marker.len());
+    let mut tail = String::with_capacity(maximum_bytes);
+    tail.push_str(truncation_marker);
+    if skip < target.len() {
+        tail.push_str(&target[target.ceil_char_boundary(skip)..]);
+        tail.push_str(value);
+    } else {
+        tail.push_str(&value[value.ceil_char_boundary(skip - target.len())..]);
     }
-    let tail = target[start..].to_string();
-    target.clear();
-    target.push_str(truncation_marker);
-    target.push_str(&tail);
+    *target = tail;
     true
 }
 
@@ -76,6 +91,9 @@ pub(crate) fn bounded_tail(
     maximum_bytes: usize,
     truncation_marker: &str,
 ) -> (String, bool) {
+    if value.len() <= maximum_bytes && value.capacity() <= maximum_bytes {
+        return (value, false);
+    }
     let mut retained = String::new();
     let truncated = append_bounded_tail(&mut retained, &value, maximum_bytes, truncation_marker);
     (retained, truncated)
@@ -174,6 +192,11 @@ pub trait ChannelSender {
     fn name(&self) -> &str;
 
     fn identity(&self) -> ChannelIdentity;
+
+    /// Return native conversation identifiers for an admitted message.
+    fn conversation_context(&self, _task: &Self::Task) -> Option<ConversationContext> {
+        None
+    }
 
     fn open_run(
         &self,
@@ -362,6 +385,8 @@ impl ChannelAgentStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChannelReply {
     Text(String),
+    /// Successful cancellation request; text is the fallback acknowledgement.
+    StopAccepted(String),
     AgentList(Vec<ChannelAgentStatus>),
     AgentStatus(ChannelAgentStatus),
 }
@@ -381,13 +406,20 @@ impl ChannelReply {
 
     pub fn as_text(&self) -> Option<&str> {
         match self {
-            Self::Text(text) => Some(text),
+            Self::Text(text) | Self::StopAccepted(text) => Some(text),
             Self::AgentList(_) | Self::AgentStatus(_) => None,
         }
     }
 }
 
 pub trait ChannelRun: Clone {
+    /// Initial admission was rejected before the backend ran and can be redelivered.
+    fn admission_deferred(&self) -> impl Future<Output = Result<()>> + Send {
+        self.publish(RunEvent::Failed {
+            message: "task initialization failed or was cancelled".into(),
+        })
+    }
+
     fn publish(&self, event: RunEvent) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -427,6 +459,13 @@ pub enum ConfiguredRun {
 }
 
 impl ChannelRun for ConfiguredRun {
+    async fn admission_deferred(&self) -> Result<()> {
+        match self {
+            Self::Lark(run) => run.admission_deferred().await,
+            Self::Telegram(run) => run.admission_deferred().await,
+        }
+    }
+
     async fn publish(&self, event: RunEvent) -> Result<()> {
         match self {
             ConfiguredRun::Lark(run) => run.publish(event).await,
@@ -477,6 +516,16 @@ impl ChannelSender for ConfiguredSender {
         }
     }
 
+    fn conversation_context(&self, task: &Self::Task) -> Option<ConversationContext> {
+        match (self, task) {
+            (Self::Lark(channel), ConfiguredTask::Lark(task)) => channel.conversation_context(task),
+            (Self::Telegram(channel), ConfiguredTask::Telegram(task)) => {
+                channel.conversation_context(task)
+            }
+            _ => None,
+        }
+    }
+
     async fn open_run(&self, task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
         match (self, task) {
             (ConfiguredSender::Lark(channel), ConfiguredTask::Lark(task)) => {
@@ -517,6 +566,10 @@ impl ChannelSender for ConfiguredChannel {
             ConfiguredChannel::Telegram(channel) => channel.identity(),
         }
     }
+    fn conversation_context(&self, task: &Self::Task) -> Option<ConversationContext> {
+        self.sender().conversation_context(task)
+    }
+
     async fn open_run(&self, task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
         self.sender().open_run(task, context).await
     }

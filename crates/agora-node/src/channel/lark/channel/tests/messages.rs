@@ -1,4 +1,6 @@
 use super::*;
+use crate::channel::test_http::HttpMockServer;
+use serde_json::json;
 
 #[test]
 fn parses_lark_message_receive_event_payload() {
@@ -145,4 +147,55 @@ fn accepts_a_standalone_lark_image_message() {
     assert_eq!(event.input(), "");
     assert_eq!(event.image_keys(), &["img_standalone"]);
     assert!(event.is_supported_message());
+}
+
+#[tokio::test]
+async fn lark_conversation_context_uses_native_identifiers_and_member_mentions() {
+    let server = HttpMockServer::start_json_queue([] as [&str; 0]).await;
+    let config = LarkChannelConfig {
+        name: "lark".into(),
+        app_id: "cli_bot".into(),
+        secret: "secret".into(),
+        proxy: None,
+        permission: Default::default(),
+    };
+    let channel = LarkChannel::with_api(LarkApi::with_base_url(config, server.base_url()).unwrap());
+    channel.ingress.bot_open_id.set("ou_bot".into()).unwrap();
+    for (chat_type, kind) in [
+        ("p2p", "private"),
+        ("group", "group"),
+        ("topic_group", "group"),
+    ] {
+        let mut message = json!({
+            "message_id": "om_question", "chat_id": "oc_chat", "chat_type": chat_type,
+            "message_type": "text", "content": r#"{"text":"看下这个问题"}"#
+        });
+        let mut expected = json!({
+            "channel":"lark", "chat_type":kind, "chat_id":"oc_chat", "message_id":"om_question"
+        });
+        if chat_type == "topic_group" {
+            message["parent_id"] = json!("om_quote");
+            message["root_id"] = json!("om_root");
+            message["thread_id"] = json!("omt_topic");
+            message["mentions"] = json!([
+                {"key":"@_user_1","name":"机器人","id":{"open_id":"ou_bot"}},
+                {"key":"@_user_2","name":"小李","id":{"open_id":"ou_li"}}
+            ]);
+            expected["reply_to_message_id"] = json!("om_quote");
+            expected["thread_id"] = json!("omt_topic");
+            expected["mentions"] = json!([{"text":"@_user_2 (@小李)", "id":"ou_li"}]);
+        }
+        let event = LarkEvent::from_lark_event_payload(
+            json!({
+                "header":{"event_type":"im.message.receive_v1","event_id":"ev"},
+                "event":{"sender":{"sender_id":{"open_id":"ou_me"}},"message":message}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let task = channel.ingress.handle_event(event).await.unwrap().unwrap();
+        let context = channel.sender().conversation_context(&task).unwrap();
+        assert_eq!(serde_json::to_value(&context).unwrap(), expected);
+    }
+    assert!(server.requests().await.is_empty());
 }

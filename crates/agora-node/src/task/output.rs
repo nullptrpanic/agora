@@ -42,6 +42,22 @@ pub enum OutputEvent {
     Thinking {
         text: String,
     },
+    Commentary {
+        id: String,
+        text: String,
+    },
+    ToolCall {
+        id: String,
+        text: String,
+        status: ProgressStatus,
+        /// Optional semantic web action; channels may retain the text fallback.
+        web_action: Option<WebAction>,
+    },
+    /// A nonfatal backend diagnostic, distinct from task/tool failure.
+    Diagnostic {
+        id: String,
+        text: String,
+    },
     Progress {
         id: String,
         text: String,
@@ -52,6 +68,13 @@ pub enum OutputEvent {
         command: String,
         status: ProgressStatus,
         exit_code: Option<i32>,
+    },
+    /// A completed tool's textual output and optional observed elapsed time.
+    /// The id refers to an existing ToolCall or CommandExecution.
+    ToolOutput {
+        id: String,
+        text: String,
+        elapsed_ms: Option<u64>,
     },
     Answer {
         text: String,
@@ -77,4 +100,18 @@ pub enum ProgressStatus {
     Completed,
     Failed,
     Stopped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WebAction {
+    Search {
+        queries: Vec<String>,
+    },
+    OpenPage {
+        url: Option<String>,
+    },
+    FindInPage {
+        url: Option<String>,
+        pattern: Option<String>,
+    },
 }

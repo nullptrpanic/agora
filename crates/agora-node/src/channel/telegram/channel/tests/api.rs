@@ -75,6 +75,7 @@ async fn telegram_send_does_not_accept_an_edit_noop_error() {
         message_id: 7,
         message_thread_id: None,
         is_private: true,
+        mention: None,
     };
 
     assert!(
@@ -342,6 +343,7 @@ async fn telegram_api_rejects_false_callback_draft_and_failed_download_results()
         message_id: 2,
         message_thread_id: None,
         is_private: true,
+        mention: None,
     };
 
     assert!(api.answer_callback_query("query").await.is_err());
@@ -387,6 +389,7 @@ async fn telegram_api_does_not_retry_non_idempotent_message_sends() {
         message_id: 31,
         message_thread_id: None,
         is_private: true,
+        mention: None,
     };
 
     let error = api
@@ -701,6 +704,14 @@ async fn telegram_channel_replies_to_denied_messages_and_returns_the_next_allowe
             "getUpdates" => {
                 r#"[
                     {
+                        "update_id":599,
+                        "message":{"message_id":39,"from":{"id":42},"chat":{"id":-2002,"type":"group"},"text":"普通聊天"}
+                    },
+                    {
+                        "update_id":600,
+                        "message":{"message_id":40,"from":{"id":42},"chat":{"id":-2002,"type":"group"},"text":"@agora_bot can I use this?"}
+                    },
+                    {
                         "update_id":601,
                         "message":{
                             "message_id":41,
@@ -736,9 +747,23 @@ async fn telegram_channel_replies_to_denied_messages_and_returns_the_next_allowe
 
     assert_eq!(task.input().message().unwrap().text(), "allowed");
     let requests = server.requests().await;
+    let notices: Vec<_> = requests
+        .iter()
+        .filter(|request| request.endpoint() == "sendRichMessage")
+        .map(|r| serde_json::from_str::<serde_json::Value>(&r.body).unwrap())
+        .collect();
+    assert_eq!(notices.len(), 2);
+    assert_eq!(notices[0]["reply_parameters"]["message_id"], 40);
+    assert!(
+        notices[0]["rich_message"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("tg://user?id=42")
+    );
     let denial = requests
         .iter()
-        .find(|request| request.endpoint() == "sendRichMessage")
+        .filter(|r| r.endpoint() == "sendRichMessage")
+        .nth(1)
         .unwrap();
     assert!(denial.body.contains("Channel：`telegram-test`"));
     assert!(denial.body.contains("User ID：`7`"));
@@ -898,7 +923,7 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
     assert_eq!(
         active["rich_message"]["markdown"],
         format!(
-            "**codex** · ● 运行中\n\n> {}",
+            "<details open><summary>运行中</summary>\n\ncodex：{}\n\n</details>",
             crate::i18n::WAITING_FOR_AGENT
         )
     );
@@ -945,7 +970,7 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
     let streaming: serde_json::Value = serde_json::from_str(&streaming.body).unwrap();
     assert_eq!(streaming["message_id"], 88);
     assert!(
-        streaming["rich_message"]["markdown"]
+        !streaming["rich_message"]["markdown"]
             .as_str()
             .unwrap()
             .contains("Inspecting the project")
@@ -972,6 +997,7 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
         .rfind(|request| request.endpoint() == "editMessageText")
         .unwrap();
     let terminal: serde_json::Value = serde_json::from_str(&terminal.body).unwrap();
+    assert_eq!(terminal["rich_message"]["markdown"], "已停止");
     assert_eq!(
         terminal["reply_markup"]["inline_keyboard"],
         serde_json::json!([])

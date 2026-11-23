@@ -2,6 +2,116 @@ use super::*;
 
 #[cfg(unix)]
 #[tokio::test]
+async fn codex_web_actions_preserve_queries_targets_and_legacy_text() {
+    use agora_node::task::WebAction;
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(&script, "#!/bin/sh\ncat >/dev/null\ncat events.jsonl\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let search = |queries: &[&str]| WebAction::Search {
+        queries: queries.iter().map(|q| (*q).into()).collect(),
+    };
+    let cases = [
+        (json!({"query":" 上海\n天气 "}), search(&["上海 天气"])),
+        (
+            json!({"query":"", "action":{"type":"search", "query":"上海天气"}}),
+            search(&["上海天气"]),
+        ),
+        (
+            json!({"query":"", "action":{"type":"search", "queries":["", "上海天气", "北京天气"]}}),
+            search(&["上海天气", "北京天气"]),
+        ),
+        (
+            json!({"query":"fallback", "action":{"type":"search", "query":"single", "queries":[" "]}}),
+            search(&["single"]),
+        ),
+        (
+            json!({"query":"fallback", "action":{"type":"search", "queries":[" "]}}),
+            search(&["fallback"]),
+        ),
+        (
+            json!({"query":"", "action":{"type":"open_page", "url":"https://example.com/weather"}}),
+            WebAction::OpenPage {
+                url: Some("https://example.com/weather".into()),
+            },
+        ),
+        (
+            json!({"query":"", "action":{"type":"find_in_page", "url":"https://example.com/weather", "pattern":"降雨"}}),
+            WebAction::FindInPage {
+                url: Some("https://example.com/weather".into()),
+                pattern: Some("降雨".into()),
+            },
+        ),
+        (
+            json!({"action":{"type":"open_page"}}),
+            WebAction::OpenPage { url: None },
+        ),
+        (
+            json!({"action":{"type":"find_in_page", "pattern":"降雨"}}),
+            WebAction::FindInPage {
+                url: None,
+                pattern: Some("降雨".into()),
+            },
+        ),
+        (
+            json!({"query":" \n ", "action":{"type":"search", "queries":[" "]}}),
+            search(&[]),
+        ),
+        (json!({"action":{"type":"other"}}), search(&[])),
+    ];
+    let mut events = vec![json!({"type":"thread.started", "thread_id":"web-actions"})];
+    for (index, (item, _)) in cases.iter().enumerate() {
+        let mut item = item.clone();
+        item["id"] = json!(format!("search-{index}"));
+        item["type"] = json!("web_search");
+        events.push(json!({"type":"item.completed", "item":item}));
+    }
+    events.extend([
+        json!({"type":"item.started", "item":{"id":"late-query", "type":"web_search", "query":"", "action":{"type":"other"}}}),
+        json!({"type":"item.completed", "item":{"id":"late-query", "type":"web_search", "query":"上海实时天气", "action":{"type":"search", "query":"上海实时天气"}}}),
+    ]);
+    std::fs::write(
+        temp.path().join("events.jsonl"),
+        events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let agent =
+        ConfiguredAgent::from_config(agent(AgentType::Codex, &script, temp.path())).unwrap();
+    let mut output = VecAgentOutput::default();
+    agent
+        .run(
+            AgentTask::new("查天气"),
+            None,
+            AgentRunControl::new(),
+            &mut output,
+        )
+        .await
+        .unwrap();
+    for (index, (_, expected)) in cases.iter().enumerate() {
+        assert!(output.events.iter().any(|event| matches!(event, OutputEvent::ToolCall { id, web_action:Some(action), status:ProgressStatus::Completed, .. } if id == &format!("search-{index}") && action == expected)), "missing web action: {expected:?}; got {:?}", output.events);
+    }
+    assert!(output.events.contains(&OutputEvent::ToolCall {
+        id: "late-query".into(),
+        text: "Search ``".into(),
+        web_action: Some(search(&[])),
+        status: ProgressStatus::Running,
+    }));
+    assert!(output.events.contains(&OutputEvent::ToolCall {
+        id: "late-query".into(),
+        text: "Search `上海实时天气`".into(),
+        web_action: Some(search(&["上海实时天气"])),
+        status: ProgressStatus::Completed,
+    }));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn codex_agent_uses_the_session_supplied_by_its_caller() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -136,13 +246,20 @@ async fn codex_agent_classifies_thinking_progress_and_final_answer() {
         .await
         .unwrap();
 
+    let elapsed_ms = output.events.iter().find_map(|event| match event {
+        OutputEvent::ToolOutput { id, elapsed_ms, .. } if id == "cmd-1" => *elapsed_ms,
+        _ => None,
+    });
+    assert!(
+        elapsed_ms.is_some(),
+        "command completion retains observed duration"
+    );
     assert_eq!(
         output.events,
         vec![
-            OutputEvent::Progress {
+            OutputEvent::Commentary {
                 id: "msg-0".to_string(),
                 text: "I will inspect the channel path".to_string(),
-                status: ProgressStatus::Completed,
             },
             OutputEvent::Thinking {
                 text: "Inspecting the channel path".to_string(),
@@ -158,6 +275,11 @@ async fn codex_agent_classifies_thinking_progress_and_final_answer() {
                 command: "cargo test".to_string(),
                 status: ProgressStatus::Completed,
                 exit_code: Some(0),
+            },
+            OutputEvent::ToolOutput {
+                id: "cmd-1".to_string(),
+                text: "ok".to_string(),
+                elapsed_ms,
             },
             OutputEvent::Answer {
                 text: "All checks passed".to_string(),
@@ -449,10 +571,9 @@ async fn codex_agent_maps_all_supported_json_events_and_stream_boundaries() {
     assert!(output.events.contains(&OutputEvent::Answer {
         text: "plain output\n".to_string(),
     }));
-    assert!(output.events.contains(&OutputEvent::Progress {
+    assert!(output.events.contains(&OutputEvent::Commentary {
         id: "agent-message".to_string(),
         text: "intermediate answer".to_string(),
-        status: ProgressStatus::Completed,
     }));
     assert!(output.events.contains(&OutputEvent::Thinking {
         text: "compact reasoning".to_string(),
@@ -463,7 +584,8 @@ async fn codex_agent_maps_all_supported_json_events_and_stream_boundaries() {
         status: ProgressStatus::Failed,
         exit_code: None,
     }));
-    assert!(output.events.contains(&OutputEvent::Progress {
+    assert!(output.events.contains(&OutputEvent::ToolCall {
+        web_action: None,
         id: "files-1".to_string(),
         text: "Changed 2 file(s)".to_string(),
         status: ProgressStatus::Running,
@@ -473,20 +595,23 @@ async fn codex_agent_maps_all_supported_json_events_and_stream_boundaries() {
         text: "Plan progress: 1/2".to_string(),
         status: ProgressStatus::Completed,
     }));
-    assert!(output.events.contains(&OutputEvent::Progress {
+    assert!(output.events.contains(&OutputEvent::ToolCall {
+        web_action: None,
         id: "mcp-1".to_string(),
         text: "Call `docs/search`".to_string(),
         status: ProgressStatus::Running,
     }));
-    assert!(output.events.contains(&OutputEvent::Progress {
+    assert!(output.events.contains(&OutputEvent::ToolCall {
+        web_action: Some(agora_node::task::WebAction::Search {
+            queries: vec!["find `docs`".into()]
+        }),
         id: "search-1".to_string(),
         text: "Search `find 'docs'`".to_string(),
         status: ProgressStatus::Completed,
     }));
-    assert!(output.events.contains(&OutputEvent::Progress {
+    assert!(output.events.contains(&OutputEvent::Diagnostic {
         id: "codex-progress".to_string(),
         text: "codex item failed".to_string(),
-        status: ProgressStatus::Failed,
     }));
     assert!(output.events.contains(&OutputEvent::Answer {
         text: "turn failed detail".to_string(),
@@ -549,7 +674,7 @@ async fn codex_agent_truncates_intermediate_messages_and_ignores_unknown_events(
         .events
         .iter()
         .find_map(|event| match event {
-            OutputEvent::Progress { id, text, .. } if id == "long-message" => Some(text),
+            OutputEvent::Commentary { id, text } if id == "long-message" => Some(text),
             _ => None,
         })
         .unwrap();
@@ -581,4 +706,42 @@ async fn codex_agent_reports_delete_failures_with_stdout_and_stderr() {
     assert!(message.contains("exit_code=7"));
     assert!(message.contains("stdout detail"));
     assert!(message.contains("stderr detail"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn final_answer_survives_closing_plan_snapshot() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(&script, "#!/bin/sh\ncat >/dev/null\ncat events.jsonl\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(temp.path().join("events.jsonl"), concat!(
+        "{\"type\":\"thread.started\",\"thread_id\":\"review\"}\n",
+        "{\"type\":\"turn.started\"}\n",
+        "{\"type\":\"item.started\",\"item\":{\"id\":\"plan\",\"type\":\"todo_list\",\"items\":[{\"text\":\"Verify\",\"completed\":false}]}}\n",
+        "{\"type\":\"item.started\",\"item\":{\"id\":\"cmd\",\"type\":\"command_execution\",\"command\":\"true\"}}\n",
+        "{\"type\":\"item.completed\",\"item\":{\"id\":\"answer\",\"type\":\"agent_message\",\"text\":\"Final answer from the completed task\"}}\n",
+        "{\"type\":\"item.completed\",\"item\":{\"id\":\"cmd\",\"type\":\"command_execution\",\"command\":\"true\",\"exit_code\":0}}\n",
+        "{\"type\":\"item.completed\",\"item\":{\"id\":\"plan\",\"type\":\"todo_list\",\"items\":[{\"text\":\"Verify\",\"completed\":true}]}}\n",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"cached_input_tokens\":0,\"output_tokens\":5}}\n",
+    )).unwrap();
+    let agent =
+        ConfiguredAgent::from_config(agent(AgentType::Codex, &script, temp.path())).unwrap();
+    let mut output = VecAgentOutput::default();
+    let result = completed(
+        agent
+            .run(
+                AgentTask::new("run"),
+                None,
+                AgentRunControl::new(),
+                &mut output,
+            )
+            .await
+            .unwrap(),
+    );
+    let commentary = output.events.iter().any(|e| matches!(e, OutputEvent::Commentary {id, text} if id == "answer" && text == "Final answer from the completed task"));
+    assert_eq!(result.exit_code(), 0);
+    assert_eq!(output.answer_text(), "Final answer from the completed task");
+    assert!(!commentary);
 }

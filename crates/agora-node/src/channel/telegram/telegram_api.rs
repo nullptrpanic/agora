@@ -244,6 +244,12 @@ impl TelegramApi {
         Ok(())
     }
 
+    pub(super) fn send_was_rejected(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<TelegramApiError>()
+            .is_some_and(|error| error.rejected)
+    }
+
     pub(super) async fn send_rich_message(
         &self,
         target: &TelegramReplyTarget,
@@ -392,6 +398,7 @@ impl TelegramApi {
                 .unwrap_or_else(|| "unknown Telegram API error".to_string());
             return Err(TelegramApiError {
                 retryable,
+                rejected: true,
                 message_not_modified: method == "editMessageText"
                     && error_code == Some(400)
                     && (description == "Bad Request: message is not modified"
@@ -460,6 +467,7 @@ impl TelegramApi {
 #[derive(Debug)]
 struct TelegramApiError {
     retryable: bool,
+    rejected: bool,
     message_not_modified: bool,
     message: String,
 }
@@ -468,6 +476,7 @@ impl TelegramApiError {
     fn new(retryable: bool, message: impl Into<String>) -> Self {
         Self {
             retryable,
+            rejected: false,
             message_not_modified: false,
             message: message.into(),
         }

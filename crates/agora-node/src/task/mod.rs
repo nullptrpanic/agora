@@ -1,7 +1,11 @@
+mod conversation;
 mod output;
 
+pub use conversation::ConversationContext;
+pub(crate) use conversation::ConversationMention;
+
 pub(crate) use output::{MAX_OUTPUT_IMAGE_BYTES, MAX_OUTPUT_IMAGE_TOTAL_BYTES, MAX_OUTPUT_IMAGES};
-pub use output::{OutputEvent, OutputImage, ProgressStatus, TokenUsage};
+pub use output::{OutputEvent, OutputImage, ProgressStatus, TokenUsage, WebAction};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

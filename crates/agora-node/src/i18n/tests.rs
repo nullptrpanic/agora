@@ -1,20 +1,6 @@
 use super::*;
 
 #[test]
-fn shared_token_format_handles_unit_boundaries() {
-    for (tokens, expected) in [
-        (0, "0"),
-        (999, "999"),
-        (1000, "1.0K"),
-        (58_800, "58.8K"),
-        (1_000_000, "1.0M"),
-    ] {
-        assert_eq!(format_tokens(tokens), expected);
-    }
-}
-use crate::task::ProgressStatus;
-
-#[test]
 fn chinese_copy_covers_every_status_and_failure_category() {
     assert_eq!(run_status(RunStatus::Queued), "排队中");
     assert_eq!(run_status(RunStatus::Running), "运行中");
@@ -22,11 +8,6 @@ fn chinese_copy_covers_every_status_and_failure_category() {
     assert_eq!(run_status(RunStatus::Failed), "失败");
     assert_eq!(run_status(RunStatus::Stopped), "已停止");
     assert_eq!(run_status(RunStatus::Interrupted), "已中断");
-
-    assert_eq!(progress_count(ProgressStatus::Running, 2), "2 项进行中");
-    assert_eq!(progress_count(ProgressStatus::Completed, 2), "2 项已完成");
-    assert_eq!(progress_count(ProgressStatus::Failed, 2), "2 项失败");
-    assert_eq!(progress_count(ProgressStatus::Stopped, 2), "2 项已停止");
 
     assert_eq!(failure_copy("request timed out").category, "执行超时");
     assert_eq!(failure_copy("session unavailable").category, "会话不可用");
@@ -37,9 +18,8 @@ fn chinese_copy_covers_every_status_and_failure_category() {
 
 #[test]
 fn chinese_copy_formats_dynamic_command_and_agent_messages() {
-    assert_eq!(phase_count(3), "3 个阶段");
+    assert_eq!(tool_call_count(2), "已调用 2 次工具");
     assert_eq!(queued_message(4), "正在排队，前面还有 4 个任务...");
-    assert_eq!(cached_tokens(12), "12 cached");
     assert_eq!(
         unknown_agent("reviewer"),
         "当前对话中不存在 Agent：reviewer。"

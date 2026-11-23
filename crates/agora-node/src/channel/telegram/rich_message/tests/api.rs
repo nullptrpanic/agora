@@ -101,7 +101,8 @@ async fn telegram_slow_delivery_has_one_update_worker_and_keeps_latest_snapshot(
     let delivery = message.inner.delivery_lock.lock().await;
     for index in 0..32 {
         message
-            .publish(RunEvent::Output(OutputEvent::Thinking {
+            .publish(RunEvent::Output(OutputEvent::Commentary {
+                id: "progress".into(),
                 text: format!("newest-{index}"),
             }))
             .await
@@ -270,7 +271,8 @@ async fn background_flush_does_not_retry_a_non_idempotent_initial_send() {
     );
 
     message
-        .publish(RunEvent::Output(OutputEvent::Thinking {
+        .publish(RunEvent::Output(OutputEvent::Commentary {
+            id: "inspect".into(),
             text: "Inspecting".to_string(),
         }))
         .await
@@ -279,6 +281,88 @@ async fn background_flush_does_not_retry_a_non_idempotent_initial_send() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert_eq!(server.endpoint_count("sendRichMessage").await, 1);
+}
+
+#[tokio::test]
+async fn private_reply_shows_two_curl_actions_in_their_commentary_steps() {
+    let server = rich_message_server().await;
+    let message = TelegramRichMessage::with_timing(
+        private_target(),
+        "agent".into(),
+        telegram_api(&server),
+        TelegramRichTiming::new(Duration::from_millis(5), Duration::from_secs(5)),
+    );
+    let first = "/bin/bash -lc 'timeout 15s curl https qq'";
+    let retry = r#"/bin/bash -lc "curl -sS --max-time 12 -o /dev/null -w 'HTTP %{http_code}\nProxy CONNECT %{http_connect}' https://qq.com""#;
+    for (id, commentary, command, output) in [
+        (
+            "first",
+            "我先按原命令执行。",
+            first,
+            "503 Forwarding failure",
+        ),
+        ("retry", "我用完整网址再试一次。", retry, "HTTP 302"),
+    ] {
+        for event in [
+            OutputEvent::Commentary {
+                id: format!("{id}-note"),
+                text: commentary.into(),
+            },
+            OutputEvent::CommandExecution {
+                id: id.into(),
+                command: command.into(),
+                status: ProgressStatus::Completed,
+                exit_code: Some(0),
+            },
+            OutputEvent::ToolOutput {
+                id: id.into(),
+                text: output.into(),
+                elapsed_ms: Some(250),
+            },
+        ] {
+            message.publish(RunEvent::Output(event)).await.unwrap();
+        }
+    }
+    message
+        .publish(RunEvent::Output(OutputEvent::Answer {
+            text: "完整网址返回 HTTP 302。".into(),
+        }))
+        .await
+        .unwrap();
+    message
+        .publish(RunEvent::Completed { exit_code: 0 })
+        .await
+        .unwrap();
+
+    let requests = server.requests().await;
+    let mut final_replies = requests
+        .iter()
+        .filter(|r| r.endpoint() == "sendRichMessage");
+    let body: serde_json::Value =
+        serde_json::from_str(&final_replies.next().unwrap().body).unwrap();
+    assert!(final_replies.next().is_none());
+    assert_eq!(body["reply_parameters"]["message_id"], 7);
+    let markdown = body["rich_message"]["markdown"].as_str().unwrap();
+    assert!(markdown.starts_with("完整网址返回 HTTP 302。\n\n<details><summary>已完成</summary>"));
+    assert!(!markdown.contains("\n\nagent\n") && !markdown.contains("已调用 1 次工具"));
+    let mut rest = markdown;
+    for (note, title, command, output) in [
+        (
+            "我先按原命令执行。",
+            "运行 curl",
+            first,
+            "503 Forwarding failure",
+        ),
+        ("我用完整网址再试一次。", "请求 qq.com", retry, "HTTP 302"),
+    ] {
+        let row = format!(
+            "{note}\n\n<details><summary>{title}</summary>\n\n<pre><code class=\"language-bash\">$ {command}\n\n{output}\n\n✓ Success · 约 0.250 秒</code></pre>"
+        );
+        rest = rest
+            .split_once(&row)
+            .expect("action should appear in its own step")
+            .1;
+    }
 }
 
 #[tokio::test]
@@ -300,10 +384,17 @@ async fn private_run_streams_a_draft_and_persists_one_final_reply() {
     server
         .wait_for_endpoint_count("sendRichMessageDraft", 1)
         .await;
+    message
+        .publish(RunEvent::Output(OutputEvent::Thinking {
+            text: "hidden summary".into(),
+        }))
+        .await
+        .unwrap();
     for index in 0..3 {
         message
-            .publish(RunEvent::Output(OutputEvent::Thinking {
-                text: format!("Thinking {index}"),
+            .publish(RunEvent::Output(OutputEvent::Commentary {
+                id: format!("step-{index}"),
+                text: format!("Step {index}"),
             }))
             .await
             .unwrap();
@@ -340,18 +431,21 @@ async fn private_run_streams_a_draft_and_persists_one_final_reply() {
         latest_draft["rich_message"]["markdown"]
             .as_str()
             .unwrap()
-            .contains("Thinking 2")
+            .contains("Step 2")
     );
     let final_body: serde_json::Value = serde_json::from_str(&finals[0].body).unwrap();
     assert_eq!(final_body["chat_id"], 1);
     assert_eq!(final_body["reply_parameters"]["message_id"], 7);
     assert_eq!(final_body["message_thread_id"], 44);
     let final_markdown = final_body["rich_message"]["markdown"].as_str().unwrap();
-    assert!(final_markdown.starts_with(
-        "**codex-dev** · ✓ 已完成\n\n<details><summary>任务过程 · 3 个阶段</summary>"
-    ));
-    assert!(final_markdown.contains("**01 · 思考过程**\n\n> ✦ Thinking 0"));
-    assert!(final_markdown.contains("**03 · 思考过程**\n\n> ✦ Thinking 2"));
+    assert!(final_markdown.starts_with("<details><summary>已完成</summary>"));
+    assert!(final_markdown.contains("Step 0"));
+    assert!(final_markdown.contains("Step 2"));
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.body.contains("hidden summary"))
+    );
     assert!(final_markdown.ends_with("</details>"));
 }
 
@@ -370,7 +464,7 @@ async fn completed_run_sends_as_many_bounded_messages_as_needed() {
         text: answer.clone(),
     }));
     expected.apply(RunEvent::Completed { exit_code: 0 });
-    let expected = expected.render_messages(false);
+    let expected = expected.render_messages(false, None);
     assert!(expected.len() > 2);
 
     message
@@ -435,7 +529,7 @@ async fn terminal_retry_reuses_multipart_messages_that_were_already_sent() {
         text: answer.clone(),
     }));
     expected.apply(RunEvent::Completed { exit_code: 0 });
-    let expected = expected.render_messages(false);
+    let expected = expected.render_messages(false, None);
     assert_eq!(expected.len(), 2);
 
     message
@@ -575,7 +669,8 @@ async fn group_run_sends_once_and_edits_the_same_topic_message() {
         .unwrap();
     server.wait_for_endpoint_count("sendRichMessage", 1).await;
     message
-        .publish(RunEvent::Output(OutputEvent::Thinking {
+        .publish(RunEvent::Output(OutputEvent::Commentary {
+            id: "inspect".into(),
             text: "Inspecting".to_string(),
         }))
         .await
@@ -661,4 +756,49 @@ async fn subscribed_agents_keep_independent_telegram_messages() {
         })
         .collect::<Vec<_>>();
     assert_eq!(edited_ids, vec![100, 101]);
+}
+
+#[tokio::test]
+async fn ambiguous_multipart_send_is_never_repeated() {
+    let sends = std::sync::atomic::AtomicUsize::new(0);
+    let server = HttpMockServer::start(move |request| match request.endpoint() {
+        "sendRichMessage" => match sends.fetch_add(1, Ordering::SeqCst) {
+            0 => MockResponse::json(r#"{"ok":true,"result":{"message_id":100}}"#),
+            1 => MockResponse::json(r#"{"ok":true,"result":{"message_id":"#),
+            _ => MockResponse::json(r#"{"ok":true,"result":{"message_id":102}}"#),
+        },
+        "editMessageText" => MockResponse::json(r#"{"ok":true,"result":{"message_id":100}}"#),
+        other => panic!("unexpected endpoint {other}"),
+    })
+    .await;
+    let message = TelegramRichMessage::with_timing(
+        group_target(),
+        "review".into(),
+        telegram_api(&server),
+        TelegramRichTiming {
+            update_interval: Duration::from_secs(3600),
+            heartbeat_interval: Duration::from_secs(3600),
+            retry_interval: Duration::from_millis(10),
+        },
+    );
+    message
+        .publish(RunEvent::Queued { ahead: 0 })
+        .await
+        .unwrap();
+    message
+        .publish(RunEvent::Output(OutputEvent::Answer {
+            text: "x".repeat(40000),
+        }))
+        .await
+        .unwrap();
+    assert!(
+        message
+            .publish(RunEvent::Completed { exit_code: 0 })
+            .await
+            .is_err()
+    );
+    // A later flush and the automatic retry must both respect the unknown receipt.
+    let _ = message.publish(RunEvent::Completed { exit_code: 0 }).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(server.endpoint_count("sendRichMessage").await, 2);
 }

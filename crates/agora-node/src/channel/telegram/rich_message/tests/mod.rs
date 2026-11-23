@@ -32,6 +32,7 @@ fn private_target() -> TelegramReplyTarget {
         message_id: 7,
         message_thread_id: Some(44),
         is_private: true,
+        mention: None,
     }
 }
 
@@ -41,6 +42,7 @@ fn group_target() -> TelegramReplyTarget {
         message_id: 12,
         message_thread_id: Some(44),
         is_private: false,
+        mention: None,
     }
 }
 

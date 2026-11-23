@@ -48,6 +48,6 @@ impl StopCommand {
                 None => ChannelReply::new(i18n::no_running_agents()),
             };
         }
-        ChannelReply::new(i18n::stopped_agents(stopped))
+        ChannelReply::StopAccepted(i18n::stopped_agents(stopped))
     }
 }

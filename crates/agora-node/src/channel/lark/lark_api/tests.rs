@@ -57,7 +57,8 @@ async fn lark_card_serialized_budget_is_enforced_before_http() {
         api.reply_card(
             "token",
             &LarkReplyTarget {
-                message_id: "source".into()
+                message_id: "source".into(),
+                mention_user_id: Some("ou_sender".into()),
             },
             &card
         )
@@ -76,17 +77,17 @@ async fn tenant_token_cache_obeys_server_expiry_and_preserves_newer_tokens() {
     ])
     .await;
     let api = LarkApi::with_base_url(config(), server.base_url()).unwrap();
-    assert_eq!(api.cached_tenant_access_token().await.unwrap(), "first");
-    assert_eq!(api.cached_tenant_access_token().await.unwrap(), "first");
+    assert_eq!(api.tenant_access_token().await.unwrap(), "first");
+    assert_eq!(api.tenant_access_token().await.unwrap(), "first");
     {
         let mut cache = api.token_cache.lock().await;
         let token = cache.as_mut().unwrap();
         assert!(token.expires_at <= Instant::now() + Duration::from_secs(10));
         token.expires_at = Instant::now() - Duration::from_secs(1);
     }
-    assert_eq!(api.cached_tenant_access_token().await.unwrap(), "second");
+    assert_eq!(api.tenant_access_token().await.unwrap(), "second");
     api.invalidate_cached_tenant_access_token("first").await;
-    assert_eq!(api.cached_tenant_access_token().await.unwrap(), "second");
+    assert_eq!(api.tenant_access_token().await.unwrap(), "second");
     assert_eq!(server.requests().await.len(), 2);
 }
 
@@ -100,7 +101,7 @@ async fn tenant_token_cache_rejects_invalid_token_or_lifetime() {
     ] {
         let server = HttpMockServer::start_json_queue([body]).await;
         let api = LarkApi::with_base_url(config(), server.base_url()).unwrap();
-        assert!(api.cached_tenant_access_token().await.is_err(), "{body}");
+        assert!(api.tenant_access_token().await.is_err(), "{body}");
         assert!(api.token_cache.lock().await.is_none());
     }
 }

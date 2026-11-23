@@ -6,7 +6,7 @@ A chat message should not become a blind remote shell. Agora Node turns it into 
 
 ## Highlights
 
-- **The conversation shows the work, not just the result.** Native Lark cards and Telegram Rich Messages expose lifecycle state, reasoning summaries, complete commands, progress, answers, and token usage as the run evolves.
+- **Agent replies show progress as work runs.** Lark groups progress updates and tool calls in an expandable message, then sends the final answer as a separate reply. Telegram puts the answer and expandable process in the same reply. Both channels show tool results and hide reasoning summaries and token counts.
 - **Context continues across messages.** Codex thread IDs remain opaque to Node but persist locally and resume by shared or per-conversation scope; users can explicitly stop work or reset that context.
 - **One channel can host a team of agents.** Subscriptions fan an ordinary message out to several specialists, while `/ask` targets, enables, or disables one agent without deploying another bot.
 - **Load becomes visible backpressure, not resource exhaustion.** Task admission, queued runs, and active backends have explicit limits. Capacity is reserved before source delivery is confirmed, and overload receives a clear busy response.

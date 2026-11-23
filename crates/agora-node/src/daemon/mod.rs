@@ -219,11 +219,9 @@ impl AgentDispatcher {
                 let _ = published.send(result);
                 if !visible || start.wait_for(|started| *started).await.is_err() {
                     drop(execution);
-                    let result = tokio::time::timeout(
-                        SHUTDOWN_RUN_TIMEOUT,
-                        output.failed("task initialization failed or was cancelled".to_string()),
-                    )
-                    .await;
+                    let result =
+                        tokio::time::timeout(SHUTDOWN_RUN_TIMEOUT, output.run.admission_deferred())
+                            .await;
                     drop(completion);
                     return result?;
                 }

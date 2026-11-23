@@ -65,7 +65,9 @@ async fn channel_loop_routes_stop_without_sending_it_to_the_agent() {
     assert_eq!(contexts.lock().unwrap().as_slice(), ["codex-dev"]);
     assert_eq!(
         replies.lock().unwrap().as_slice(),
-        [ChannelReply::new("已停止 1 个 Agent：codex-dev。")]
+        [ChannelReply::StopAccepted(
+            "已停止 1 个 Agent：codex-dev。".into()
+        )]
     );
     daemon.abort();
 }

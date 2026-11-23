@@ -11,13 +11,16 @@ use crate::config::ChannelPermissionConfig;
 use crate::config::TelegramChannelConfig;
 use crate::i18n;
 use crate::store::ChannelIdentity;
-use crate::task::{ChannelTaskInput, TaskAttachment, TaskContent};
+use crate::task::{ChannelTaskInput, ConversationContext, TaskAttachment, TaskContent};
 use agora_core::logger;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::VecDeque;
 use tokio::sync::oneshot;
+
+mod context;
+use context::Entity;
 
 const TELEGRAM_INTERRUPT_PREFIX: &str = "agora_interrupt:";
 const TELEGRAM_IMAGE_MAX_ATTEMPTS: usize = 3;
@@ -170,7 +173,7 @@ impl TelegramChannel {
                             let api = self.api.clone();
                             self.permission
                                 .admit(self.api.name(), &context, move |denial| async move {
-                                    let markdown = denial.markdown();
+                                    let markdown = target.addressed(denial.markdown());
                                     api.send_rich_message(&target, &markdown, None).await
                                 })
                                 .await
@@ -204,7 +207,7 @@ impl TelegramChannel {
                         if !self
                             .permission
                             .admit(self.api.name(), &context, move |denial| async move {
-                                let markdown = denial.markdown();
+                                let markdown = target.addressed(denial.markdown());
                                 api.send_rich_message(&target, &markdown, None).await
                             })
                             .await
@@ -373,7 +376,7 @@ impl TelegramChannel {
 
     pub(super) fn render_reply(reply: &ChannelReply) -> String {
         match reply {
-            ChannelReply::Text(text) => text.clone(),
+            ChannelReply::Text(text) | ChannelReply::StopAccepted(text) => text.clone(),
             ChannelReply::AgentList(agents) => {
                 let mut sections = vec![format!(
                     "**{}**\n> {}",
@@ -423,6 +426,9 @@ impl ChannelSender for TelegramChannelSender {
         self.identity.clone()
     }
 
+    fn conversation_context(&self, task: &Self::Task) -> Option<ConversationContext> {
+        Some((*task.context).clone())
+    }
     async fn open_run(&self, task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
         let interrupt = context
             .interrupt
@@ -438,10 +444,15 @@ impl ChannelSender for TelegramChannelSender {
     }
 
     async fn reply(&self, task: &Self::Task, reply: ChannelReply) -> Result<()> {
+        if matches!(reply, ChannelReply::StopAccepted(_)) {
+            return Ok(());
+        }
         self.api
             .send_rich_message(
                 task.reply_target(),
-                &TelegramChannel::render_reply(&reply),
+                &task
+                    .reply_target()
+                    .addressed(TelegramChannel::render_reply(&reply)),
                 None,
             )
             .await?;
@@ -457,6 +468,9 @@ impl ChannelSender for TelegramChannel {
     }
     fn identity(&self) -> ChannelIdentity {
         self.identity.clone()
+    }
+    fn conversation_context(&self, task: &Self::Task) -> Option<ConversationContext> {
+        self.sender().conversation_context(task)
     }
     async fn open_run(&self, task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
         self.sender().open_run(task, context).await
@@ -484,6 +498,16 @@ pub(super) struct TelegramReplyTarget {
     pub(super) message_id: i64,
     pub(super) message_thread_id: Option<i64>,
     pub(super) is_private: bool,
+    pub(super) mention: Option<String>,
+}
+
+impl TelegramReplyTarget {
+    fn addressed(&self, text: String) -> String {
+        match &self.mention {
+            Some(mention) => format!("{mention}\n\n{text}"),
+            None => text,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -496,6 +520,7 @@ pub struct TelegramTask {
     sender_id: String,
     group_id: Option<String>,
     mentioned_bot: bool,
+    context: Box<ConversationContext>,
 }
 
 impl TelegramTask {
@@ -560,7 +585,8 @@ impl TelegramUpdate {
         let mentioned_bot = message.mentions_bot(bot_username);
         let text = message.normalized_text(bot_username)?;
         let image_file_id = message.photo.last().map(|photo| photo.file_id.clone());
-        let sender_id = message.from.as_ref()?.id.to_string();
+        let sender = message.from.as_ref()?;
+        let sender_id = sender.id.to_string();
         let group_id = (!message.chat.is_private()).then(|| message.chat.id.to_string());
         let session_id = match message.message_thread_id {
             Some(thread_id) => {
@@ -573,6 +599,7 @@ impl TelegramUpdate {
             message_id: message.message_id,
             message_thread_id: message.message_thread_id,
             is_private: message.chat.is_private(),
+            mention: sender.mention(&message.chat, message.sender_chat.is_some()),
         };
         Some(TelegramTask {
             task_id: self.update_id.to_string(),
@@ -583,6 +610,7 @@ impl TelegramUpdate {
             sender_id,
             group_id,
             mentioned_bot,
+            context: Box::new(message.conversation_context(bot_username)),
         })
     }
 }
@@ -600,7 +628,8 @@ struct TelegramCallbackQuery {
 
 impl TelegramCallbackQuery {
     fn access(&self) -> Option<TelegramCallbackAccess> {
-        let sender_id = self.from.as_ref()?.id.to_string();
+        let sender = self.from.as_ref()?;
+        let sender_id = sender.id.to_string();
         let message = self.message.as_ref()?;
         let group_id = (!message.chat.is_private()).then(|| message.chat.id.to_string());
         Some(TelegramCallbackAccess {
@@ -611,6 +640,7 @@ impl TelegramCallbackQuery {
                 message_id: message.message_id,
                 message_thread_id: message.message_thread_id,
                 is_private: message.chat.is_private(),
+                mention: sender.mention(&message.chat, false),
             },
         })
     }
@@ -642,6 +672,19 @@ impl TelegramCallbackAccess {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct TelegramMessage {
     message_id: i64,
+    #[serde(default)]
+    date: i64,
+    edit_date: Option<i64>,
+    reply_to_message: Option<Box<TelegramMessage>>,
+    #[serde(default)]
+    entities: Vec<Entity>,
+    #[serde(default)]
+    caption_entities: Vec<Entity>,
+    #[serde(default)]
+    has_protected_content: bool,
+    sender_chat: Option<Value>,
+    receiver_user: Option<Value>,
+    ephemeral_message_id: Option<Value>,
     #[serde(default)]
     from: Option<TelegramSender>,
     #[serde(default)]
@@ -701,6 +744,36 @@ impl TelegramMessage {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct TelegramSender {
     id: i64,
+    #[serde(default)]
+    is_bot: bool,
+    first_name: Option<String>,
+    username: Option<String>,
+}
+
+impl TelegramSender {
+    fn mention(&self, chat: &TelegramChat, anonymous: bool) -> Option<String> {
+        if chat.is_private() || anonymous || self.is_bot || self.id <= 0 {
+            return None;
+        }
+        let label = self
+            .first_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or(self.username.as_deref())
+            .unwrap_or("")
+            .trim();
+        let mut escaped = String::new();
+        for ch in label.chars().filter(|ch| !ch.is_control()).take(64) {
+            if ch.is_ascii_punctuation() {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+        if escaped.is_empty() {
+            escaped = self.id.to_string();
+        }
+        Some(format!("[@{escaped}](tg://user?id={})", self.id))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

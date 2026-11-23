@@ -79,6 +79,68 @@ async fn codex_preserves_completed_mcp_image_content() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn codex_tool_outputs_preserve_text_and_failures_without_dumping_binary_blocks() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut mixed = tool(PNG);
+    mixed["result"]["content"].as_array_mut().unwrap().extend([
+        json!({"type":"text", "text":"Script completed\n```中🦀"}),
+        json!({"type":"audio", "data":"audio-must-not-be-log-text"}),
+        json!({"type":"text", "text":"{\"ok\":true}"}),
+    ]);
+    let output = execute(temp.path(), vec![
+        mixed,
+        json!({"id":"failed", "type":"mcp_tool_call", "status":"failed", "error":{"message":"tool timed out"}}),
+        json!({"id":"command", "type":"command_execution", "command":"cargo test", "status":"failed", "exit_code":7, "aggregated_output":"error: test failed\n"}),
+        json!({"id":"empty", "type":"command_execution", "command":"true", "status":"completed", "exit_code":0, "aggregated_output":""}),
+        answer("检查结束"),
+    ]).await;
+    let results: Vec<_> = output
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            OutputEvent::ToolOutput {
+                id,
+                text,
+                elapsed_ms,
+            } => Some((id.as_str(), text.as_str(), *elapsed_ms)),
+            _ => None,
+        })
+        .collect();
+    // No starts were supplied: the adapter must not invent elapsed time.
+    assert_eq!(
+        results,
+        vec![
+            (
+                "image-tool",
+                "Script completed\n```中🦀\n{\"ok\":true}",
+                None
+            ),
+            ("failed", "tool timed out", None),
+            ("command", "error: test failed\n", None),
+            ("empty", "", None),
+        ]
+    );
+    assert!(output.events.iter().any(|e| matches!(
+        e,
+        OutputEvent::CommandExecution {
+            status: ProgressStatus::Failed,
+            exit_code: Some(7),
+            ..
+        }
+    )));
+    assert_eq!(
+        output
+            .events
+            .iter()
+            .filter(|e| matches!(e, OutputEvent::Image { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(output.answer_text(), "检查结束");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn codex_materializes_markdown_images_but_preserves_code_and_links() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
