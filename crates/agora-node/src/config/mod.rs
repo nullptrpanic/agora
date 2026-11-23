@@ -9,7 +9,6 @@ use std::str::FromStr;
 pub mod generate;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<HttpProxy>,
@@ -20,7 +19,6 @@ pub struct NodeConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default = "default_max_in_flight_tasks")]
     pub max_in_flight_tasks: usize,
@@ -313,7 +311,6 @@ impl Serialize for HttpProxy {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub name: String,
     pub isolate: IsolateMode,
@@ -397,7 +394,6 @@ impl TelegramChannelConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AgentSubscription {
     pub channel: String,
     #[serde(default)]
@@ -412,7 +408,6 @@ pub enum ChannelConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct LarkChannelConfig {
     pub name: String,
     pub app_id: String,
@@ -424,7 +419,6 @@ pub struct LarkChannelConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct TelegramChannelConfig {
     pub name: String,
     pub token: String,
@@ -435,7 +429,6 @@ pub struct TelegramChannelConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ChannelPermissionConfig {
     #[serde(default)]
     pub users: Vec<ChannelUserPermissionConfig>,
@@ -444,13 +437,11 @@ pub struct ChannelPermissionConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ChannelUserPermissionConfig {
     pub id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ChannelGroupPermissionConfig {
     pub id: String,
     #[serde(default)]

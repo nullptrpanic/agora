@@ -22,8 +22,10 @@ fn executable_search_skips_non_executable_shadow_entries() {
 }
 
 #[test]
-fn hardening_rejects_unknown_fields_at_each_configuration_level() {
-    let base = serde_json::json!({"channels":[{"type":"lark","name":"lark","app_id":"id","secret":"secret","permission":{"users":[{"id":"u"}],"groups":[{"id":"g"}]}}],"agents":[{"name":"agent","isolate":"none","type":"custom","path":"agent","subscribe":[{"channel":"lark"}]}],"runtime":{}});
+fn ignores_unknown_fields_at_each_configuration_level() {
+    let base = serde_json::json!({"channels":[{"type":"lark","name":"lark","app_id":"id","secret":"secret","permission":{"users":[{"id":"u"}],"groups":[{"id":"g"}]}},{"type":"telegram","name":"telegram","token":"123:token","permission":{"users":[{"id":"123"}],"groups":[{"id":"-456"}]}}],"agents":[{"name":"agent","isolate":"none","type":"custom","path":"agent","subscribe":[{"channel":"lark"}]}],"runtime":{}});
+    let expected: NodeConfig = serde_json::from_value(base.clone()).unwrap();
+    expected.validate().unwrap();
     for pointer in [
         "",
         "/runtime",
@@ -31,6 +33,10 @@ fn hardening_rejects_unknown_fields_at_each_configuration_level() {
         "/channels/0/permission",
         "/channels/0/permission/users/0",
         "/channels/0/permission/groups/0",
+        "/channels/1",
+        "/channels/1/permission",
+        "/channels/1/permission/users/0",
+        "/channels/1/permission/groups/0",
         "/agents/0",
         "/agents/0/subscribe/0",
     ] {
@@ -40,10 +46,14 @@ fn hardening_rejects_unknown_fields_at_each_configuration_level() {
             .unwrap()
             .as_object_mut()
             .unwrap()
-            .insert("typo".into(), serde_json::json!(true));
-        assert!(
-            serde_json::from_value::<NodeConfig>(document).is_err(),
-            "silently accepted {pointer}/typo"
+            .insert(
+                "unknown".into(),
+                serde_json::json!({"nested": ["unused", 42, null]}),
+            );
+        assert_eq!(
+            serde_json::from_value::<NodeConfig>(document).unwrap(),
+            expected,
+            "unknown field at {pointer} changed the configuration"
         );
     }
 }

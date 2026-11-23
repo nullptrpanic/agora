@@ -67,7 +67,7 @@ Daemon process settings such as pid files, state directory, log level, and foreg
 
 This shape keeps channels and agents separate. `channels` defines named channel adapters. `agents` defines local agent entries with direct `isolate`, `type`, and `path` fields plus optional `workspace`, `model`, `effort`, `agent_sandbox`, `proxy`, `timeout_seconds`, and `max_output_bytes` overrides. The optional top-level `proxy` supplies the default HTTP proxy for every channel and agent that does not define its own value. The optional `runtime` object bounds live work; omitting the object or any of its fields selects the documented defaults.
 
-Every configuration object rejects unknown fields, including nested runtime, channel, permission, agent and subscription objects. The config file should parse as one object with `channels` and `agents` lists. A list with one channel and one agent is valid. Adding another local agent should only require appending another object to `agents` and subscribing it to one or more existing channel names.
+Every configuration object ignores unknown fields, including nested runtime, channel, permission, agent and subscription objects. Ignored fields are not stored or applied; required fields, types, enum values and validation rules for recognized fields remain enforced. The config file should parse as one object with `channels` and `agents` lists. A list with one channel and one agent is valid. Adding another local agent should only require appending another object to `agents` and subscribing it to one or more existing channel names.
 
 ## Fields
 
@@ -115,7 +115,7 @@ Private messages require the sender id to match `permission.users`. Group messag
 
 An unauthorized event is consumed by the channel and must not become a daemon `ChannelTask`. The shared channel-layer `PermissionGate` applies the policy, decides whether guidance should be delivered, invokes the channel-provided denial delivery callback when needed, and prevents rejected events from advancing. A concrete channel only extracts its native user, group, and mention identity and implements native denial delivery. The daemon and agents do not depend on channel permission details.
 
-The `model`, `effort`, and `agent_sandbox` fields are currently consumed only by `CodexAgent`. Other agent implementations remain responsible for defining and interpreting their own backend-specific execution options. Agent configuration has no arbitrary child-process `env` field. Unknown agent fields, including the removed legacy `env` field, fail deserialization with a field/line diagnostic.
+The `model`, `effort`, and `agent_sandbox` fields are currently consumed only by `CodexAgent`. Other agent implementations remain responsible for defining and interpreting their own backend-specific execution options. Agent configuration has no arbitrary child-process `env` field. Unknown agent fields, including the removed legacy `env` field, are ignored during deserialization and do not set child-process environment variables or proxy settings.
 
 `subscribe` lists channel subscriptions this agent consumes. Each entry must include `channel`, the name of a configured channel. The same channel name may appear in multiple agents' `subscribe` lists.
 
