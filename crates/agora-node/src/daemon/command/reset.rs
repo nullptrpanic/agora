@@ -26,7 +26,7 @@ impl ResetCommand {
                 let command = command.clone();
                 async move { command.reset(context, arguments).await }
             })
-            .control(),
+            .mutation(),
         )
     }
 

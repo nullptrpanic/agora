@@ -706,6 +706,7 @@ impl Daemon {
                 task.session_id(),
                 agents,
                 task.input(),
+                Some(task.task_id()),
                 admission.clone(),
             )
             .await?
@@ -717,10 +718,11 @@ impl Daemon {
             }
             CommandOutcome::Reply(reply) => {
                 admission.complete();
-                match reply {
-                    Some(reply) => channel.reply(&task, reply).await,
-                    None => Ok(()),
+                if let Some(reply) = reply {
+                    channel.reply(&task, reply).await?;
                 }
+                commands.reply_delivered(channel.identity(), task.session_id(), task.task_id());
+                Ok(())
             }
             CommandOutcome::Dispatch(dispatch) => {
                 let (agents, content) = dispatch.into_parts();

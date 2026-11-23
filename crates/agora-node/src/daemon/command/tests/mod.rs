@@ -118,6 +118,7 @@ impl AgentOutput for IgnoreAgentOutput {
 
 #[derive(Clone)]
 struct CommandTestTask {
+    fail_first_reply: bool,
     task_id: String,
     session_id: String,
     input: ChannelTaskInput,
@@ -126,6 +127,7 @@ struct CommandTestTask {
 impl CommandTestTask {
     fn new(task_id: &str, session_id: &str, content: &str) -> Self {
         Self {
+            fail_first_reply: false,
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
             input: ChannelTaskInput::Message(TaskContent::new(content)),
@@ -139,6 +141,7 @@ impl CommandTestTask {
         enabled: bool,
     ) -> Self {
         Self {
+            fail_first_reply: false,
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
             input: ChannelTaskInput::Command(
@@ -220,8 +223,12 @@ impl crate::channel::ChannelSender for CommandTestChannel {
         })
     }
 
-    async fn reply(&self, _task: &Self::Task, reply: ChannelReply) -> Result<()> {
-        self.replies.lock().unwrap().push(reply);
+    async fn reply(&self, task: &Self::Task, reply: ChannelReply) -> Result<()> {
+        let mut attempts = self.replies.lock().unwrap();
+        attempts.push(reply);
+        if task.fail_first_reply && attempts.len() == 1 {
+            anyhow::bail!("simulated reply transport failure");
+        }
         Ok(())
     }
 }

@@ -128,10 +128,17 @@ impl CommandContext {
 
 type HandlerFn = dyn Fn(CommandContext, CommandArguments) -> CommandFuture + Send + Sync + 'static;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandMode {
+    Dispatch,
+    Control,
+    Mutation,
+}
+
 #[derive(Clone)]
 pub(in crate::daemon) struct CommandHandler {
     handler: Arc<HandlerFn>,
-    control: bool,
+    mode: CommandMode,
 }
 
 impl CommandHandler {
@@ -142,7 +149,7 @@ impl CommandHandler {
         Output: Into<CommandExecution> + Send + 'static,
     {
         Self {
-            control: false,
+            mode: CommandMode::Dispatch,
             handler: Arc::new(move |context, arguments| {
                 let future = handler(context, arguments);
                 Box::pin(async move { future.await.map(Into::into) })
@@ -151,12 +158,21 @@ impl CommandHandler {
     }
 
     pub(super) fn control(mut self) -> Self {
-        self.control = true;
+        self.mode = CommandMode::Control;
         self
     }
 
+    pub(super) fn mutation(mut self) -> Self {
+        self.mode = CommandMode::Mutation;
+        self
+    }
+
+    pub(super) fn is_mutation(&self) -> bool {
+        self.mode == CommandMode::Mutation
+    }
+
     pub(super) fn is_control(&self) -> bool {
-        self.control
+        self.mode != CommandMode::Dispatch
     }
 
     pub(in crate::daemon) async fn execute(

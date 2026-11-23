@@ -25,7 +25,7 @@ impl StopCommand {
                     let command = command.clone();
                     async move { command.stop(context, arguments).await }
                 })
-                .control(),
+                .mutation(),
             )
     }
 

@@ -304,3 +304,79 @@ async fn reset_succeeds_when_no_session_mapping_exists() {
     };
     assert_eq!(reply, ChannelReply::new("重置成功。"));
 }
+
+#[tokio::test]
+async fn redelivered_reset_preserves_a_later_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = command_test_agent("review", temp.path());
+    let store = SessionStore::open(temp.path().join("store.db")).unwrap();
+    let dispatcher = AgentDispatcher::new(store.clone());
+    let commands = command_runtime(&dispatcher);
+    let key = agent.store_session_key(&command_channel_identity(), "chat-1");
+    let channel = CommandTestChannel::new(Arc::new(Mutex::new(Vec::new())));
+    let mut task = CommandTestTask::new("same-message", "chat-1", "/reset");
+    task.fail_first_reply = true;
+    let mut runs = tokio::task::JoinSet::new();
+    store.observe(&key, None, "old-session").unwrap();
+    assert!(
+        Daemon::route_channel_task(
+            &channel,
+            std::slice::from_ref(&agent),
+            &dispatcher,
+            &commands,
+            task.clone(),
+            &mut runs
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(store.get(&key).unwrap(), None);
+    store.observe(&key, None, "later-session").unwrap();
+    Daemon::route_channel_task(
+        &channel,
+        std::slice::from_ref(&agent),
+        &dispatcher,
+        &commands,
+        task,
+        &mut runs,
+    )
+    .await
+    .unwrap();
+    let retained = store.get(&key).unwrap();
+    assert_eq!(retained.as_deref(), Some("later-session"));
+}
+
+#[tokio::test]
+async fn redelivery_joins_a_mutation_after_its_first_waiter_times_out() {
+    use super::super::replay::CommandReplies;
+    use tokio::sync::oneshot;
+
+    let cache = Arc::new(CommandReplies::default());
+    let key = (command_channel_session("chat"), "source".to_owned());
+    let (started, ready) = oneshot::channel();
+    let (release, blocked) = oneshot::channel();
+    let first = tokio::spawn({
+        let cache = cache.clone();
+        let key = key.clone();
+        async move {
+            cache
+                .run(key, &Default::default(), async move {
+                    started.send(()).unwrap();
+                    blocked.await.unwrap();
+                    Ok(Some(ChannelReply::new("original outcome")))
+                })
+                .await
+        }
+    });
+    ready.await.unwrap();
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    let reply = cache
+        .run(key, &Default::default(), async {
+            panic!("redelivery executed the mutation twice")
+        })
+        .await
+        .unwrap();
+    assert_eq!(reply.unwrap().as_text(), Some("original outcome"));
+}

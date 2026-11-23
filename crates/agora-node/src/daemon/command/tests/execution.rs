@@ -50,7 +50,10 @@ async fn silent_command_completes_without_a_channel_reply() {
             })),
         )
         .unwrap();
-    let commands = CommandRuntime { registry };
+    let commands = CommandRuntime {
+        registry,
+        replies: Default::default(),
+    };
     let replies = Arc::new(Mutex::new(Vec::new()));
     let channel = CommandTestChannel::new(Arc::clone(&replies));
     let mut runs = tokio::task::JoinSet::new();

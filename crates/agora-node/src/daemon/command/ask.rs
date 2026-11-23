@@ -91,18 +91,20 @@ impl AskCommand {
         handler: fn(&Self, CommandContext, CommandArguments) -> Result<Option<ChannelReply>>,
     ) -> CommandNode<CommandHandler> {
         let command = self.clone();
+        let handler = CommandHandler::new(move |context, arguments| {
+            let command = command.clone();
+            async move { handler(&command, context, arguments) }
+        });
+        let handler = match name {
+            "enable" | "disable" => handler.mutation(),
+            _ => handler.control(),
+        };
         CommandNode::new(name, description)
             .argument(Argument::required(
                 "agent_name",
                 i18n::AGENT_NAME_ARGUMENT_DESCRIPTION,
             ))
-            .handler(
-                CommandHandler::new(move |context, arguments| {
-                    let command = command.clone();
-                    async move { handler(&command, context, arguments) }
-                })
-                .control(),
-            )
+            .handler(handler)
     }
 
     async fn list(
@@ -176,11 +178,19 @@ impl AskCommand {
         )?;
 
         if context.is_structured() {
-            return Ok(Some(ChannelReply::agent_list(self.agent_statuses(
+            match self.agent_statuses(
                 context.channel_identity(),
                 context.session_id(),
                 context.agents(),
-            )?)));
+            ) {
+                Ok(statuses) => return Ok(Some(ChannelReply::agent_list(statuses))),
+                // The change already committed. A list-read failure must not make
+                // redelivery repeat the mutation against a newer setting.
+                Err(error) => agora_core::logger::error!(
+                    "agent setting saved but list refresh failed: {}",
+                    error
+                ),
+            }
         }
         Ok(Some(ChannelReply::agent_status(ChannelAgentStatus::new(
             agent.name(),

@@ -1,6 +1,7 @@
 mod ask;
 mod executor;
 mod registry;
+mod replay;
 mod reset;
 mod stop;
 
@@ -25,6 +26,7 @@ pub(super) enum CommandOutcome {
 
 pub(super) struct CommandRuntime {
     registry: CommandRegistry<CommandHandler>,
+    replies: replay::CommandReplies,
 }
 
 impl CommandRuntime {
@@ -49,7 +51,22 @@ impl CommandRuntime {
         registry.register(reset.command())?;
         registry.register(ask.command())?;
         registry.register(ask.management_command())?;
-        Ok(Self { registry })
+        Ok(Self {
+            registry,
+            replies: Default::default(),
+        })
+    }
+
+    pub(super) fn reply_delivered(
+        &self,
+        channel: ChannelIdentity,
+        session_id: &str,
+        task_id: &str,
+    ) {
+        self.replies.delivered(&(
+            crate::store::StoreChannelSessionKey::new(channel, session_id),
+            task_id.to_owned(),
+        ));
     }
 
     #[cfg(test)]
@@ -60,7 +77,7 @@ impl CommandRuntime {
         agents: &[ConfiguredAgent],
         input: &ChannelTaskInput,
     ) -> Result<CommandOutcome> {
-        self.handle_admitted(channel, session_id, agents, input, Default::default())
+        self.handle_admitted(channel, session_id, agents, input, None, Default::default())
             .await
     }
 
@@ -70,6 +87,7 @@ impl CommandRuntime {
         session_id: &str,
         agents: &[ConfiguredAgent],
         input: &ChannelTaskInput,
+        task_id: Option<&str>,
         admission: super::RouteAdmission,
     ) -> Result<CommandOutcome> {
         let (resolution, context) = match input {
@@ -91,6 +109,28 @@ impl CommandRuntime {
             }
             CommandResolution::Invocation(invocation) => {
                 let (handler, arguments) = invocation.into_parts();
+                if handler.is_mutation()
+                    && let Some(task_id) = task_id
+                {
+                    let scope =
+                        crate::store::StoreChannelSessionKey::new(channel.clone(), session_id);
+                    let command_admission = admission.clone();
+                    let result = self
+                        .replies
+                        .run((scope, task_id.to_owned()), &admission, async move {
+                            match handler
+                                .execute(context.with_admission(command_admission), arguments)
+                                .await?
+                            {
+                                CommandExecution::Reply(reply) => Ok(reply),
+                                CommandExecution::Dispatch(_) => {
+                                    anyhow::bail!("control command dispatched an agent")
+                                }
+                            }
+                        })
+                        .await?;
+                    return Ok(CommandOutcome::Reply(result));
+                }
                 Ok(
                     match handler
                         .execute(context.with_admission(admission), arguments)
