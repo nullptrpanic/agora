@@ -215,11 +215,11 @@ fn process_runtime_reuses_the_inherited_execution_stream() {
 
     assert_eq!(
         runtime.prepare(Path::new("/bin/sh")).unwrap(),
-        CString::new("/tmp/prepared-sh").unwrap()
+        (CString::new("/tmp/prepared-sh").unwrap(), false)
     );
     assert_eq!(
         runtime.prepare(Path::new("/usr/bin/true")).unwrap(),
-        CString::new("/tmp/prepared-sh").unwrap()
+        (CString::new("/tmp/prepared-sh").unwrap(), false)
     );
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 2);
@@ -301,6 +301,7 @@ fn child_arguments_replace_a_script_with_its_prepared_interpreter() {
             CString::new("node").unwrap(),
             CString::new("/usr/local/bin/codex").unwrap(),
         ],
+        passthrough: false,
     };
 
     let arguments = unsafe { ChildArguments::new(pointers.as_ptr(), &prepared) }.unwrap();
@@ -324,6 +325,7 @@ fn child_arguments_replace_a_script_with_its_prepared_interpreter() {
     let direct = PreparedExecutable {
         program: CString::new("/usr/local/bin/codex").unwrap(),
         arguments: Vec::new(),
+        passthrough: false,
     };
     let arguments = unsafe { ChildArguments::new(pointers.as_ptr(), &direct) }.unwrap();
     let values = arguments
@@ -851,9 +853,10 @@ fn process_audit_prefers_the_tracked_logical_directory() {
 #[test]
 fn process_runtime_returns_the_prepared_executable() {
     let (runtime, server) = runtime_with_response(response(1, b"/tmp/prepared-curl"));
-    let prepared = runtime.prepare(Path::new("/usr/bin/curl")).unwrap();
+    let (prepared, passthrough) = runtime.prepare(Path::new("/usr/bin/curl")).unwrap();
 
     assert_eq!(prepared.to_bytes(), b"/tmp/prepared-curl");
+    assert!(!passthrough);
     let request = server.join().unwrap();
     assert!(
         request
@@ -956,12 +959,21 @@ fn process_runtime_propagates_denied_and_invalid_responses() {
     assert_eq!(denied.to_string(), "missing executable");
     denied_server.join().unwrap();
 
-    let (runtime, invalid_server) = runtime_with_response(response(3, b"invalid"));
+    let (runtime, invalid_server) = runtime_with_response(response(4, b"invalid"));
     assert_eq!(
         runtime.prepare(Path::new("/bin/sh")).unwrap_err().errno,
         libc::EPROTO
     );
     invalid_server.join().unwrap();
+
+    let (runtime, passthrough_server) = runtime_with_response(response(3, b"/usr/bin/security"));
+    let prepared = runtime
+        .prepare_executable(Path::new("/usr/bin/security"))
+        .unwrap();
+    assert!(prepared.passthrough);
+    assert_eq!(prepared.program.to_bytes(), b"/usr/bin/security");
+    assert!(prepared.arguments.is_empty());
+    passthrough_server.join().unwrap();
 
     let (runtime, nul_server) = runtime_with_response(response(1, b"/tmp/a\0b"));
     assert_eq!(
@@ -1247,4 +1259,83 @@ fn process_exec_interposers_prepare_before_native_exec_failure() {
     );
 
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn passthrough_child_environment_strips_agora_runtime_and_managed_tls_values() {
+    let entries = [
+        CString::new("PATH=/usr/bin:/bin").unwrap(),
+        CString::new("HOME=/Users/example").unwrap(),
+        CString::new("DYLD_INSERT_LIBRARIES=/tmp/hook.dylib").unwrap(),
+        CString::new("AGORA_SANDBOX_TOKEN=token").unwrap(),
+        CString::new("AGORA_SANDBOX_PENDING_PROCESS_EVENT=pending").unwrap(),
+        CString::new("AGORA_SANDBOX_TRACE_ID=trace-root").unwrap(),
+        CString::new("SSL_CERT_FILE=/tmp/agora-ca.pem").unwrap(),
+        CString::new(concat!(
+            "JAVA_TOOL_OPTIONS=-Xmx256m ",
+            "-Djavax.net.ssl.trustStore=/tmp/agora-ca.jks ",
+            "-Djavax.net.ssl.trustStoreType=JKS ",
+            "-Djavax.net.ssl.trustStorePassword=changeit"
+        ))
+        .unwrap(),
+    ];
+    let pointers = entries
+        .iter()
+        .map(|entry| entry.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect::<Vec<_>>();
+
+    let environment =
+        unsafe { ChildEnvironment::passthrough(pointers.as_ptr(), &config_with_tls_bundle()) }
+            .unwrap();
+    let values = environment
+        .values
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        values,
+        [
+            "PATH=/usr/bin:/bin",
+            "HOME=/Users/example",
+            "JAVA_TOOL_OPTIONS=-Xmx256m",
+        ]
+    );
+
+    let managed_only = [CString::new(concat!(
+        "JAVA_TOOL_OPTIONS=-Djavax.net.ssl.trustStore=/tmp/agora-ca.jks ",
+        "-Djavax.net.ssl.trustStoreType=JKS ",
+        "-Djavax.net.ssl.trustStorePassword=changeit"
+    ))
+    .unwrap()];
+    let managed_only_pointers = [managed_only[0].as_ptr(), std::ptr::null()];
+    let stripped = unsafe {
+        ChildEnvironment::passthrough(managed_only_pointers.as_ptr(), &config_with_tls_bundle())
+    }
+    .unwrap();
+    assert!(stripped.values.is_empty());
+}
+
+#[test]
+fn passthrough_cloexec_guard_sets_and_restores_descriptor_flags() {
+    use std::os::fd::AsRawFd;
+
+    let file = tempfile::tempfile().unwrap();
+    let fd = file.as_raw_fd();
+    let original = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert!(original >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_SETFD, original & !libc::FD_CLOEXEC) },
+        0
+    );
+
+    {
+        let _guard = super::PassthroughCloexecGuard::apply([fd, fd, -1]).unwrap();
+        let active = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(active & libc::FD_CLOEXEC, 0);
+    }
+
+    let restored = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert_eq!(restored & libc::FD_CLOEXEC, 0);
 }

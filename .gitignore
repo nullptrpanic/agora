@@ -8,4 +8,5 @@ Cargo.lock
 config.json
 sandbox.json
 AGENTS.md
-/docs/
+/docs/local/
+/docs/superpowers/

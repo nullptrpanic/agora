@@ -11,7 +11,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub(crate) const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -100,6 +100,8 @@ pub(crate) struct WirePreparedLaunch {
     argument_prefix: Vec<WireOsString>,
     additions: Vec<(WireOsString, WireOsString)>,
     removals: Vec<WireOsString>,
+    #[serde(default)]
+    passthrough: bool,
 }
 
 impl From<&PreparedLaunch> for WirePreparedLaunch {
@@ -124,6 +126,7 @@ impl From<&PreparedLaunch> for WirePreparedLaunch {
                 .iter()
                 .map(|value| value.as_os_str().into())
                 .collect(),
+            passthrough: value.is_passthrough(),
         }
     }
 }
@@ -156,6 +159,7 @@ impl WirePreparedLaunch {
                 .collect(),
             ProtectedEnvironment::from_parts(additions, removals),
             self.launch_id,
+            self.passthrough,
         ))
     }
 }

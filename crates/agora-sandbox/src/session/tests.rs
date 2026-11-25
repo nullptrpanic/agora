@@ -122,6 +122,7 @@ async fn session_client_retries_an_idle_daemon_retirement() {
             Vec::new(),
             ProtectedEnvironment::from_parts(BTreeMap::new(), Vec::new()),
             "launch-a".to_string(),
+            false,
         );
         write_frame(
             &mut current,
@@ -236,4 +237,32 @@ fn inherited_daemon_descriptors_are_restored_close_on_exec() {
     let descriptor = super::startup::inherited_descriptor(descriptor, "test").unwrap();
     let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
     assert_ne!(flags & libc::FD_CLOEXEC, 0);
+}
+
+#[test]
+fn wire_prepared_launch_round_trips_passthrough_flag() {
+    let launch = PreparedLaunch::new(
+        "/usr/bin/security".into(),
+        Vec::new(),
+        ProtectedEnvironment::from_parts(
+            BTreeMap::new(),
+            vec![OsString::from("DYLD_INSERT_LIBRARIES")],
+        ),
+        "launch-passthrough".to_string(),
+        true,
+    );
+
+    let encoded = serde_json::to_vec(&WirePreparedLaunch::from(&launch)).unwrap();
+    let decoded: WirePreparedLaunch = serde_json::from_slice(&encoded).unwrap();
+    let restored = decoded.into_prepared().unwrap();
+
+    assert!(restored.is_passthrough());
+    assert_eq!(
+        restored.program(),
+        std::path::Path::new("/usr/bin/security")
+    );
+    assert_eq!(
+        restored.environment().removals(),
+        [OsString::from("DYLD_INSERT_LIBRARIES")]
+    );
 }

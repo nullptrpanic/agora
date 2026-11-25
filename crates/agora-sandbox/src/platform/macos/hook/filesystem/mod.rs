@@ -2424,6 +2424,36 @@ fn refresh_descriptor_inheritance(descriptor: libc::c_int) {
     }
 }
 
+pub(super) fn prepare_passthrough_exec() -> Result<Vec<libc::c_int>> {
+    let Some(runtime) = FilesystemHookRuntime::global() else {
+        return Ok(Vec::new());
+    };
+    if runtime.local.is_none() {
+        return Ok(Vec::new());
+    }
+    let _guard = FilesystemHookGuard::enter().context("filesystem hook unavailable during exec")?;
+    let _operation = runtime
+        .operations
+        .acquire(mapping::OperationRequest::new().descriptor_registry_exclusive());
+    let files = lock(&runtime.open_files);
+    let mut auxiliaries = HashSet::new();
+    for (&fd, open) in files.iter() {
+        let Some(local) = open.local_inheritance() else {
+            continue;
+        };
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        if flags & libc::FD_CLOEXEC == 0 {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into());
+        }
+        auxiliaries.insert(local.state.as_raw_fd());
+        auxiliaries.insert(local.lock.as_raw_fd());
+    }
+    Ok(auxiliaries.into_iter().collect())
+}
+
 pub(super) fn flush_before_exec() -> Result<()> {
     let Some(_guard) = FilesystemHookGuard::enter() else {
         return Ok(());
@@ -2557,7 +2587,7 @@ mod namespace;
 mod nfs;
 mod open;
 mod spawn;
-pub(super) use spawn::{SpawnLocalDescriptors, prepare_local_spawn};
+pub(super) use spawn::{SpawnLocalDescriptors, prepare_local_spawn, prepare_passthrough_spawn};
 pub(super) mod socket;
 mod unsupported;
 

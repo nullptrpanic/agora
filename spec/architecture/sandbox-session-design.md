@@ -123,7 +123,8 @@ and reports the runtime failure instead of presenting it as the child status.
 
 The typed, default-expanded, path-resolved runtime configuration has a
 deterministic semantic encoding. Its SHA-256 identity includes all fields that
-affect filesystem mode and key, NFS routes and credentials, network and TLS,
+affect filesystem mode and key, NFS routes and credentials, execution mode and
+executable bypass paths, network and TLS,
 Hook compatibility, audit, and logging. The digest is exchanged only over the
 owner-only socket and is never persisted or logged. JSON formatting and object
 key order do not affect it. A protocol, build, or configuration mismatch is
@@ -139,10 +140,14 @@ that resolved executable with the shared execution controller, including
 Mach-O preparation and shebang adjustment. It returns a launch specification
 containing:
 
-- the prepared executable and adjusted arguments;
+- the prepared executable, adjusted arguments, and whether the target is a native
+  passthrough launch (session protocol version 2);
 - protected environment additions for Hook injection, controller endpoints and
-  tokens, filesystem mode and derived key, NFS routes, TLS trust, and trace;
-- protected environment removals that prevent stale nested runtime values.
+  tokens, filesystem mode and derived key, NFS routes, TLS trust, and trace
+  (empty for passthrough launches);
+- protected environment removals that prevent stale nested runtime values
+  (including `DYLD_INSERT_LIBRARIES` and Agora runtime variables for passthrough
+  launches).
 
 The control loop does not await executable preparation inline. One preparation
 job uses a cloneable handle to the existing execution store; up to 128 connection

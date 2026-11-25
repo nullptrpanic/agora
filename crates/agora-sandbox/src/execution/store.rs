@@ -1,6 +1,9 @@
-use crate::filesystem::{EntryState, FileCipher, Materializer, OverlayStore};
+use crate::filesystem::{
+    EntryState, FileCipher, Materializer, OverlayStore, normalize_path, resolve_existing_ancestor,
+};
+use crate::runner::ExecutionMode;
 use anyhow::{Context, Result, bail};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -80,20 +83,66 @@ pub(crate) struct Shebang {
     pub(crate) argument: Option<OsString>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PreparedExecutableTarget {
+    Managed(PathBuf),
+    Passthrough(PathBuf),
+}
+
+impl PreparedExecutableTarget {
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::Managed(path) | Self::Passthrough(path) => path,
+        }
+    }
+
+    pub(crate) fn into_path(self) -> PathBuf {
+        match self {
+            Self::Managed(path) | Self::Passthrough(path) => path,
+        }
+    }
+
+    pub(crate) fn is_passthrough(&self) -> bool {
+        matches!(self, Self::Passthrough(_))
+    }
+}
+
 pub(super) struct ExecutableStore {
     overlay: OverlayStore,
+    mode: ExecutionMode,
+    passthrough_executables: HashSet<PathBuf>,
 }
 
 impl ExecutableStore {
+    #[cfg(test)]
     pub(super) fn new(directory: PathBuf) -> Result<Self> {
-        Self::with_cipher(directory, None)
+        Self::with_options(directory, None, ExecutionMode::Strict, Vec::new())
     }
 
-    pub(super) fn encrypted(directory: PathBuf, cipher: FileCipher) -> Result<Self> {
-        Self::with_cipher(directory, Some(cipher))
+    pub(super) fn with_policy(
+        directory: PathBuf,
+        mode: ExecutionMode,
+        passthrough_executables: Vec<PathBuf>,
+    ) -> Result<Self> {
+        Self::with_options(directory, None, mode, passthrough_executables)
     }
 
-    fn with_cipher(directory: PathBuf, cipher: Option<FileCipher>) -> Result<Self> {
+    pub(super) fn encrypted_with_policy(
+        directory: PathBuf,
+        cipher: FileCipher,
+        mode: ExecutionMode,
+        passthrough_executables: Vec<PathBuf>,
+    ) -> Result<Self> {
+        Self::with_options(directory, Some(cipher), mode, passthrough_executables)
+    }
+
+    fn with_options(
+        directory: PathBuf,
+        cipher: Option<FileCipher>,
+        mode: ExecutionMode,
+        passthrough_executables: Vec<PathBuf>,
+    ) -> Result<Self> {
         fs::create_dir_all(&directory).with_context(|| {
             format!(
                 "failed to create sandbox executable directory {}",
@@ -110,10 +159,19 @@ impl ExecutableStore {
             Some(cipher) => OverlayStore::encrypted(directory.clone(), cipher)?,
             None => OverlayStore::new(directory.clone())?,
         };
-        Ok(Self { overlay })
+        let mut passthroughs = HashSet::with_capacity(passthrough_executables.len());
+        for path in passthrough_executables {
+            let normalized = normalize_path(&path)?;
+            passthroughs.insert(resolve_existing_ancestor(&normalized)?);
+        }
+        Ok(Self {
+            overlay,
+            mode,
+            passthrough_executables: passthroughs,
+        })
     }
 
-    pub(super) fn prepare(&self, requested: &Path) -> Result<PathBuf> {
+    pub(super) fn prepare(&self, requested: &Path) -> Result<PreparedExecutableTarget> {
         if !self.overlay.is_internal(requested) && self.overlay.is_private(requested)? {
             return Err(io::Error::from_raw_os_error(libc::EACCES)).with_context(|| {
                 format!(
@@ -130,14 +188,30 @@ impl ExecutableStore {
         }
         let metadata = Self::validate_source(&source)?;
         if resolve_shebang(&source)?.is_some() {
-            return Ok(source);
+            return Ok(PreparedExecutableTarget::Managed(source));
         }
         if !self.overlay.is_internal(&source) {
-            if !Self::requires_copy(&source, &metadata)? {
-                return Ok(source);
+            if self.passthrough_executables.contains(&source) {
+                return Ok(PreparedExecutableTarget::Passthrough(source));
+            }
+            let (requires_copy, has_identity_bound_entitlements) =
+                Self::inspect_copy_requirement(&source, &metadata)?;
+            if !requires_copy {
+                return Ok(PreparedExecutableTarget::Managed(source));
+            }
+            match self.mode {
+                ExecutionMode::Strict => {}
+                ExecutionMode::Restricted if has_identity_bound_entitlements => {
+                    return Ok(PreparedExecutableTarget::Passthrough(source));
+                }
+                ExecutionMode::Restricted => {}
+                ExecutionMode::Bypass => {
+                    return Ok(PreparedExecutableTarget::Passthrough(source));
+                }
             }
             bundle::prepare_dependencies(self, &source, Self::native_architecture())?;
             self.prepare_copy(&source, &metadata)
+                .map(PreparedExecutableTarget::Managed)
         } else {
             let signature =
                 Self::cached_code_signature(&metadata, || Self::inspect_code_signature(&source))?;
@@ -152,11 +226,11 @@ impl ExecutableStore {
                 .iter()
                 .any(|key| Self::requires_original_signing_identity(key))
             {
-                Ok(source)
+                Ok(PreparedExecutableTarget::Managed(source))
             } else {
                 let source = self.prepare_internal_copy(&source, &metadata)?;
                 self.overlay.mark_executable(&source)?;
-                Ok(source)
+                Ok(PreparedExecutableTarget::Managed(source))
             }
         }
     }
@@ -176,12 +250,17 @@ impl ExecutableStore {
             .with_context(|| format!("failed to resolve executable {}", requested.display()))
     }
 
-    fn requires_copy(source: &Path, metadata: &Metadata) -> Result<bool> {
+    fn inspect_copy_requirement(source: &Path, metadata: &Metadata) -> Result<(bool, bool)> {
         let sip_restricted =
             metadata.st_flags() & SF_RESTRICTED != 0 && sip_restricts_protected_files();
         let signature =
             Self::cached_code_signature(metadata, || Self::inspect_code_signature(source))?;
-        Ok(sip_restricted || signature.flags & CS_DYLD_RESTRICTED != 0)
+        let requires_copy = sip_restricted || signature.flags & CS_DYLD_RESTRICTED != 0;
+        let has_identity_bound_entitlements = signature
+            .entitlement_keys
+            .iter()
+            .any(|key| Self::requires_original_signing_identity(key));
+        Ok((requires_copy, has_identity_bound_entitlements))
     }
 
     fn cached_code_signature(
@@ -269,22 +348,27 @@ impl ExecutableStore {
         Ok(entitlements.into_keys().collect())
     }
 
-    fn requires_original_signing_identity(entitlement: &str) -> bool {
+    fn is_adhoc_safe_entitlement(entitlement: &str) -> bool {
         matches!(
             entitlement,
-            "application-identifier"
-                | "aps-environment"
-                | "beta-reports-active"
-                | "com.apple.application-identifier"
-                | "com.apple.security.application-groups"
-                | "com.apple.security.system-container"
-                | "com.apple.security.system-groups"
-                | "fairplay-client"
-                | "keychain-access-groups"
-                | "useractivity-team-identifier"
-        ) || entitlement.starts_with("com.apple.developer.")
-            || entitlement.starts_with("com.apple.private.")
-            || entitlement.starts_with("com.apple.rootless.")
+            "com.apple.security.app-sandbox"
+                | "com.apple.security.automation.apple-events"
+                | "com.apple.security.get-task-allow"
+                | "com.apple.security.hypervisor"
+                | "com.apple.security.print"
+                | "com.apple.security.scripting-targets"
+                | "com.apple.security.smartcard"
+        ) || entitlement.starts_with("com.apple.security.assets.")
+            || entitlement.starts_with("com.apple.security.cs.")
+            || entitlement.starts_with("com.apple.security.device.")
+            || entitlement.starts_with("com.apple.security.files.")
+            || entitlement.starts_with("com.apple.security.network.")
+            || entitlement.starts_with("com.apple.security.personal-information.")
+            || entitlement.starts_with("com.apple.security.temporary-exception.")
+    }
+
+    fn requires_original_signing_identity(entitlement: &str) -> bool {
+        !Self::is_adhoc_safe_entitlement(entitlement)
     }
 
     fn prepare_copy(&self, source: &Path, metadata: &Metadata) -> Result<PathBuf> {
@@ -395,6 +479,20 @@ impl ExecutableStore {
                     OsStr::new("-"),
                     OsStr::new("--timestamp=none"),
                     OsStr::new("--preserve-metadata=identifier,entitlements"),
+                    temporary.as_os_str(),
+                ],
+                "failed to ad-hoc sign executable copy",
+            );
+        }
+        if identity_bound.len() == signature.entitlement_keys.len() {
+            return Self::run_tool(
+                "/usr/bin/codesign",
+                [
+                    OsStr::new("--force"),
+                    OsStr::new("--sign"),
+                    OsStr::new("-"),
+                    OsStr::new("--timestamp=none"),
+                    OsStr::new("--preserve-metadata=identifier"),
                     temporary.as_os_str(),
                 ],
                 "failed to ad-hoc sign executable copy",

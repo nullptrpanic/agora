@@ -2350,7 +2350,7 @@ fn executable_cache_rebuilds_when_the_recorded_checksum_is_wrong() {
                 materializer,
                 source: Some(source_identity),
                 variant: Some(format!(
-                    "{}/{}/prepare-v2",
+                    "{}/{}/prepare-v3",
                     std::env::consts::OS,
                     std::env::consts::ARCH
                 )),

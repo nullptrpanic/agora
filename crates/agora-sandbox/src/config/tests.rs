@@ -1,5 +1,5 @@
 use super::*;
-use agora_sandbox::runner::FilesystemMode;
+use agora_sandbox::runner::{ExecutionMode, FilesystemMode};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -25,6 +25,10 @@ fn unified_config_resolves_runtime_settings_and_redacts_secrets() {
         r#"{
           "workdir": "state",
           "tls": "auto",
+          "execution": {
+            "mode": "restricted",
+            "bypass": ["/usr/bin/security", "/usr/bin/../bin/security"]
+          },
           "filesystem": {
             "bypass": ["/opt/agora-tools"],
             "local": { "encrypt": "encrypted", "key": "local-secret" },
@@ -60,6 +64,11 @@ fn unified_config_resolves_runtime_settings_and_redacts_secrets() {
     assert_eq!(
         runtime.native_passthrough_roots(),
         [PathBuf::from("/dev"), PathBuf::from("/opt/agora-tools")]
+    );
+    assert_eq!(runtime.execution_mode(), ExecutionMode::Restricted);
+    assert_eq!(
+        runtime.native_executable_passthroughs(),
+        [PathBuf::from("/usr/bin/security")]
     );
     assert_eq!(
         runtime.encrypted_workspace_key(),
@@ -116,6 +125,8 @@ fn empty_config_uses_all_runtime_defaults() {
     assert!(runtime.encrypted_workspace_key().is_none());
     assert!(runtime.smb_remotes().is_empty());
     assert_eq!(runtime.native_passthrough_roots(), [PathBuf::from("/dev")]);
+    assert_eq!(runtime.execution_mode(), ExecutionMode::Strict);
+    assert!(runtime.native_executable_passthroughs().is_empty());
 }
 
 #[test]
@@ -170,6 +181,28 @@ fn config_rejects_relative_filesystem_bypass_roots() {
     );
 
     assert!(load_error(&path).contains("filesystem bypass root must be absolute"));
+}
+
+#[test]
+fn config_rejects_invalid_execution_bypass_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let relative = write_config(
+        root.path(),
+        r#"{ "execution": { "bypass": ["usr/bin/security"] } }"#,
+    );
+    assert!(load_error(&relative).contains("execution bypass path must be absolute"));
+
+    let root_path = write_config(root.path(), r#"{ "execution": { "bypass": ["/"] } }"#);
+    assert!(load_error(&root_path).contains("execution bypass path must not be root"));
+
+    let unknown_mode = write_config(root.path(), r#"{ "execution": { "mode": "unknown" } }"#);
+    assert!(load_error(&unknown_mode).contains("failed to parse sandbox config"));
+
+    let bypass_mode = write_config(root.path(), r#"{ "execution": { "mode": "bypass" } }"#);
+    let runtime = RunConfig::load(&bypass_mode)
+        .unwrap()
+        .into_runtime(PathBuf::from("/tmp/hook.dylib"));
+    assert_eq!(runtime.execution_mode(), ExecutionMode::Bypass);
 }
 
 #[test]
@@ -228,6 +261,8 @@ fn semantic_session_identity_ignores_json_formatting_but_tracks_runtime_changes(
     let second_path = root.path().join("second.json");
     let changed_path = root.path().join("changed.json");
     let bypass_path = root.path().join("bypass.json");
+    let execution_mode_path = root.path().join("execution-mode.json");
+    let execution_bypass_path = root.path().join("execution-bypass.json");
     std::fs::write(
         &first_path,
         format!(
@@ -264,11 +299,29 @@ fn semantic_session_identity_ignores_json_formatting_but_tracks_runtime_changes(
         ),
     )
     .unwrap();
+    std::fs::write(
+        &execution_mode_path,
+        format!(
+            r#"{{"workdir":"{}","execution":{{"mode":"restricted"}},"filesystem":{{"local":{{"encrypt":"encrypted","key":"secret-a"}}}}}}"#,
+            workdir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &execution_bypass_path,
+        format!(
+            r#"{{"workdir":"{}","execution":{{"bypass":["/usr/bin/security"]}},"filesystem":{{"local":{{"encrypt":"encrypted","key":"secret-a"}}}}}}"#,
+            workdir.display()
+        ),
+    )
+    .unwrap();
 
     let first = RunConfig::load(&first_path).unwrap();
     let second = RunConfig::load(&second_path).unwrap();
     let changed = RunConfig::load(&changed_path).unwrap();
     let bypass = RunConfig::load(&bypass_path).unwrap();
+    let execution_mode = RunConfig::load(&execution_mode_path).unwrap();
+    let execution_bypass = RunConfig::load(&execution_bypass_path).unwrap();
 
     let original_identity = first.session_identity(&hook).unwrap();
     assert_eq!(original_identity, second.session_identity(&hook).unwrap());
@@ -279,6 +332,14 @@ fn semantic_session_identity_ignores_json_formatting_but_tracks_runtime_changes(
     assert_ne!(
         first.session_identity(&hook).unwrap(),
         bypass.session_identity(&hook).unwrap()
+    );
+    assert_ne!(
+        first.session_identity(&hook).unwrap(),
+        execution_mode.session_identity(&hook).unwrap()
+    );
+    assert_ne!(
+        first.session_identity(&hook).unwrap(),
+        execution_bypass.session_identity(&hook).unwrap()
     );
     std::fs::write(&hook, b"hook-b").unwrap();
     assert_ne!(original_identity, first.session_identity(&hook).unwrap());

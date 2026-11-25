@@ -28,6 +28,39 @@ impl ProtectedEnvironment {
         }
     }
 
+    fn passthrough() -> Self {
+        Self {
+            additions: BTreeMap::new(),
+            removals: vec![
+                TOKEN.into(),
+                PROXY_IPV4.into(),
+                PROXY_IPV6.into(),
+                EXECUTION_CONTROL.into(),
+                EXECUTION_TOKEN.into(),
+                AUDIT_CONTROL.into(),
+                AUDIT_TOKEN.into(),
+                HOOK_LIBRARIES.into(),
+                FILESYSTEM_ROOT.into(),
+                FILESYSTEM_MODE.into(),
+                FILESYSTEM_CIPHER_KEY.into(),
+                LOCAL_FILESYSTEM_CONTROL.into(),
+                LOCAL_FILESYSTEM_TOKEN.into(),
+                INHERITED_LOCAL_DESCRIPTORS.into(),
+                REMOTE_CONTROL.into(),
+                REMOTE_TOKEN.into(),
+                REMOTE_ROOTS.into(),
+                REMOTE_CURRENT_DIRECTORY.into(),
+                NATIVE_PASSTHROUGH_ROOTS.into(),
+                TLS_TRUST_ANCHOR_DER.into(),
+                TLS_TRUST_BUNDLE.into(),
+                JAVA_TRUST_STORE_ENVIRONMENT.into(),
+                PENDING_PROCESS_EVENT_ENVIRONMENT.into(),
+                TRACE_ID_ENVIRONMENT.into(),
+                "DYLD_INSERT_LIBRARIES".into(),
+            ],
+        }
+    }
+
     fn insert(&mut self, key: impl Into<OsString>, value: impl Into<OsString>) {
         self.additions.insert(key.into(), value.into());
     }
@@ -64,6 +97,7 @@ pub(crate) struct PreparedLaunch {
     argument_prefix: Vec<OsString>,
     environment: ProtectedEnvironment,
     launch_id: String,
+    passthrough: bool,
 }
 
 impl PreparedLaunch {
@@ -72,12 +106,14 @@ impl PreparedLaunch {
         argument_prefix: Vec<OsString>,
         environment: ProtectedEnvironment,
         launch_id: String,
+        passthrough: bool,
     ) -> Self {
         Self {
             program,
             argument_prefix,
             environment,
             launch_id,
+            passthrough,
         }
     }
 
@@ -95,6 +131,10 @@ impl PreparedLaunch {
 
     pub(crate) fn launch_id(&self) -> &str {
         &self.launch_id
+    }
+
+    pub(crate) fn is_passthrough(&self) -> bool {
+        self.passthrough
     }
 }
 
@@ -123,6 +163,7 @@ impl SandboxRuntime {
         let native_passthrough_roots =
             serde_json::to_string(&config.effective_native_passthrough_roots()?)
                 .context("failed to encode native passthrough roots")?;
+        let native_executable_passthroughs = config.effective_native_executable_passthroughs()?;
         let callback = std::sync::Arc::new(callback);
         let filesystem_workdir = config.workdir.clone();
         let filesystem_mode = config.filesystem_mode;
@@ -236,9 +277,22 @@ impl SandboxRuntime {
         };
         let execution_result = match filesystem_cipher {
             Some(cipher) => {
-                ExecutionController::start_encrypted(filesystem.root().to_path_buf(), cipher).await
+                ExecutionController::start_encrypted_with_policy(
+                    filesystem.root().to_path_buf(),
+                    cipher,
+                    config.execution_mode,
+                    native_executable_passthroughs,
+                )
+                .await
             }
-            None => ExecutionController::start(filesystem.root().to_path_buf()).await,
+            None => {
+                ExecutionController::start_with_policy(
+                    filesystem.root().to_path_buf(),
+                    config.execution_mode,
+                    native_executable_passthroughs,
+                )
+                .await
+            }
         };
         let execution = match execution_result {
             Ok(execution) => execution,
@@ -422,21 +476,33 @@ impl SandboxRuntime {
         let mut environment = self.environment.clone();
         async move {
             let prepared = execution.prepare(executable).await?;
-            let (program, argument_prefix) = if let Some(shebang) = resolve_shebang(&prepared)? {
-                let interpreter = execution.prepare(shebang.interpreter).await?;
-                let mut arguments = Vec::with_capacity(2);
-                arguments.extend(shebang.argument);
-                arguments.push(prepared.into_os_string());
-                (interpreter, arguments)
-            } else {
-                (prepared, Vec::new())
+            let (program, argument_prefix, passthrough) = match prepared {
+                PreparedExecutableTarget::Passthrough(program) => (program, Vec::new(), true),
+                PreparedExecutableTarget::Managed(prepared) => {
+                    if let Some(shebang) = resolve_shebang(&prepared)? {
+                        let interpreter = execution.prepare(shebang.interpreter).await?;
+                        let passthrough = interpreter.is_passthrough();
+                        let mut arguments = Vec::with_capacity(2);
+                        arguments.extend(shebang.argument);
+                        arguments.push(prepared.into_os_string());
+                        (interpreter.into_path(), arguments, passthrough)
+                    } else {
+                        (prepared, Vec::new(), false)
+                    }
+                }
             };
-            environment.insert(TRACE_ID_ENVIRONMENT, TraceContext::root().encode());
+            let environment = if passthrough {
+                ProtectedEnvironment::passthrough()
+            } else {
+                environment.insert(TRACE_ID_ENVIRONMENT, TraceContext::root().encode());
+                environment
+            };
             Ok(PreparedLaunch::new(
                 program,
                 argument_prefix,
                 environment,
                 Uuid::new_v4().to_string(),
+                passthrough,
             ))
         }
     }
@@ -549,39 +615,41 @@ impl RunningSandboxCommand {
         let mut child = command.into_command();
         child.kill_on_drop(true);
         launch.environment.apply(&mut child);
-        if let Some(java_store) = launch
-            .environment
-            .additions()
-            .get(OsStr::new(JAVA_TRUST_STORE_ENVIRONMENT))
-        {
-            let options = merged_java_tool_options(
-                inherited_java_options
-                    .as_deref()
-                    .map(std::os::unix::ffi::OsStrExt::as_bytes),
-                inherited_java_store
-                    .as_deref()
-                    .map(std::os::unix::ffi::OsStrExt::as_bytes),
-                java_store.as_os_str().as_bytes(),
-            );
-            child.env(JAVA_TOOL_OPTIONS_ENVIRONMENT, OsString::from_vec(options));
-        }
-        if let Some(inherited) = inherited_libraries {
-            let base = launch
+        if !launch.is_passthrough() {
+            if let Some(java_store) = launch
                 .environment
                 .additions()
-                .get(OsStr::new("DYLD_INSERT_LIBRARIES"))
-                .context("prepared launch has no sandbox hook libraries")?;
-            let mut libraries = std::env::split_paths(base).collect::<Vec<_>>();
-            for library in std::env::split_paths(&inherited) {
-                if !libraries.contains(&library) {
-                    libraries.push(library);
-                }
+                .get(OsStr::new(JAVA_TRUST_STORE_ENVIRONMENT))
+            {
+                let options = merged_java_tool_options(
+                    inherited_java_options
+                        .as_deref()
+                        .map(std::os::unix::ffi::OsStrExt::as_bytes),
+                    inherited_java_store
+                        .as_deref()
+                        .map(std::os::unix::ffi::OsStrExt::as_bytes),
+                    java_store.as_os_str().as_bytes(),
+                );
+                child.env(JAVA_TOOL_OPTIONS_ENVIRONMENT, OsString::from_vec(options));
             }
-            let libraries = std::env::join_paths(libraries)
-                .context("invalid inherited DYLD_INSERT_LIBRARIES path")?;
-            child
-                .env("DYLD_INSERT_LIBRARIES", &libraries)
-                .env(HOOK_LIBRARIES, libraries);
+            if let Some(inherited) = inherited_libraries {
+                let base = launch
+                    .environment
+                    .additions()
+                    .get(OsStr::new("DYLD_INSERT_LIBRARIES"))
+                    .context("prepared launch has no sandbox hook libraries")?;
+                let mut libraries = std::env::split_paths(base).collect::<Vec<_>>();
+                for library in std::env::split_paths(&inherited) {
+                    if !libraries.contains(&library) {
+                        libraries.push(library);
+                    }
+                }
+                let libraries = std::env::join_paths(libraries)
+                    .context("invalid inherited DYLD_INSERT_LIBRARIES path")?;
+                child
+                    .env("DYLD_INSERT_LIBRARIES", &libraries)
+                    .env(HOOK_LIBRARIES, libraries);
+            }
         }
         child.as_std_mut().process_group(0);
         let mut terminal = if foreground {

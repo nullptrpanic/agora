@@ -4,6 +4,7 @@ use super::protocol::{
     decode_prepare_request, decode_prepare_response, decode_request, encode_ping_request,
     encode_prepare_request, encode_prepare_response, frame_length,
 };
+use crate::runner::ExecutionMode;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
@@ -61,6 +62,14 @@ fn execution_prepare_protocol_preserves_paths() {
     assert_eq!(
         decode_prepare_response(body(&response)).unwrap(),
         PrepareResponse::Ready(PathBuf::from("/tmp/agora/curl"))
+    );
+    let passthrough = encode_prepare_response(&PrepareResponse::Passthrough(PathBuf::from(
+        "/usr/bin/security",
+    )))
+    .unwrap();
+    assert_eq!(
+        decode_prepare_response(body(&passthrough)).unwrap(),
+        PrepareResponse::Passthrough(PathBuf::from("/usr/bin/security"))
     );
     assert_eq!(
         decode_prepare_response(body(
@@ -122,7 +131,7 @@ fn execution_prepare_protocol_rejects_malformed_responses() {
     assert!(decode_prepare_response(&invalid_length).is_err());
 
     let mut invalid_status = body(&ready).to_vec();
-    invalid_status[2] = 3;
+    invalid_status[2] = 4;
     assert!(decode_prepare_response(&invalid_status).is_err());
 
     let mut invalid_error = [0, 0, 2, 0, 0, 0, 5, 0, 0, 0, 1, 0xff];
@@ -187,7 +196,7 @@ async fn execution_controller_rejects_an_invalid_token() {
         .await
         .unwrap();
 
-    assert!(prepared.is_file());
+    assert!(prepared.path().is_file());
     controller.shutdown().await.unwrap();
     assert!(directory.join(".vfs.lock").is_file());
 }
@@ -204,10 +213,11 @@ async fn execution_controller_prepares_and_reuses_the_root_executable() {
         .await
         .unwrap();
 
-    assert!(prepared.starts_with(&directory));
-    assert!(prepared.is_file());
+    assert!(!prepared.is_passthrough());
+    assert!(prepared.path().starts_with(&directory));
+    assert!(prepared.path().is_file());
     controller.shutdown().await.unwrap();
-    assert!(prepared.is_file());
+    assert!(prepared.path().is_file());
 
     let controller = ExecutionController::start(directory).await.unwrap();
     let reused = controller
@@ -216,6 +226,49 @@ async fn execution_controller_prepares_and_reuses_the_root_executable() {
         .await
         .unwrap();
     assert_eq!(reused, prepared);
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn execution_controller_returns_passthrough_for_configured_policy() {
+    let root = TestDirectory::new();
+    let directory = root.cache();
+    let controller = ExecutionController::start_with_policy(
+        directory.clone(),
+        ExecutionMode::Restricted,
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    let canonical = Path::new("/usr/bin/security").canonicalize().unwrap();
+
+    let prepared = controller
+        .preparer()
+        .prepare(PathBuf::from("/usr/bin/security"))
+        .await
+        .unwrap();
+    assert!(prepared.is_passthrough());
+    assert_eq!(prepared.path(), canonical);
+    assert!(!directory.join("usr/bin/security").exists());
+
+    let mut stream = TcpStream::connect(controller.runtime().control())
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            &encode_prepare_request(controller.runtime().token(), Path::new("/usr/bin/security"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix).await.unwrap();
+    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(
+        decode_prepare_response(&response).unwrap(),
+        PrepareResponse::Passthrough(canonical)
+    );
     controller.shutdown().await.unwrap();
 }
 
@@ -266,7 +319,7 @@ async fn execution_controller_isolates_a_malformed_hook_request() {
         .await
         .unwrap();
 
-    assert!(prepared.is_file());
+    assert!(prepared.path().is_file());
     controller.shutdown().await.unwrap();
 }
 

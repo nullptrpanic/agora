@@ -21,7 +21,7 @@ const LOCK_DESCRIPTOR_POOL_CAPACITY: usize = 16;
 const TREE_CHECKSUM_CACHE_CAPACITY: usize = 64;
 // Increment when executable or loader preparation can produce different bytes
 // for the same source and target platform.
-const PREPARED_FILE_CACHE_VERSION: u32 = 2;
+const PREPARED_FILE_CACHE_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BackingIdentity {

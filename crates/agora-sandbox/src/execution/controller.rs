@@ -1,8 +1,9 @@
 use super::protocol::{
     ExecutionRequest, PrepareResponse, decode_request, encode_prepare_response, frame_length,
 };
-use super::store::ExecutableStore;
+use super::store::{ExecutableStore, PreparedExecutableTarget};
 use crate::filesystem::FileCipher;
+use crate::runner::ExecutionMode;
 use anyhow::{Context, Result};
 use std::io;
 use std::net::SocketAddr;
@@ -46,7 +47,7 @@ pub(crate) struct ExecutionController {
 pub(crate) struct ExecutionPreparer(Arc<Mutex<ExecutableStore>>);
 
 impl ExecutionPreparer {
-    pub(crate) async fn prepare(&self, executable: PathBuf) -> Result<PathBuf> {
+    pub(crate) async fn prepare(&self, executable: PathBuf) -> Result<PreparedExecutableTarget> {
         let store = Arc::clone(&self.0);
         tokio::task::spawn_blocking(move || lock(&store).prepare(&executable))
             .await
@@ -55,18 +56,42 @@ impl ExecutionPreparer {
 }
 
 impl ExecutionController {
+    #[cfg(test)]
     pub(crate) async fn start(directory: PathBuf) -> Result<Self> {
-        Self::start_with_cipher(directory, None).await
+        Self::start_with_options(directory, None, ExecutionMode::Strict, Vec::new()).await
     }
 
-    pub(crate) async fn start_encrypted(directory: PathBuf, cipher: FileCipher) -> Result<Self> {
-        Self::start_with_cipher(directory, Some(cipher)).await
+    pub(crate) async fn start_with_policy(
+        directory: PathBuf,
+        mode: ExecutionMode,
+        passthrough_executables: Vec<PathBuf>,
+    ) -> Result<Self> {
+        Self::start_with_options(directory, None, mode, passthrough_executables).await
     }
 
-    async fn start_with_cipher(directory: PathBuf, cipher: Option<FileCipher>) -> Result<Self> {
+    pub(crate) async fn start_encrypted_with_policy(
+        directory: PathBuf,
+        cipher: FileCipher,
+        mode: ExecutionMode,
+        passthrough_executables: Vec<PathBuf>,
+    ) -> Result<Self> {
+        Self::start_with_options(directory, Some(cipher), mode, passthrough_executables).await
+    }
+
+    async fn start_with_options(
+        directory: PathBuf,
+        cipher: Option<FileCipher>,
+        mode: ExecutionMode,
+        passthrough_executables: Vec<PathBuf>,
+    ) -> Result<Self> {
         let store = Arc::new(Mutex::new(match cipher {
-            Some(cipher) => ExecutableStore::encrypted(directory, cipher)?,
-            None => ExecutableStore::new(directory)?,
+            Some(cipher) => ExecutableStore::encrypted_with_policy(
+                directory,
+                cipher,
+                mode,
+                passthrough_executables,
+            )?,
+            None => ExecutableStore::with_policy(directory, mode, passthrough_executables)?,
         }));
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -264,7 +289,12 @@ impl ExecutionServer {
                     match tokio::task::spawn_blocking(move || lock(&store).prepare(&executable))
                         .await
                     {
-                        Ok(Ok(path)) => PrepareResponse::Ready(path),
+                        Ok(Ok(PreparedExecutableTarget::Managed(path))) => {
+                            PrepareResponse::Ready(path)
+                        }
+                        Ok(Ok(PreparedExecutableTarget::Passthrough(path))) => {
+                            PrepareResponse::Passthrough(path)
+                        }
                         Ok(Err(error)) => PrepareResponse::Error {
                             errno: preparation_errno(&error),
                             message: format!("{error:#}"),

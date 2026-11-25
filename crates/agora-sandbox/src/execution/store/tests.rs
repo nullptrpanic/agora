@@ -1,9 +1,10 @@
 use super::{
     ArchitectureSelection, CPU_SUBTYPE_ARM64E, CPU_TYPE_ARM64, CS_DYLD_RESTRICTED, CS_RUNTIME,
-    CodeSignature, ExecutableStore, MACH_64_MAGIC, resolve_shebang,
+    CodeSignature, ExecutableStore, MACH_64_MAGIC, PreparedExecutableTarget, resolve_shebang,
 };
 use crate::execution::resolve_executable;
 use crate::filesystem::{EntryState, Materializer};
+use crate::runner::ExecutionMode;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -121,8 +122,8 @@ fn executable_store_prepares_and_caches_a_native_copy() {
     let directory = root.path().join("prepared");
     let store = ExecutableStore::new(directory.clone()).unwrap();
 
-    let first = store.prepare(Path::new("/bin/sh")).unwrap();
-    let second = store.prepare(Path::new("/bin/sh")).unwrap();
+    let first = store.prepare(Path::new("/bin/sh")).unwrap().into_path();
+    let second = store.prepare(Path::new("/bin/sh")).unwrap().into_path();
 
     assert_eq!(first, second);
     assert_eq!(first, directory.join("bin/sh"));
@@ -145,7 +146,7 @@ fn executable_store_prepares_and_caches_a_native_copy() {
         variant.as_deref(),
         Some(
             format!(
-                "{}/{}/prepare-v2",
+                "{}/{}/prepare-v3",
                 std::env::consts::OS,
                 std::env::consts::ARCH
             )
@@ -172,7 +173,10 @@ fn executable_store_prepares_and_caches_a_native_copy() {
     drop(store);
 
     let reused_store = ExecutableStore::new(directory).unwrap();
-    let reused = reused_store.prepare(Path::new("/bin/sh")).unwrap();
+    let reused = reused_store
+        .prepare(Path::new("/bin/sh"))
+        .unwrap()
+        .into_path();
     assert_eq!(reused, first);
     assert_eq!(reused.metadata().unwrap().ino(), inode);
     let metadata: serde_json::Value =
@@ -184,7 +188,7 @@ fn executable_store_prepares_and_caches_a_native_copy() {
     assert_eq!(
         metadata["entries"]["sh"]["entry"]["variant"],
         format!(
-            "{}/{}/prepare-v2",
+            "{}/{}/prepare-v3",
             std::env::consts::OS,
             std::env::consts::ARCH
         )
@@ -215,7 +219,7 @@ fn executable_store_keeps_normal_reads_on_lower_before_execution() {
     assert_eq!(store.overlay.prepare_read(&source).unwrap(), source);
     assert_eq!(store.overlay.state(&source).unwrap(), None);
 
-    let cached = store.prepare(&source).unwrap();
+    let cached = store.prepare(&source).unwrap().into_path();
     assert_ne!(cached, source);
     assert!(matches!(
         store.overlay.state(&source).unwrap(),
@@ -233,7 +237,10 @@ fn executable_store_keeps_unrestricted_binaries_and_scripts_at_their_original_pa
     let store = ExecutableStore::new(directory.clone()).unwrap();
     let binary = std::env::current_exe().unwrap().canonicalize().unwrap();
 
-    assert_eq!(store.prepare(&binary).unwrap(), binary);
+    assert_eq!(
+        store.prepare(&binary).unwrap(),
+        PreparedExecutableTarget::Managed(binary.clone())
+    );
 
     let script = root.path().join("client");
     fs::write(&script, b"#!/usr/bin/env node\r\nconsole.log('ok')\n").unwrap();
@@ -243,7 +250,10 @@ fn executable_store_keeps_unrestricted_binaries_and_scripts_at_their_original_pa
 
     assert_eq!(shebang.interpreter, Path::new("/usr/bin/env"));
     assert_eq!(shebang.argument.as_deref(), Some(OsStr::new("node")));
-    assert_eq!(store.prepare(&script).unwrap(), script);
+    assert_eq!(
+        store.prepare(&script).unwrap(),
+        PreparedExecutableTarget::Managed(script.clone())
+    );
     assert!(!store.destination(&script).unwrap().exists());
     assert_eq!(fs::read_dir(directory).unwrap().count(), 2);
 }
@@ -259,7 +269,10 @@ fn executable_store_prefers_a_cow_script_over_the_lower_file() {
     fs::write(&mapped, b"#!/bin/sh\necho sandbox\n").unwrap();
     fs::set_permissions(&mapped, fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert_eq!(store.prepare(&source).unwrap(), mapped);
+    assert_eq!(
+        store.prepare(&source).unwrap(),
+        PreparedExecutableTarget::Managed(mapped)
+    );
     assert_eq!(
         fs::read_to_string(&source).unwrap(),
         "#!/bin/sh\necho lower\n"
@@ -281,7 +294,10 @@ fn executable_store_resigns_a_restricted_cow_binary_in_place() {
     let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
     let mapped = store.overlay.prepare_write(&source, false).unwrap();
 
-    assert_eq!(store.prepare(&source).unwrap(), mapped);
+    assert_eq!(
+        store.prepare(&source).unwrap(),
+        PreparedExecutableTarget::Managed(mapped.clone())
+    );
     assert_eq!(
         ExecutableStore::code_signing_flags(&mapped).unwrap() & CS_DYLD_RESTRICTED,
         0
@@ -310,7 +326,7 @@ fn executable_store_copies_hardened_runtime_binaries() {
     );
     let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
 
-    let prepared = store.prepare(&source).unwrap();
+    let prepared = store.prepare(&source).unwrap().into_path();
 
     assert_ne!(prepared, source);
     assert_eq!(
@@ -344,7 +360,7 @@ fn executable_store_preserves_entitlements_when_resigning() {
     assert!(status.success());
     let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
 
-    let prepared = store.prepare(&source).unwrap();
+    let prepared = store.prepare(&source).unwrap().into_path();
 
     let output = Command::new("/usr/bin/codesign")
         .args(["--display", "--entitlements", ":-", "--xml"])
@@ -395,7 +411,7 @@ fn executable_store_strips_identity_bound_entitlements_before_caching() {
     assert!(status.success());
     let source = source.canonicalize().unwrap();
     let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
-    let prepared = store.prepare(&source).unwrap();
+    let prepared = store.prepare(&source).unwrap().into_path();
 
     let output = Command::new("/usr/bin/codesign")
         .args(["--display", "--verbose=4", "--entitlements", ":-", "--xml"])
@@ -453,9 +469,9 @@ fn executable_store_reuses_a_sanitized_identity_bound_copy() {
     assert!(status.success());
     let source = source.canonicalize().unwrap();
     let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
-    let prepared = store.prepare(&source).unwrap();
+    let prepared = store.prepare(&source).unwrap().into_path();
     let inode = prepared.metadata().unwrap().ino();
-    let reused = store.prepare(&source).unwrap();
+    let reused = store.prepare(&source).unwrap().into_path();
 
     assert_eq!(reused, prepared);
     assert_eq!(reused.metadata().unwrap().ino(), inode);
@@ -465,47 +481,206 @@ fn executable_store_reuses_a_sanitized_identity_bound_copy() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(
-        !String::from_utf8_lossy(&output.stdout).contains("com.apple.developer.team-identifier")
-    );
+    assert!(output.stdout.is_empty());
 }
 
 #[test]
-fn identity_bound_entitlement_policy_is_generic() {
+fn identity_bound_entitlement_policy_uses_an_adhoc_safe_allowlist() {
     for entitlement in [
         "application-identifier",
         "com.apple.application-identifier",
+        "com.apple.authorization.smartcard.override",
         "com.apple.developer.icloud-services",
         "com.apple.developer.team-identifier",
+        "com.apple.keystore.keybag.create",
         "com.apple.private.security.no-container",
         "com.apple.rootless.storage.AppData",
         "com.apple.security.application-groups",
+        "com.apple.security.exception.mach-lookup.global-name",
+        "com.apple.security.hardened-process",
+        "com.apple.security.iokit-user-client-class",
         "com.apple.security.system-container",
         "com.apple.security.system-groups",
+        "com.apple.system-task-ports.read",
+        "com.example.custom-entitlement",
         "keychain-access-groups",
         "aps-environment",
         "beta-reports-active",
         "fairplay-client",
+        "platform-application",
         "useractivity-team-identifier",
     ] {
         assert!(
             ExecutableStore::requires_original_signing_identity(entitlement),
-            "expected {entitlement} to require the original signing identity"
+            "expected {entitlement} to be stripped during ad-hoc preparation"
         );
     }
 
     for entitlement in [
         "com.apple.security.app-sandbox",
+        "com.apple.security.assets.pictures.read-only",
         "com.apple.security.automation.apple-events",
         "com.apple.security.cs.allow-jit",
+        "com.apple.security.cs.disable-library-validation",
+        "com.apple.security.device.camera",
+        "com.apple.security.files.user-selected.read-write",
+        "com.apple.security.get-task-allow",
+        "com.apple.security.hypervisor",
         "com.apple.security.network.client",
-        "com.example.custom-entitlement",
+        "com.apple.security.personal-information.location",
+        "com.apple.security.print",
+        "com.apple.security.scripting-targets",
+        "com.apple.security.smartcard",
+        "com.apple.security.temporary-exception.files.absolute-path.read-only",
     ] {
         assert!(
             !ExecutableStore::requires_original_signing_identity(entitlement),
             "expected {entitlement} to remain eligible for ad-hoc preparation"
         );
     }
+}
+
+#[test]
+fn executable_store_prepares_macos_security_without_restricted_entitlements() {
+    let root = TestDirectory::new();
+    let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
+
+    let prepared = store
+        .prepare(Path::new("/usr/bin/security"))
+        .unwrap()
+        .into_path();
+
+    let signature = Command::new("/usr/bin/codesign")
+        .args(["--display", "--verbose=4", "--entitlements", ":-", "--xml"])
+        .arg(&prepared)
+        .output()
+        .unwrap();
+    assert!(signature.status.success());
+    assert!(signature.stdout.is_empty());
+
+    let run = Command::new(&prepared).arg("help").output().unwrap();
+    assert!(
+        run.status.success(),
+        "prepared /usr/bin/security failed (status={:?}, stderr={})",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn executable_store_passthrough_skips_copy_and_respects_overlay_state() {
+    let root = TestDirectory::new();
+    let directory = root.path().join("workdir/fs");
+    let security = Path::new("/usr/bin/security").canonicalize().unwrap();
+    let local_bin = root.path().join("local-tool");
+    fs::copy("/bin/sh", &local_bin).unwrap();
+    fs::set_permissions(&local_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    let canonical_local = local_bin.canonicalize().unwrap();
+    let symlink_local = root.path().join("local-tool-link");
+    std::os::unix::fs::symlink(&local_bin, &symlink_local).unwrap();
+
+    let store = ExecutableStore::with_policy(
+        directory.clone(),
+        ExecutionMode::Strict,
+        vec![PathBuf::from("/usr/bin/security"), symlink_local.clone()],
+    )
+    .unwrap();
+
+    assert_eq!(
+        store.prepare(Path::new("/usr/bin/security")).unwrap(),
+        PreparedExecutableTarget::Passthrough(security)
+    );
+    assert!(!directory.join("usr/bin/security").exists());
+
+    assert_eq!(
+        store.prepare(&symlink_local).unwrap(),
+        PreparedExecutableTarget::Passthrough(canonical_local.clone())
+    );
+    assert!(!store.destination(&canonical_local).unwrap().exists());
+
+    // A sandbox COW override must never escape via passthrough.
+    let cow = store
+        .overlay
+        .prepare_write(&canonical_local, false)
+        .unwrap();
+    assert_eq!(
+        store.prepare(&canonical_local).unwrap(),
+        PreparedExecutableTarget::Managed(cow)
+    );
+
+    // An overlay whiteout must still hide the host executable.
+    store.overlay.remove(&canonical_local, false).unwrap();
+    assert!(store.prepare(&canonical_local).is_err());
+}
+
+#[test]
+fn execution_modes_control_automatic_passthrough_by_signing_profile() {
+    let root = TestDirectory::new();
+    let security = Path::new("/usr/bin/security").canonicalize().unwrap();
+    let shell = Path::new("/bin/sh").canonicalize().unwrap();
+
+    let restricted_dir = root.path().join("restricted/fs");
+    let restricted = ExecutableStore::with_policy(
+        restricted_dir.clone(),
+        ExecutionMode::Restricted,
+        Vec::new(),
+    )
+    .unwrap();
+    // /usr/bin/security carries restricted entitlements and passes through automatically.
+    assert_eq!(
+        restricted.prepare(&security).unwrap(),
+        PreparedExecutableTarget::Passthrough(security.clone())
+    );
+    assert!(!restricted_dir.join("usr/bin/security").exists());
+    // /bin/sh is SIP-restricted without restricted entitlements and stays managed.
+    let prepared_shell = restricted.prepare(&shell).unwrap();
+    assert!(!prepared_shell.is_passthrough());
+    assert!(prepared_shell.path().starts_with(&restricted_dir));
+    // /usr/bin/open remains rejected even in restricted mode.
+    assert!(restricted.prepare(Path::new("/usr/bin/open")).is_err());
+
+    // A hardened binary carrying only allowlisted entitlements stays managed in restricted mode.
+    let allowlisted = root.path().join("allowlisted-sh");
+    let entitlements = root.path().join("allowlisted.plist");
+    fs::copy("/bin/sh", &allowlisted).unwrap();
+    fs::set_permissions(&allowlisted, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        &entitlements,
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+          <plist version=\"1.0\"><dict>\
+          <key>com.apple.security.cs.allow-jit</key><true/>\
+          </dict></plist>\n",
+    )
+    .unwrap();
+    let status = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-", "--options", "runtime"])
+        .arg("--entitlements")
+        .arg(&entitlements)
+        .arg(&allowlisted)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let prepared_allowlisted = restricted.prepare(&allowlisted).unwrap();
+    assert!(!prepared_allowlisted.is_passthrough());
+    assert!(prepared_allowlisted.path().starts_with(&restricted_dir));
+
+    // In bypass mode, any binary that would require copying passes through automatically,
+    // while unrestricted binaries and COW files remain managed.
+    let bypass_dir = root.path().join("bypass/fs");
+    let bypass =
+        ExecutableStore::with_policy(bypass_dir.clone(), ExecutionMode::Bypass, Vec::new())
+            .unwrap();
+    assert_eq!(
+        bypass.prepare(&shell).unwrap(),
+        PreparedExecutableTarget::Passthrough(shell.clone())
+    );
+    assert!(!bypass_dir.join("bin/sh").exists());
+    let unrestricted = std::env::current_exe().unwrap().canonicalize().unwrap();
+    assert_eq!(
+        bypass.prepare(&unrestricted).unwrap(),
+        PreparedExecutableTarget::Managed(unrestricted)
+    );
+    assert!(bypass.prepare(Path::new("/usr/bin/open")).is_err());
 }
 
 #[test]
@@ -539,7 +714,7 @@ fn executable_store_preserves_code_identifier_when_resigning() {
     assert!(status.success());
     let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
 
-    let prepared = store.prepare(&source).unwrap();
+    let prepared = store.prepare(&source).unwrap().into_path();
 
     let output = Command::new("/usr/bin/codesign")
         .args(["--display", "--verbose=4"])
@@ -916,7 +1091,7 @@ fn missing_cached_executable_maps_back_to_its_original_source() {
     let cached = store.overlay.root().join("bin/sh");
     assert!(!cached.exists());
 
-    let prepared = store.prepare(&cached).unwrap();
+    let prepared = store.prepare(&cached).unwrap().into_path();
 
     assert_eq!(prepared, cached);
     assert!(prepared.is_file());
@@ -1006,18 +1181,24 @@ fn executable_store_rebuilds_when_the_copy_or_metadata_is_missing() {
     let root = TestDirectory::new();
     let directory = root.path().join("prepared");
     let store = ExecutableStore::new(directory.clone()).unwrap();
-    let destination = store.prepare(Path::new("/bin/sh")).unwrap();
+    let destination = store.prepare(Path::new("/bin/sh")).unwrap().into_path();
     let source = Path::new("/bin/sh").canonicalize().unwrap();
 
     store.overlay.remove_state_for_test(&source).unwrap();
     fs::write(&destination, b"stale executable").unwrap();
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(store.prepare(Path::new("/bin/sh")).unwrap(), destination);
+    assert_eq!(
+        store.prepare(Path::new("/bin/sh")).unwrap().into_path(),
+        destination
+    );
     assert_ne!(fs::read(&destination).unwrap(), b"stale executable");
     assert!(store.overlay.state_for_test(&source).unwrap().is_some());
 
     fs::remove_file(&destination).unwrap();
-    assert_eq!(store.prepare(Path::new("/bin/sh")).unwrap(), destination);
+    assert_eq!(
+        store.prepare(Path::new("/bin/sh")).unwrap().into_path(),
+        destination
+    );
     assert!(destination.is_file());
     assert!(store.overlay.state_for_test(&source).unwrap().is_some());
 }
@@ -1071,10 +1252,13 @@ fn executable_store_rebuilds_when_the_source_identity_changes() {
 fn executable_store_reuses_the_copy_when_the_source_identity_matches() {
     let root = TestDirectory::new();
     let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
-    let destination = store.prepare(Path::new("/bin/sh")).unwrap();
+    let destination = store.prepare(Path::new("/bin/sh")).unwrap().into_path();
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
 
-    assert_eq!(store.prepare(Path::new("/bin/sh")).unwrap(), destination);
+    assert_eq!(
+        store.prepare(Path::new("/bin/sh")).unwrap().into_path(),
+        destination
+    );
     assert_eq!(
         destination.metadata().unwrap().permissions().mode() & 0o777,
         0o700
@@ -1091,17 +1275,17 @@ fn executable_store_replaces_invalid_cache_files_and_rejects_non_files() {
     fs::create_dir_all(destination.parent().unwrap()).unwrap();
     fs::write(&destination, b"invalid").unwrap();
 
-    assert_eq!(store.prepare(&source).unwrap(), destination);
+    assert_eq!(store.prepare(&source).unwrap().into_path(), destination);
     assert_ne!(fs::read(&destination).unwrap(), b"invalid");
 
     fs::remove_file(&destination).unwrap();
-    assert_eq!(store.prepare(&source).unwrap(), destination);
+    assert_eq!(store.prepare(&source).unwrap().into_path(), destination);
     assert!(destination.is_file());
 
     store.overlay.remove_state_for_test(&source).unwrap();
     fs::remove_file(&destination).unwrap();
     fs::create_dir_all(&destination).unwrap();
-    assert_eq!(store.prepare(&source).unwrap(), destination);
+    assert_eq!(store.prepare(&source).unwrap().into_path(), destination);
     assert!(destination.is_file());
 }
 

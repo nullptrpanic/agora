@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 mod tests;
 
-pub(crate) const EXECUTION_PROTOCOL_VERSION: u16 = 6;
+pub(crate) const EXECUTION_PROTOCOL_VERSION: u16 = 7;
 pub(super) const MAX_EXECUTION_FRAME_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -25,6 +25,7 @@ pub(crate) enum ExecutionRequest {
 pub(crate) enum PrepareResponse {
     Accepted,
     Ready(PathBuf),
+    Passthrough(PathBuf),
     Error { errno: i32, message: String },
 }
 
@@ -108,6 +109,7 @@ pub(super) fn encode_prepare_response(response: &PrepareResponse) -> io::Result<
     let (status, content) = match response {
         PrepareResponse::Accepted => (0_u8, Vec::new()),
         PrepareResponse::Ready(path) => (1_u8, path.as_os_str().as_bytes().to_vec()),
+        PrepareResponse::Passthrough(path) => (3_u8, path.as_os_str().as_bytes().to_vec()),
         PrepareResponse::Error { errno, message } => {
             if *errno <= 0 {
                 return Err(io::Error::new(
@@ -148,6 +150,9 @@ pub(crate) fn decode_prepare_response(frame: &[u8]) -> io::Result<PrepareRespons
         1 if content_length != 0 => Ok(PrepareResponse::Ready(PathBuf::from(OsString::from_vec(
             frame[7..].to_vec(),
         )))),
+        3 if content_length != 0 => Ok(PrepareResponse::Passthrough(PathBuf::from(
+            OsString::from_vec(frame[7..].to_vec()),
+        ))),
         2 if content_length >= 4 => {
             let errno = i32::from_be_bytes(frame[7..11].try_into().unwrap());
             if errno <= 0 {

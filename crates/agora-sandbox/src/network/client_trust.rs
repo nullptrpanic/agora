@@ -63,6 +63,50 @@ pub(crate) fn merged_java_tool_options(
     if !options.is_empty() && !options.last().is_some_and(u8::is_ascii_whitespace) {
         options.push(b' ');
     }
+    options.extend_from_slice(&managed_java_trust_store_options(managed_store));
+    options
+}
+
+pub(crate) fn strip_managed_java_tool_options(
+    existing: &[u8],
+    managed_store: &[u8],
+) -> Option<Vec<u8>> {
+    let managed = managed_java_trust_store_options(managed_store);
+    let mut remaining = existing.to_vec();
+    while let Some(index) = remaining
+        .windows(managed.len())
+        .position(|window| window == managed.as_slice())
+    {
+        let before_ok = index == 0 || remaining[index - 1].is_ascii_whitespace();
+        let end = index + managed.len();
+        let after_ok = end == remaining.len() || remaining[end].is_ascii_whitespace();
+        if !before_ok || !after_ok {
+            break;
+        }
+        let remove_start = if index > 0 && remaining[index - 1].is_ascii_whitespace() {
+            index - 1
+        } else {
+            index
+        };
+        let remove_end =
+            if remove_start == 0 && end < remaining.len() && remaining[end].is_ascii_whitespace() {
+                end + 1
+            } else {
+                end
+            };
+        remaining.drain(remove_start..remove_end);
+    }
+    while remaining.first().is_some_and(u8::is_ascii_whitespace) {
+        remaining.remove(0);
+    }
+    while remaining.last().is_some_and(u8::is_ascii_whitespace) {
+        remaining.pop();
+    }
+    (!remaining.is_empty()).then_some(remaining)
+}
+
+fn managed_java_trust_store_options(managed_store: &[u8]) -> Vec<u8> {
+    let mut options = Vec::new();
     options.extend_from_slice(JAVA_TRUST_STORE_OPTION);
     append_java_option_value(&mut options, managed_store);
     options.extend_from_slice(b" -Djavax.net.ssl.trustStoreType=JKS");

@@ -1,7 +1,7 @@
 //! Configuration adapter for the `agora-sandbox` binary.
 
 use agora_sandbox::network::TlsMode;
-use agora_sandbox::runner::{SandboxConfig, SmbRemoteConfig};
+use agora_sandbox::runner::{ExecutionMode, SandboxConfig, SmbRemoteConfig};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::fs::{File, OpenOptions};
@@ -16,6 +16,8 @@ pub(super) struct RunConfig {
     tls: TlsMode,
     local: LocalFilesystem,
     native_passthrough_roots: Vec<PathBuf>,
+    execution_mode: ExecutionMode,
+    native_executable_passthroughs: Vec<PathBuf>,
     remotes: Vec<SmbRemoteConfig>,
     log_file: PathBuf,
     identity_seed: [u8; 32],
@@ -72,6 +74,10 @@ impl RunConfig {
         for root in self.native_passthrough_roots {
             config = config.with_native_passthrough_root(root);
         }
+        config = config.with_execution_mode(self.execution_mode);
+        for executable in self.native_executable_passthroughs {
+            config = config.with_native_executable_passthrough(executable);
+        }
         for remote in self.remotes {
             config = config.with_smb_remote(remote);
         }
@@ -91,6 +97,8 @@ struct StoredConfig {
     workdir: Option<PathBuf>,
     #[serde(default)]
     tls: StoredTlsMode,
+    #[serde(default)]
+    execution: StoredExecution,
     #[serde(default)]
     filesystem: StoredFilesystem,
     #[serde(default)]
@@ -161,6 +169,36 @@ impl StoredConfig {
         for root in &native_passthrough_roots {
             identity.path(root);
         }
+        let execution_mode: ExecutionMode = self.execution.mode.into();
+        identity.byte(match execution_mode {
+            ExecutionMode::Strict => 0,
+            ExecutionMode::Restricted => 1,
+            ExecutionMode::Bypass => 2,
+        });
+        let mut native_executable_passthroughs = self
+            .execution
+            .bypass
+            .into_iter()
+            .map(|executable| {
+                if !executable.is_absolute() {
+                    bail!(
+                        "execution bypass path must be absolute: {}",
+                        executable.display()
+                    );
+                }
+                let normalized = normalize_absolute_path(&executable)?;
+                if normalized == Path::new("/") {
+                    bail!("execution bypass path must not be root");
+                }
+                Ok(normalized)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        native_executable_passthroughs.sort();
+        native_executable_passthroughs.dedup();
+        identity.usize(native_executable_passthroughs.len());
+        for executable in &native_executable_passthroughs {
+            identity.path(executable);
+        }
         let remotes = self.filesystem.nfs;
         identity.usize(remotes.len());
         let remotes = remotes
@@ -172,6 +210,8 @@ impl StoredConfig {
             tls,
             local,
             native_passthrough_roots,
+            execution_mode,
+            native_executable_passthroughs,
             remotes,
             log_file,
             identity_seed: identity.finish(),
@@ -192,6 +232,34 @@ impl From<StoredTlsMode> for TlsMode {
         match value {
             StoredTlsMode::Off => Self::Off,
             StoredTlsMode::Auto => Self::Auto,
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredExecution {
+    #[serde(default)]
+    mode: StoredExecutionMode,
+    #[serde(default)]
+    bypass: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum StoredExecutionMode {
+    #[default]
+    Strict,
+    Restricted,
+    Bypass,
+}
+
+impl From<StoredExecutionMode> for ExecutionMode {
+    fn from(value: StoredExecutionMode) -> Self {
+        match value {
+            StoredExecutionMode::Strict => Self::Strict,
+            StoredExecutionMode::Restricted => Self::Restricted,
+            StoredExecutionMode::Bypass => Self::Bypass,
         }
     }
 }

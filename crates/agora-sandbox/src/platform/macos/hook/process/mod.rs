@@ -12,7 +12,9 @@ use crate::execution::{
     DEFAULT_EXECUTABLE_PATH, PrepareResponse, encode_prepare_request, resolve_shebang,
 };
 use crate::ipc::InheritedControlStream;
-use crate::network::client_trust::{JAVA_TOOL_OPTIONS_ENVIRONMENT, merged_java_tool_options};
+use crate::network::client_trust::{
+    JAVA_TOOL_OPTIONS_ENVIRONMENT, merged_java_tool_options, strip_managed_java_tool_options,
+};
 use crate::trace::TraceContext;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -123,6 +125,7 @@ struct ProcessHookRuntime {
 struct PreparedExecutable {
     program: CString,
     arguments: Vec<CString>,
+    passthrough: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,6 +430,54 @@ impl ChildEnvironment {
         Some(Self { values, pointers })
     }
 
+    unsafe fn passthrough(
+        environment: *const *const libc::c_char,
+        config: &HookConfig,
+    ) -> Option<Self> {
+        let mut values = Vec::new();
+        if !environment.is_null() {
+            let mut current = environment;
+            while !(unsafe { *current }).is_null() {
+                let value = unsafe { CStr::from_ptr(*current) }.to_bytes();
+                if let Some(java_store) = config.java_trust_store()
+                    && Self::has_key(value, JAVA_TOOL_OPTIONS_ENVIRONMENT)
+                {
+                    if let Some(options) = value
+                        .strip_prefix(JAVA_TOOL_OPTIONS_ENVIRONMENT.as_bytes())
+                        .and_then(|value| value.strip_prefix(b"="))
+                        .and_then(|value| {
+                            strip_managed_java_tool_options(value, java_store.as_bytes())
+                        })
+                    {
+                        let mut entry = Vec::with_capacity(
+                            JAVA_TOOL_OPTIONS_ENVIRONMENT.len() + 1 + options.len(),
+                        );
+                        entry.extend_from_slice(JAVA_TOOL_OPTIONS_ENVIRONMENT.as_bytes());
+                        entry.push(b'=');
+                        entry.extend_from_slice(&options);
+                        values.push(CString::new(entry).ok()?);
+                    }
+                    current = unsafe { current.add(1) };
+                    continue;
+                }
+                if !CHILD_RUNTIME_ENVIRONMENT
+                    .iter()
+                    .any(|key| Self::has_key(value, key))
+                    && !Self::has_key(value, "DYLD_INSERT_LIBRARIES")
+                {
+                    values.push(CString::new(value).ok()?);
+                }
+                current = unsafe { current.add(1) };
+            }
+        }
+        let mut pointers = values
+            .iter()
+            .map(|value| value.as_ptr().cast_mut())
+            .collect::<Vec<_>>();
+        pointers.push(std::ptr::null_mut());
+        Some(Self { values, pointers })
+    }
+
     fn as_posix_ptr(&self) -> *const *mut libc::c_char {
         debug_assert_eq!(self.values.len() + 1, self.pointers.len());
         self.pointers.as_ptr()
@@ -478,7 +529,7 @@ impl ProcessHookRuntime {
             .as_ref()
     }
 
-    fn prepare(&self, executable: &Path) -> Result<CString, PrepareError> {
+    fn prepare(&self, executable: &Path) -> Result<(CString, bool), PrepareError> {
         let request = encode_prepare_request(self.config.execution_token(), executable)
             .map_err(|error| PrepareError::new(io_errno(&error), error.to_string()))?;
         let current_pid = std::process::id();
@@ -518,11 +569,16 @@ impl ProcessHookRuntime {
                 libc::EPROTO,
                 "execution preparation returned a handshake response",
             )),
-            PrepareResponse::Ready(path) => {
-                CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            PrepareResponse::Ready(path) => CString::new(path.as_os_str().as_bytes())
+                .map(|program| (program, false))
+                .map_err(|_| {
                     PrepareError::new(libc::EINVAL, "prepared executable path contains NUL")
-                })
-            }
+                }),
+            PrepareResponse::Passthrough(path) => CString::new(path.as_os_str().as_bytes())
+                .map(|program| (program, true))
+                .map_err(|_| {
+                    PrepareError::new(libc::EINVAL, "prepared executable path contains NUL")
+                }),
             PrepareResponse::Error { errno, message } => Err(PrepareError::new(errno, message)),
         }
     }
@@ -546,7 +602,14 @@ impl ProcessHookRuntime {
     }
 
     fn prepare_executable(&self, executable: &Path) -> Result<PreparedExecutable, PrepareError> {
-        let program = self.prepare(executable)?;
+        let (program, passthrough) = self.prepare(executable)?;
+        if passthrough {
+            return Ok(PreparedExecutable {
+                program,
+                arguments: Vec::new(),
+                passthrough: true,
+            });
+        }
         let script = Path::new(OsStr::from_bytes(program.to_bytes()));
         let Some(shebang) = resolve_shebang(script)
             .map_err(|error| PrepareError::from_anyhow(error, libc::ENOEXEC))?
@@ -554,9 +617,10 @@ impl ProcessHookRuntime {
             return Ok(PreparedExecutable {
                 program,
                 arguments: Vec::new(),
+                passthrough: false,
             });
         };
-        let interpreter = self.prepare(&shebang.interpreter)?;
+        let (interpreter, passthrough) = self.prepare(&shebang.interpreter)?;
         let mut arguments = Vec::with_capacity(2);
         if let Some(argument) = shebang.argument {
             arguments.push(
@@ -572,6 +636,7 @@ impl ProcessHookRuntime {
         Ok(PreparedExecutable {
             program: interpreter,
             arguments,
+            passthrough,
         })
     }
 
@@ -865,6 +930,49 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
     }
 }
 
+struct PassthroughCloexecGuard {
+    restored: Vec<(libc::c_int, libc::c_int)>,
+}
+
+impl PassthroughCloexecGuard {
+    fn apply(descriptors: impl IntoIterator<Item = libc::c_int>) -> Result<Self, PrepareError> {
+        let mut guard = Self {
+            restored: Vec::new(),
+        };
+        let mut seen = std::collections::HashSet::new();
+        for fd in descriptors {
+            if fd < 0 || !seen.insert(fd) {
+                continue;
+            }
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EBADF) {
+                    continue;
+                }
+                return Err(PrepareError::from(error));
+            }
+            if flags & libc::FD_CLOEXEC == 0 {
+                if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+                    return Err(PrepareError::from(io::Error::last_os_error()));
+                }
+                guard.restored.push((fd, flags));
+            }
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for PassthroughCloexecGuard {
+    fn drop(&mut self) {
+        for (fd, flags) in self.restored.drain(..) {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, flags);
+            }
+        }
+    }
+}
+
 unsafe fn spawn(
     pid: *mut libc::pid_t,
     path: *const libc::c_char,
@@ -902,6 +1010,49 @@ unsafe fn spawn(
     let Some(runtime) = ProcessHookRuntime::global() else {
         return libc::EACCES;
     };
+    if prepared.passthrough {
+        let file_actions =
+            match unsafe { SpawnFileActions::prepare_passthrough(file_actions, attributes) } {
+                Ok(file_actions) => file_actions,
+                Err(error) => return report_process_attempt_error(runtime, &pending, error),
+            };
+        let Some(environment) = (unsafe {
+            ChildEnvironment::passthrough(
+                environment.cast::<*const libc::c_char>(),
+                &runtime.config,
+            )
+        }) else {
+            return report_process_attempt_error(runtime, &pending, libc::EACCES);
+        };
+        let Some(arguments) =
+            (unsafe { ChildArguments::new(arguments.cast::<*const libc::c_char>(), &prepared) })
+        else {
+            return report_process_attempt_error(runtime, &pending, libc::EACCES);
+        };
+        if file_actions.replaces_process
+            && let Err(error) = super::filesystem::flush_before_exec()
+        {
+            return report_process_attempt_error(
+                runtime,
+                &pending,
+                PrepareError::from_anyhow(error, libc::EIO).errno,
+            );
+        }
+        if let Err(error) = publish_process_attempt(runtime, &pending) {
+            return error.errno;
+        }
+        drop(guard);
+        return unsafe {
+            original(
+                pid,
+                prepared.program.as_ptr(),
+                file_actions.as_ptr(),
+                attributes,
+                arguments.as_posix_ptr(),
+                environment.as_posix_ptr(),
+            )
+        };
+    }
     let pending_environment = match pending.environment_entry() {
         Ok(environment) => environment,
         Err(error) => return report_process_attempt_error(runtime, &pending, error.errno),
@@ -1050,6 +1201,55 @@ unsafe fn execute(
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };
+    if prepared.passthrough {
+        let extra_cloexec = match super::filesystem::prepare_passthrough_exec() {
+            Ok(descriptors) => descriptors,
+            Err(error) => {
+                let error = PrepareError::from_anyhow(error, libc::EIO);
+                return unsafe { report_exec_failure(runtime, &pending, error.errno) };
+            }
+        };
+        let Some(environment) =
+            (unsafe { ChildEnvironment::passthrough(environment, &runtime.config) })
+        else {
+            return unsafe { report_exec_failure(runtime, &pending, libc::EACCES) };
+        };
+        let Some(child_arguments) = (unsafe { ChildArguments::new(arguments, &prepared) }) else {
+            return unsafe { report_exec_failure(runtime, &pending, libc::EACCES) };
+        };
+        if let Err(error) = super::filesystem::flush_before_exec() {
+            let error = PrepareError::from_anyhow(error, libc::EIO);
+            return unsafe { report_exec_failure(runtime, &pending, error.errno) };
+        }
+        let cloexec_guard = match PassthroughCloexecGuard::apply(
+            super::control::inheritable_descriptors()
+                .into_iter()
+                .chain(extra_cloexec),
+        ) {
+            Ok(cloexec_guard) => cloexec_guard,
+            Err(error) => return unsafe { report_exec_failure(runtime, &pending, error.errno) },
+        };
+        if let Err(error) = publish_process_attempt(runtime, &pending) {
+            drop(cloexec_guard);
+            unsafe { set_errno(error.errno) };
+            return -1;
+        }
+        drop(guard);
+        let result = unsafe {
+            original(
+                prepared.program.as_ptr(),
+                child_arguments.as_exec_ptr(),
+                environment.as_exec_ptr(),
+            )
+        };
+        if result == -1 {
+            let native_errno = unsafe { *libc::__error() };
+            drop(cloexec_guard);
+            unsafe { set_errno(native_errno) };
+            return -1;
+        }
+        return result;
+    }
     let pending_environment = match pending.environment_entry() {
         Ok(environment) => environment,
         Err(error) => {

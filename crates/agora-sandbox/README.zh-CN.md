@@ -43,6 +43,10 @@ cargo build --release -p agora-sandbox
 {
   "workdir": "~/.agora-sandbox",
   "tls": "auto",
+  "execution": {
+    "mode": "strict",
+    "bypass": []
+  },
   "filesystem": {
     "bypass": [],
     "local": {
@@ -65,7 +69,7 @@ chmod 600 sandbox.json
 
 `workdir` 默认是 `~/.agora-sandbox`。配置中的相对路径会根据字段从配置文件目录或工作目录解析；默认日志路径最终为 `<workdir>/runtime/logs/sandbox.log`。
 
-不需要加密时，可以把 `filesystem.local.encrypt` 设置为 `plain` 并省略 `key`。将 `tls` 设置为 `off` 可以关闭 TLS 卸载。
+不需要加密时，可以把 `filesystem.local.encrypt` 设置为 `plain` 并省略 `key`。将 `tls` 设置为 `off` 可以关闭 TLS 卸载。将 `execution.mode` 设为 `"restricted"` 时，携带受限 Apple Entitlement 的宿主系统二进制（如访问 Keychain ACL 的 `/usr/bin/security`）会自动免重签原生直通，而 Shell 与普通工具仍保持在沙箱内；设为 `"bypass"` 则跳过所有需拷贝重签的宿主二进制；`execution.bypass` 还可显式补充精确的绝对可执行文件路径。
 
 ### 4. 运行命令
 

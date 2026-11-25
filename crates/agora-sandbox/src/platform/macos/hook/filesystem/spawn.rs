@@ -12,46 +12,29 @@ pub(in crate::platform::hook) struct SpawnLocalDescriptors {
 }
 
 impl SpawnLocalDescriptors {
+    pub(in crate::platform::hook) fn empty() -> Self {
+        Self {
+            environment: None,
+            retained: None,
+            auxiliaries: Vec::new(),
+            _opens: Vec::new(),
+            close: Vec::new(),
+        }
+    }
+
     pub(in crate::platform::hook) fn descriptors(&self) -> impl Iterator<Item = i32> + '_ {
         self.auxiliaries.iter().map(AsRawFd::as_raw_fd)
     }
 }
 
-pub(in crate::platform::hook) fn prepare_local_spawn(
-    actions: Option<&[Action]>,
+type LocalSpawnAliasMap = HashMap<i32, (i32, Arc<OpenFile>, bool)>;
+
+fn collect_local_spawn_aliases(
+    files: &HashMap<i32, Arc<OpenFile>>,
+    actions: &[Action],
     cloexec_default: bool,
-    replaces_process: bool,
-) -> Result<SpawnLocalDescriptors> {
-    let mut prepared = SpawnLocalDescriptors {
-        environment: None,
-        retained: None,
-        auxiliaries: Vec::new(),
-        _opens: Vec::new(),
-        close: Vec::new(),
-    };
-    let Some(runtime) = FilesystemHookRuntime::global() else {
-        return Ok(prepared);
-    };
-    let Some(local) = runtime.local.as_ref() else {
-        return Ok(prepared);
-    };
-    let _guard =
-        FilesystemHookGuard::enter().context("filesystem hook unavailable during spawn")?;
-    let _operation = runtime
-        .operations
-        .acquire(mapping::OperationRequest::new().descriptor_registry_exclusive());
-    let files = lock(&runtime.open_files);
-    let has_local_descriptors = files
-        .values()
-        .any(|open| open.local_inheritance().is_some());
-    if !has_local_descriptors && !replaces_process {
-        return Ok(prepared);
-    }
-    let actions = match actions {
-        Some(actions) => actions,
-        None if !has_local_descriptors => &[],
-        None => return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into()),
-    };
+    opens: &mut Vec<Arc<OpenFile>>,
+) -> Result<(LocalSpawnAliasMap, HashSet<i32>)> {
     let mut aliases = HashMap::new();
     let mut originals = HashSet::new();
     for (&fd, open) in files.iter() {
@@ -72,9 +55,8 @@ pub(in crate::platform::hook) fn prepare_local_spawn(
         );
         originals.insert(local.state.as_raw_fd());
         originals.insert(local.lock.as_raw_fd());
-        prepared._opens.push(Arc::clone(open));
+        opens.push(Arc::clone(open));
     }
-    drop(files);
     for action in actions {
         match action {
             Action::Close(fd) | Action::Open(fd, ..) => {
@@ -101,6 +83,78 @@ pub(in crate::platform::hook) fn prepare_local_spawn(
             Action::Chdir(_) | Action::Fchdir(_) => {}
         }
     }
+    Ok((aliases, originals))
+}
+
+pub(in crate::platform::hook) fn prepare_passthrough_spawn(
+    actions: Option<&[Action]>,
+    cloexec_default: bool,
+) -> Result<SpawnLocalDescriptors> {
+    let mut prepared = SpawnLocalDescriptors::empty();
+    let Some(runtime) = FilesystemHookRuntime::global() else {
+        return Ok(prepared);
+    };
+    if runtime.local.is_none() {
+        return Ok(prepared);
+    }
+    let _guard =
+        FilesystemHookGuard::enter().context("filesystem hook unavailable during spawn")?;
+    let _operation = runtime
+        .operations
+        .acquire(mapping::OperationRequest::new().descriptor_registry_exclusive());
+    let files = lock(&runtime.open_files);
+    let has_local_descriptors = files
+        .values()
+        .any(|open| open.local_inheritance().is_some());
+    if !has_local_descriptors {
+        return Ok(prepared);
+    }
+    let actions = match actions {
+        Some(actions) => actions,
+        None => return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into()),
+    };
+    let (aliases, originals) =
+        collect_local_spawn_aliases(&files, actions, cloexec_default, &mut prepared._opens)?;
+    drop(files);
+    if aliases.values().any(|(_, _, inherits)| *inherits) {
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into());
+    }
+    prepared.close = originals.into_iter().collect();
+    Ok(prepared)
+}
+
+pub(in crate::platform::hook) fn prepare_local_spawn(
+    actions: Option<&[Action]>,
+    cloexec_default: bool,
+    replaces_process: bool,
+) -> Result<SpawnLocalDescriptors> {
+    let mut prepared = SpawnLocalDescriptors::empty();
+    let Some(runtime) = FilesystemHookRuntime::global() else {
+        return Ok(prepared);
+    };
+    let Some(local) = runtime.local.as_ref() else {
+        return Ok(prepared);
+    };
+    let _guard =
+        FilesystemHookGuard::enter().context("filesystem hook unavailable during spawn")?;
+    let _operation = runtime
+        .operations
+        .acquire(mapping::OperationRequest::new().descriptor_registry_exclusive());
+    let files = lock(&runtime.open_files);
+    let has_local_descriptors = files
+        .values()
+        .any(|open| open.local_inheritance().is_some());
+    if !has_local_descriptors && !replaces_process {
+        return Ok(prepared);
+    }
+    let actions = match actions {
+        Some(actions) => actions,
+        None if !has_local_descriptors => &[],
+        None => return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into()),
+    };
+    let (aliases, originals) =
+        collect_local_spawn_aliases(&files, actions, cloexec_default, &mut prepared._opens)?;
+    drop(files);
     prepared.close = originals.into_iter().collect();
     // Avoid caller action operands without requiring a descriptor above their
     // maximum: a valid action may already refer to RLIMIT_NOFILE - 1.

@@ -43,6 +43,10 @@ Create `sandbox.json`:
 {
   "workdir": "~/.agora-sandbox",
   "tls": "auto",
+  "execution": {
+    "mode": "strict",
+    "bypass": []
+  },
   "filesystem": {
     "bypass": [],
     "local": {
@@ -65,7 +69,7 @@ chmod 600 sandbox.json
 
 `workdir` defaults to `~/.agora-sandbox`. Relative configuration paths resolve from the configuration file or the work directory according to their field; the default log resolves to `<workdir>/runtime/logs/sandbox.log`.
 
-Set `filesystem.local.encrypt` to `plain` and omit `key` if encryption is not required. Set `tls` to `off` to disable TLS termination.
+Set `filesystem.local.encrypt` to `plain` and omit `key` if encryption is not required. Set `tls` to `off` to disable TLS termination. Set `execution.mode` to `"restricted"` to automatically run SIP/Hardened binaries with restricted Apple entitlements (such as `/usr/bin/security` for Keychain ACL access) natively without re-signing while keeping shells and ordinary CLI tools hooked, or `"bypass"` to avoid copying/re-signing restricted host binaries; `execution.bypass` accepts additional explicit absolute executable paths.
 
 ### 4. Run a command
 

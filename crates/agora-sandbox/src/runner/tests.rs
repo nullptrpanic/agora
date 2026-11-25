@@ -837,6 +837,98 @@ fn sandbox_config_validates_native_passthrough_roots() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_config_validates_execution_mode_and_native_executable_passthroughs() {
+    let root = std::env::temp_dir().join(format!(
+        "agora-native-exec-passthrough-config-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let hook = root.join("hook.dylib");
+    std::fs::write(&hook, b"hook").unwrap();
+    let workdir = root.join("workspace");
+
+    let valid = SandboxConfig::new(&hook)
+        .with_workdir(&workdir)
+        .with_execution_mode(super::ExecutionMode::Restricted)
+        .with_native_executable_passthrough("/usr/bin/security");
+    assert_eq!(valid.execution_mode(), super::ExecutionMode::Restricted);
+    assert_eq!(
+        valid.native_executable_passthroughs(),
+        [PathBuf::from("/usr/bin/security")]
+    );
+    assert!(valid.validate().is_ok());
+
+    let relative = SandboxConfig::new(&hook)
+        .with_workdir(&workdir)
+        .with_native_executable_passthrough("usr/bin/security");
+    assert!(
+        relative
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must be absolute")
+    );
+
+    let root_path = SandboxConfig::new(&hook)
+        .with_workdir(&workdir)
+        .with_native_executable_passthrough("/");
+    assert!(
+        root_path
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not root")
+    );
+
+    let directory = SandboxConfig::new(&hook)
+        .with_workdir(&workdir)
+        .with_native_executable_passthrough("/usr/bin");
+    assert!(
+        directory
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not a directory")
+    );
+
+    let open = SandboxConfig::new(&hook)
+        .with_workdir(&workdir)
+        .with_native_executable_passthrough("/usr/bin/open");
+    assert!(
+        open.validate()
+            .unwrap_err()
+            .to_string()
+            .contains("/usr/bin/open")
+    );
+
+    let private = SandboxConfig::new(&hook)
+        .with_workdir(&workdir)
+        .with_native_executable_passthrough(workdir.join("fs/usr/bin/security"));
+    assert!(
+        private
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("work directory")
+    );
+
+    let remote = SandboxConfig::new(&hook)
+        .with_workdir(&workdir)
+        .with_native_executable_passthrough("/remote/tool")
+        .with_smb_remote(SmbRemoteConfig::new("/remote", "server", "share").unwrap());
+    assert!(
+        remote
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("SMB logical root")
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(all(target_os = "macos", feature = "remote-smb"))]
 #[test]
 fn remote_connection_probe_requires_a_visible_logical_parent_directory() {

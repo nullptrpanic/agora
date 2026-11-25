@@ -12,7 +12,9 @@ use crate::audit::AuditController;
 use crate::audit::PENDING_PROCESS_EVENT_ENVIRONMENT;
 use crate::callback::Callback;
 #[cfg(target_os = "macos")]
-use crate::execution::{ExecutionController, resolve_executable, resolve_shebang};
+use crate::execution::{
+    ExecutionController, PreparedExecutableTarget, resolve_executable, resolve_shebang,
+};
 pub use crate::filesystem::FilesystemMode;
 #[cfg(target_os = "macos")]
 use crate::filesystem::{
@@ -119,6 +121,14 @@ where
         .context("filesystem blocking task failed")?
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutionMode {
+    #[default]
+    Strict,
+    Restricted,
+    Bypass,
+}
+
 #[derive(Clone, Debug)]
 pub struct SandboxConfig {
     pub network: NetworkConfig,
@@ -127,6 +137,8 @@ pub struct SandboxConfig {
     filesystem_mode: FilesystemMode,
     encrypted_workspace_key: Option<SecretBytes>,
     native_passthrough_roots: Vec<PathBuf>,
+    execution_mode: ExecutionMode,
+    native_executable_passthroughs: Vec<PathBuf>,
     tls_ca: Option<TlsCaFiles>,
     smb_remotes: Vec<SmbRemoteConfig>,
     #[cfg(test)]
@@ -167,6 +179,8 @@ impl SandboxConfig {
             filesystem_mode: FilesystemMode::default(),
             encrypted_workspace_key: None,
             native_passthrough_roots: vec![PathBuf::from(DEFAULT_NATIVE_PASSTHROUGH_ROOT)],
+            execution_mode: ExecutionMode::default(),
+            native_executable_passthroughs: Vec::new(),
             tls_ca: None,
             smb_remotes: Vec::new(),
             #[cfg(test)]
@@ -225,6 +239,24 @@ impl SandboxConfig {
         &self.native_passthrough_roots
     }
 
+    pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
+        self.execution_mode = mode;
+        self
+    }
+
+    pub fn execution_mode(&self) -> ExecutionMode {
+        self.execution_mode
+    }
+
+    pub fn with_native_executable_passthrough(mut self, executable: impl Into<PathBuf>) -> Self {
+        self.native_executable_passthroughs.push(executable.into());
+        self
+    }
+
+    pub fn native_executable_passthroughs(&self) -> &[PathBuf] {
+        &self.native_executable_passthroughs
+    }
+
     pub fn with_tls_ca(
         mut self,
         certificate: impl Into<PathBuf>,
@@ -264,7 +296,8 @@ impl SandboxConfig {
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
         let native_passthrough_roots = self.native_passthrough_root_aliases()?;
-        self.validate_smb_remotes(&native_passthrough_roots)?;
+        let native_executable_passthroughs = self.native_executable_passthrough_aliases()?;
+        self.validate_smb_remotes(&native_passthrough_roots, &native_executable_passthroughs)?;
         #[cfg(not(feature = "remote-smb"))]
         if !self.smb_remotes.is_empty() {
             bail!("this build does not include SMB remote filesystem support");
@@ -291,6 +324,19 @@ impl SandboxConfig {
         Ok(())
     }
 
+    fn resolved_workdir(&self) -> Result<(PathBuf, PathBuf)> {
+        let workdir = if self.workdir.is_absolute() {
+            self.workdir.clone()
+        } else {
+            std::env::current_dir()
+                .context("failed to resolve current directory")?
+                .join(&self.workdir)
+        };
+        let workdir = crate::filesystem::normalize_path(&workdir)?;
+        let resolved_workdir = crate::filesystem::resolve_existing_ancestor(&workdir)?;
+        Ok((workdir, resolved_workdir))
+    }
+
     fn normalized_native_passthrough_roots(&self) -> Result<Vec<PathBuf>> {
         let mut roots = self
             .native_passthrough_roots
@@ -311,15 +357,7 @@ impl SandboxConfig {
     }
 
     fn native_passthrough_root_aliases(&self) -> Result<Vec<(PathBuf, PathBuf)>> {
-        let workdir = if self.workdir.is_absolute() {
-            self.workdir.clone()
-        } else {
-            std::env::current_dir()
-                .context("failed to resolve current directory")?
-                .join(&self.workdir)
-        };
-        let workdir = crate::filesystem::normalize_path(&workdir)?;
-        let resolved_workdir = crate::filesystem::resolve_existing_ancestor(&workdir)?;
+        let (workdir, resolved_workdir) = self.resolved_workdir()?;
         self.normalized_native_passthrough_roots()?
             .into_iter()
             .map(|root| {
@@ -346,16 +384,79 @@ impl SandboxConfig {
         Ok(effective)
     }
 
-    fn validate_smb_remotes(&self, native_passthrough_roots: &[(PathBuf, PathBuf)]) -> Result<()> {
-        let workdir = if self.workdir.is_absolute() {
-            self.workdir.clone()
-        } else {
-            std::env::current_dir()
-                .context("failed to resolve current directory")?
-                .join(&self.workdir)
-        };
-        let workdir = crate::filesystem::normalize_path(&workdir)?;
-        let resolved_workdir = crate::filesystem::resolve_existing_ancestor(&workdir)?;
+    fn normalized_native_executable_passthroughs(&self) -> Result<Vec<PathBuf>> {
+        let mut executables = self
+            .native_executable_passthroughs
+            .iter()
+            .map(|executable| {
+                if !executable.is_absolute() {
+                    bail!(
+                        "native executable passthrough must be absolute: {}",
+                        executable.display()
+                    );
+                }
+                let normalized = crate::filesystem::normalize_path(executable)?;
+                if normalized == Path::new("/") {
+                    bail!("native executable passthrough must be a file path, not root");
+                }
+                Ok(normalized)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        executables.sort();
+        executables.dedup();
+        Ok(executables)
+    }
+
+    fn native_executable_passthrough_aliases(&self) -> Result<Vec<(PathBuf, PathBuf)>> {
+        let (workdir, resolved_workdir) = self.resolved_workdir()?;
+        self.normalized_native_executable_passthroughs()?
+            .into_iter()
+            .map(|executable| {
+                let resolved = crate::filesystem::resolve_existing_ancestor(&executable)?;
+                if executable == Path::new("/usr/bin/open")
+                    || resolved == Path::new("/usr/bin/open")
+                {
+                    bail!("native executable passthrough cannot bypass /usr/bin/open");
+                }
+                if executable
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.is_dir())
+                    || resolved.metadata().is_ok_and(|metadata| metadata.is_dir())
+                {
+                    bail!(
+                        "native executable passthrough must be an executable file, not a directory: {}",
+                        executable.display()
+                    );
+                }
+                if path_aliases_overlap(&executable, &resolved, &workdir, &resolved_workdir) {
+                    bail!(
+                        "native executable passthrough overlaps sandbox work directory: {}",
+                        executable.display()
+                    );
+                }
+                Ok((executable, resolved))
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn effective_native_executable_passthroughs(&self) -> Result<Vec<PathBuf>> {
+        let mut effective = self
+            .normalized_native_executable_passthroughs()?
+            .into_iter()
+            .map(|executable| crate::filesystem::resolve_existing_ancestor(&executable))
+            .collect::<Result<Vec<_>>>()?;
+        effective.sort();
+        effective.dedup();
+        Ok(effective)
+    }
+
+    fn validate_smb_remotes(
+        &self,
+        native_passthrough_roots: &[(PathBuf, PathBuf)],
+        native_executable_passthroughs: &[(PathBuf, PathBuf)],
+    ) -> Result<()> {
+        let (workdir, resolved_workdir) = self.resolved_workdir()?;
         let roots = self
             .smb_remotes
             .iter()
@@ -372,6 +473,19 @@ impl SandboxConfig {
                 bail!(
                     "SMB logical root overlaps native passthrough root {}: {}",
                     native.display(),
+                    root.display()
+                );
+            }
+            if let Some((passthrough, _)) =
+                native_executable_passthroughs
+                    .iter()
+                    .find(|(passthrough, resolved)| {
+                        path_aliases_overlap(root, resolved_root, passthrough, resolved)
+                    })
+            {
+                bail!(
+                    "SMB logical root overlaps native executable passthrough {}: {}",
+                    passthrough.display(),
                     root.display()
                 );
             }

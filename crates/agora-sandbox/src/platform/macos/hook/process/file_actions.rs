@@ -174,6 +174,83 @@ impl SpawnFileActions {
         Ok(prepared)
     }
 
+    pub(super) unsafe fn prepare_passthrough(
+        actions: *const Actions,
+        attributes: *const libc::posix_spawnattr_t,
+    ) -> Result<Self, i32> {
+        let guard = FilesystemHookGuard::enter();
+        let recorded = if actions.is_null() {
+            Some(Vec::new())
+        } else if guard.is_some() {
+            with_actions(|lists| lists.get(&(unsafe { *actions } as usize)).cloned())
+        } else {
+            None
+        };
+        drop(guard);
+        let mut flags = 0;
+        if !attributes.is_null() {
+            let result = unsafe { libc::posix_spawnattr_getflags(attributes, &mut flags) };
+            if result != 0 {
+                return Err(result);
+            }
+        }
+        let replaces_process = i32::from(flags) & libc::POSIX_SPAWN_SETEXEC != 0;
+        let cloexec_default = i32::from(flags) & libc::POSIX_SPAWN_CLOEXEC_DEFAULT != 0;
+        let local = filesystem::prepare_passthrough_spawn(recorded.as_deref(), cloexec_default)
+            .map_err(|error| PrepareError::from_anyhow(error, libc::EIO).errno)?;
+        let control_fds = super::super::control::inheritable_descriptors();
+        let mut prepared = Self {
+            borrowed: actions,
+            owned: None,
+            local,
+            replaces_process,
+        };
+        let Some(recorded) = recorded else {
+            if !control_fds.is_empty() {
+                return Err(libc::ENOTSUP);
+            }
+            return Ok(prepared);
+        };
+        let mut close_fds = control_fds
+            .into_iter()
+            .chain(prepared.local.close.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        for action in &recorded {
+            match action {
+                Action::Close(fd) | Action::Open(fd, ..) => {
+                    close_fds.remove(fd);
+                }
+                Action::Dup2(_, destination) => {
+                    close_fds.remove(destination);
+                }
+                Action::Inherit(_) | Action::Chdir(_) | Action::Fchdir(_) => {}
+            }
+        }
+        if close_fds.is_empty() {
+            return Ok(prepared);
+        }
+        let mut owned = std::ptr::null_mut();
+        let result = unsafe { libc::posix_spawn_file_actions_init(&mut owned) };
+        if result != 0 {
+            return Err(result);
+        }
+        prepared.owned = Some(owned);
+        let native = prepared.owned.as_mut().unwrap();
+        for action in recorded {
+            let result = unsafe { action.replay(native) };
+            if result != 0 {
+                return Err(result);
+            }
+        }
+        for fd in close_fds {
+            let result = unsafe { libc::posix_spawn_file_actions_addclose(native, fd) };
+            if result != 0 {
+                return Err(result);
+            }
+        }
+        Ok(prepared)
+    }
+
     pub(super) fn as_ptr(&self) -> *const Actions {
         self.owned
             .as_ref()

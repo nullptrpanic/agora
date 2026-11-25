@@ -1,8 +1,8 @@
 use agora_sandbox::callback::{
-    Decision, Event, EventType, FileAccessMode, FileEvent, NetworkEvent, NoopCallback,
+    Decision, Event, EventType, FileAccessMode, FileEvent, NetworkEvent, NoopCallback, ProcessEvent,
 };
 use agora_sandbox::network::{NetworkEnforcement, TlsMode};
-use agora_sandbox::runner::{Sandbox, SandboxCommand, SandboxConfig};
+use agora_sandbox::runner::{ExecutionMode, Sandbox, SandboxCommand, SandboxConfig};
 #[cfg(target_os = "macos")]
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket};
@@ -4958,4 +4958,246 @@ async fn assert_injected_nonblocking_connection(child_test: &str, child_environm
         .await
         .unwrap()
         .unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn execution_mode_restricted_passes_through_security_and_audits_exec() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-restricted-mode-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&directory).unwrap();
+    let config = sandbox_config_in(&workdir).with_execution_mode(ExecutionMode::Restricted);
+    let events = Arc::new(Mutex::new(Vec::<ProcessEvent>::new()));
+    let callback = {
+        let events = Arc::clone(&events);
+        move |event: Event| {
+            if let Event::Process(event) = event {
+                events.lock().unwrap().push(event);
+            }
+            std::future::ready(Decision::Allow)
+        }
+    };
+
+    let outcome = Sandbox::new(config, callback)
+        .run(SandboxCommand::new("/bin/sh").args(["-c", "/usr/bin/security help >/dev/null 2>&1"]))
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success(), "status={:?}", outcome.status());
+    assert!(workdir.join("fs/bin/sh").is_file());
+    assert!(!workdir.join("fs/usr/bin/security").exists());
+    let security_events = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            event.event_type == EventType::ProcessExecAttempt
+                && event.command.executable == "/usr/bin/security"
+        })
+        .count();
+    assert_eq!(security_events, 1);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn native_executable_passthrough_scrubs_env_and_control_fds_across_spawn_exec_and_top_level()
+{
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-exec-passthrough-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let workdir = directory.join("sandbox");
+    let source = directory.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let canonical_python = Path::new("/usr/bin/python3").canonicalize().unwrap();
+    let mut config = sandbox_config_in(&workdir)
+        .with_native_executable_passthrough(&canonical_python)
+        .with_native_executable_passthrough("/usr/bin/security");
+    config.network.tls = TlsMode::Auto;
+
+    let probe = r#"
+import os, socket, stat, sys
+build_env = {"AGORA_SANDBOX_EMBEDDED_HOOK_MD5", "AGORA_SANDBOX_EMBEDDED_HOOK_PATH"}
+leaked_env = [
+    k for k in os.environ
+    if k not in build_env and (
+        k == "DYLD_INSERT_LIBRARIES"
+        or k.startswith("AGORA_SANDBOX_")
+        or k in (
+            "SSL_CERT_FILE",
+            "CURL_CA_BUNDLE",
+            "REQUESTS_CA_BUNDLE",
+            "PIP_CERT",
+            "NODE_EXTRA_CA_CERTS",
+            "GIT_SSL_CAINFO",
+        )
+    )
+]
+assert not leaked_env, f"leaked env: {leaked_env}"
+assert os.environ.get("JAVA_TOOL_OPTIONS") == "-Xmx256m", os.environ.get("JAVA_TOOL_OPTIONS")
+leaked_sockets = []
+for entry in os.listdir("/dev/fd"):
+    fd = int(entry)
+    if fd <= 2:
+        continue
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError:
+        continue
+    if not stat.S_ISSOCK(mode):
+        continue
+    for family in (socket.AF_INET, socket.AF_INET6, socket.AF_UNIX):
+        try:
+            sock = socket.fromfd(fd, family, socket.SOCK_STREAM)
+            try:
+                peer = sock.getpeername()
+                leaked_sockets.append((fd, family, peer))
+            finally:
+                sock.close()
+        except (OSError, ValueError):
+            pass
+assert not leaked_sockets, f"leaked sockets: {leaked_sockets}"
+"#;
+
+    let events = Arc::new(Mutex::new(Vec::<ProcessEvent>::new()));
+    let callback = {
+        let events = Arc::clone(&events);
+        move |event: Event| {
+            if let Event::Process(event) = event {
+                events.lock().unwrap().push(event);
+            }
+            std::future::ready(Decision::Allow)
+        }
+    };
+
+    // Exercise both child spawn (subcommand) and execve (final exec) into passthrough binaries.
+    let script = format!(
+        "set -e\n/usr/bin/security help >/dev/null 2>&1\n{python} -c \"$PROBE\"\nexec {python} -c \"$PROBE\"\n",
+        python = canonical_python.display()
+    );
+    let outcome = Sandbox::new(config.clone(), callback)
+        .run(
+            SandboxCommand::new("/bin/sh")
+                .args(["-c", &script])
+                .env("JAVA_TOOL_OPTIONS", "-Xmx256m")
+                .env("PROBE", probe)
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success(), "status={:?}", outcome.status());
+    assert!(!workdir.join("fs/usr/bin/security").exists());
+    let mirrored_python = workdir
+        .join("fs")
+        .join(canonical_python.strip_prefix("/").unwrap());
+    assert!(!mirrored_python.exists());
+    {
+        let recorded = events.lock().unwrap();
+        assert!(recorded.iter().any(|event| {
+            event.event_type == EventType::ProcessExecAttempt
+                && event.command.executable == "/usr/bin/security"
+        }));
+        assert!(
+            recorded
+                .iter()
+                .filter(|event| {
+                    event.event_type == EventType::ProcessExecAttempt
+                        && event.command.executable == canonical_python.to_string_lossy()
+                })
+                .count()
+                >= 2
+        );
+    }
+
+    // Top-level passthrough launch must also avoid copying or injecting Agora runtime variables.
+    let top_level = Sandbox::new(config.clone(), NoopCallback)
+        .run(
+            SandboxCommand::new("/usr/bin/security")
+                .arg("help")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .await
+        .unwrap();
+    assert!(top_level.status().success());
+    assert!(!workdir.join("fs/usr/bin/security").exists());
+
+    let top_python = Sandbox::new(config, NoopCallback)
+        .run(
+            SandboxCommand::new(&canonical_python)
+                .args([
+                    "-c",
+                    "import os; build = {'AGORA_SANDBOX_EMBEDDED_HOOK_MD5', 'AGORA_SANDBOX_EMBEDDED_HOOK_PATH'}; assert 'DYLD_INSERT_LIBRARIES' not in os.environ; assert not any(k.startswith('AGORA_SANDBOX_') and k not in build for k in os.environ)",
+                ])
+                .env("DYLD_INSERT_LIBRARIES", hook_library())
+                .env("AGORA_SANDBOX_TOKEN", "stale"),
+        )
+        .await
+        .unwrap();
+    assert!(top_python.status().success());
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn encrypted_mode_rejects_inheritable_encrypted_descriptor_in_passthrough_child() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-passthrough-encrypted-fd-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let workdir = directory.join("sandbox");
+    let source = directory.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let config = SandboxConfig::new(hook_library())
+        .with_workdir(&workdir)
+        .with_encrypted_workspace(FILESYSTEM_KEY)
+        .with_execution_mode(ExecutionMode::Restricted);
+
+    let script = r#"
+import errno, os, subprocess
+with open("secret.txt", "wb") as f:
+    f.write(b"keep")
+# Passing a pipe (non-encrypted FD) to passthrough /usr/bin/security succeeds.
+ok = subprocess.run(["/usr/bin/security", "help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+assert ok.returncode == 0, ok.stderr
+# Passing an inheritable encrypted Broker-managed FD via posix_spawn fails closed with ENOTSUP.
+with open("secret.txt", "rb") as f:
+    os.set_inheritable(f.fileno(), True)
+    try:
+        subprocess.run(["/usr/bin/security", "help"], stdin=f, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        raise AssertionError("expected ENOTSUP when inheriting encrypted descriptor into passthrough spawn")
+    except OSError as exc:
+        assert exc.errno == errno.ENOTSUP, f"expected ENOTSUP, got {exc}"
+# Redirecting an encrypted FD into passthrough execve also fails closed with ENOTSUP.
+pid = os.fork()
+if pid == 0:
+    fd = os.open("secret.txt", os.O_RDWR)
+    os.dup2(fd, 1)
+    try:
+        os.execve("/usr/bin/security", ["/usr/bin/security", "help"], os.environ)
+    except OSError as exc:
+        os._exit(0 if exc.errno == errno.ENOTSUP else 42)
+    os._exit(43)
+_, status = os.waitpid(pid, 0)
+assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+"#;
+
+    let outcome = Sandbox::new(config, NoopCallback)
+        .run(
+            SandboxCommand::new("/usr/bin/python3")
+                .args(["-c", script])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success(), "status={:?}", outcome.status());
+    assert!(!workdir.join("fs/usr/bin/security").exists());
+    std::fs::remove_dir_all(directory).unwrap();
 }
